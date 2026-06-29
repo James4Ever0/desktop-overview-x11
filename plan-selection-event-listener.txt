@@ -1,0 +1,328 @@
+================================================================================
+PLAN: Selection event listener — detect TEXT SELECTION (PRIMARY) before any copy
+File: plan-selection-event-listener.txt
+Target: Kubuntu 22.04 / KDE Plasma (KWin) on X11
+Related: plan-clipboard-event-listener.txt (shares the XFIXES mechanism)
+================================================================================
+
+--------------------------------------------------------------------------------
+0. GOAL
+--------------------------------------------------------------------------------
+Get an EVENT when the user SELECTS (highlights) text — WITHOUT them pressing
+Ctrl+C — and read what was selected. Per event print: timestamp, that it is a
+SELECT (PRIMARY) event, content type, and a text preview (chars, bytes, first 100
+chars; rest discarded), same abbreviation rules as the clipboard plan.
+
+--------------------------------------------------------------------------------
+1. THE KEY FACT — SELECTION == THE "PRIMARY" SELECTION (your observation is right)
+--------------------------------------------------------------------------------
+X11 has two everyday selections:
+    CLIPBOARD = explicit Ctrl+C / Ctrl+V buffer.
+    PRIMARY   = the IMPLICIT selection: whatever text is highlighted RIGHT NOW.
+                Set automatically the moment you highlight; pasted with MIDDLE
+                click. No copy command involved.
+
+So "the text isn't going to the clipboard after selecting" is correct and by
+design: highlighting writes to PRIMARY, not CLIPBOARD. And YES — it is an event:
+when an app starts owning PRIMARY (i.e. you made a selection), the XFIXES
+extension emits a SelectionOwnerNotify for the PRIMARY selection. That is the
+"text was selected" signal you're after, and it fires BEFORE/without any copy.
+
+There is NO separate, lower-level "user highlighted these glyphs" event in X11.
+Selection is an application-level concept; the ONLY standard, app-agnostic way the
+system surfaces it is the PRIMARY selection. Watch PRIMARY ownership = watch
+selections.
+
+--------------------------------------------------------------------------------
+2. HOW TO LISTEN (same XFIXES path as clipboard, atom = PRIMARY)
+--------------------------------------------------------------------------------
+Identical mechanism to plan-clipboard-event-listener.txt, but select on the
+PRIMARY atom instead of CLIPBOARD:
+
+    from Xlib import display, X
+    from Xlib.ext import xfixes
+    dpy  = display.Display()
+    root = dpy.screen().root
+    dpy.xfixes_query_version(4, 0)
+    PRIMARY = dpy.intern_atom('PRIMARY')          # or use X.PRIMARY (== 1)
+    mask = (xfixes.XFixesSetSelectionOwnerNotifyMask
+            | xfixes.XFixesSelectionWindowDestroyNotifyMask
+            | xfixes.XFixesSelectionClientCloseNotifyMask)
+    dpy.xfixes_select_selection_input(root, PRIMARY, mask)
+
+    base = dpy.extension_event.SetSelectionOwnerNotify
+    while True:
+        ev = dpy.next_event()
+        if ev.type == base and ev.selection == PRIMARY:
+            handle_selection(ev)     # read PRIMARY content + print
+
+On each notify, READ the selection content exactly like the clipboard (request
+conversion of PRIMARY -> UTF8_STRING). Easiest robust route is the hybrid:
+    xclip -selection primary -o -t TARGETS      # available types
+    xclip -selection primary -o -t UTF8_STRING  # the selected text
+(or xsel -p -o). Pure-Xlib read = convert_selection + SelectionNotify + INCR, same
+caveats as the clipboard plan.
+
+Toolkit alternatives (event-driven, give type for free):
+  - Qt:  QClipboard.selectionChanged  +  cb.mimeData(QClipboard.Selection)
+  - GTK: Gtk.Clipboard.get(Gdk.SELECTION_PRIMARY) -> "owner-change" signal
+
+--------------------------------------------------------------------------------
+3. WHEN IT FIRES (and what that means for your handler)
+--------------------------------------------------------------------------------
+  - Fires when an app TAKES ownership of PRIMARY = a new selection was made.
+  - Many toolkits (GTK/Qt/Konsole/Firefox) update PRIMARY CONTINUOUSLY as you drag
+    or shift-extend the selection -> you may get a BURST of notifies for one drag,
+    one per intermediate selection. DEBOUNCE: coalesce events within a short window
+    (e.g. 120-200ms) and only read/print the final state. Also dedup by content
+    hash (owners re-assert; you'll otherwise log the same text twice).
+  - Single-click / deselect does NOT reliably fire and does NOT clear PRIMARY: the
+    last owner keeps the old selection until something new is selected. So you
+    CANNOT robustly detect "the user deselected" — only "a new selection exists".
+  - Reading races a fast re-selection; read promptly inside the handler. If the
+    owner vanished between notify and read, xclip returns empty -> skip.
+
+--------------------------------------------------------------------------------
+4. CONTENT TYPE + PREVIEW (reuse the clipboard rules)
+--------------------------------------------------------------------------------
+Selections are almost always TEXT, but classify from TARGETS anyway (an image
+region selected in GIMP, etc., can present image/* on PRIMARY):
+    TEXT  -> chars=<n> bytes=<m> preview="<first 100 chars, ctrl chars escaped>"
+             (+<n-100> more) when truncated.
+    IMAGE -> "IMAGE <fmt> <human_bytes> <WxH>".
+    OTHER -> print raw targets.
+Line format:  "<HH:MM:SS.mmm> | SELECT | PRIMARY | <TYPE> | <preview/descriptor>"
+(See plan-clipboard-event-listener.txt §4-5 for the exact classification &
+abbreviation logic — identical here.)
+
+--------------------------------------------------------------------------------
+5. IF YOU WANT THE RAW MOUSE/DRAG TOO (lower level, usually unnecessary)
+--------------------------------------------------------------------------------
+PRIMARY ownership is the RIGHT signal for "what was selected". Only if you also
+need the physical gesture (e.g. to know a drag-select happened even when no app
+publishes PRIMARY) consider:
+  - XRecord / XInput2: watch raw ButtonPress(1) -> Motion -> ButtonRelease(1) to
+    infer a drag-selection, then read PRIMARY on release. Tells you a drag
+    happened, NOT what/whether text was selected -> still must read PRIMARY for
+    content. More complexity, more noise; combine only if necessary.
+  - Polling PRIMARY content on a timer: works without XFIXES but no real event,
+    chatty, can miss transient selections. Fallback only.
+These add cost without giving more than PRIMARY does for the stated goal. Default
+to XFIXES-on-PRIMARY.
+
+--------------------------------------------------------------------------------
+6. CAVEATS (KDE / Kubuntu 22.04, X11)
+--------------------------------------------------------------------------------
+  - X11 only. echo $XDG_SESSION_TYPE must be "x11". Under WAYLAND the PRIMARY
+    selection is restricted; analog is `wl-paste -p --watch <cmd>` (primary) from
+    wl-clipboard.
+  - PRIMARY is the NOISIEST selection (every highlight, often mid-drag). Debounce +
+    hash-dedup are mandatory or the log floods.
+  - Klipper mostly manages CLIPBOARD, not PRIMARY, but can still appear; dedup by
+    content hash.
+  - Apps that DON'T publish PRIMARY (rare; some Java/SDL apps, password fields)
+    won't produce a selection event — nothing to do about it from outside.
+  - Your reader requesting PRIMARY does NOT change ownership, so no self-trigger
+    loop. (Unlike SETTING a selection, which would.)
+  - PRIVACY: this logs everything the user highlights (often more than they copy).
+    Honour password-manager / concealment hints and redact; make it opt-in. (See
+    plan-clipboard-event-listener.txt §9.)
+
+--------------------------------------------------------------------------------
+7. DEPENDENCIES & QUICK CHECKS
+--------------------------------------------------------------------------------
+  sudo apt install python3-xlib xclip          # (xsel works too: xsel -p -o)
+  XFIXES present:
+    python3 -c "from Xlib import display;print(display.Display().has_extension('XFIXES'))"
+  Manual sanity:
+    $ xsel -p -o            # prints whatever you currently have highlighted
+    $ xclip -selection primary -o -t TARGETS
+    # highlight text in Konsole/Firefox WITHOUT Ctrl+C, watch the listener print a
+    # "SELECT | PRIMARY" line; middle-click pastes the same text to confirm.
+
+--------------------------------------------------------------------------------
+8. DEBOUNCING & AGGREGATION STRATEGIES (multiple alternatives)
+--------------------------------------------------------------------------------
+The core problem: toolkits fire PRIMARY ownership events continuously during a
+drag-select (one per intermediate highlight boundary). We want to coalesce the
+noisy stream into discrete "the user selected something meaningful" events.
+
+Below are several strategies, ordered from simplest to most sophisticated.
+
+----------------------------------------------------------------------
+8a. Strategy A — Time-gap enqueue (the "x > threshold" method)
+----------------------------------------------------------------------
+Keep two timestamps:  last_selection_ts  and  current_selection_ts.
+On EACH selection event:
+
+  1. Record current_selection_ts = now().
+  2. If last_selection_ts is None (first event or after flush):
+       Set last_selection_ts = current_selection_ts.
+       Do NOT read or enqueue the selection content.
+       (This is the "selection start" event; content is partial.)
+  3. Else compute:  gap = current_selection_ts - last_selection_ts.
+  4. If gap > THRESHOLD (e.g. 200-400ms):
+       a) Read the PRIMARY content now (this is the stable selection).
+       b) Enqueue the text into a buffer[] (ring buffer, max N entries).
+       c) Increment a global counter.
+       d) Periodically (every K enqueues, or on a timer) print:
+            "[buffer stats] total=<count> | latest=<preview>"
+       e) Clear BOTH timestamps (last = None, current = None).
+          Wait for a fresh selection-start event (step 2).
+  5. Else (gap ≤ THRESHOLD):
+       This is part of the same drag-select. Do NOT enqueue.
+       Update last_selection_ts = current_selection_ts.
+       (Optionally sample the content to detect direction, see §8c.)
+
+Rationale: The gap between events during a drag is small (~10-50ms). When the
+user pauses or releases, the gap widens. Threshold tuning:
+  - Too low (≤80ms) → enqueues mid-drag fragments.
+  - Too high (≥500ms) → misses quick highlight-and-release.
+  - 200-300ms is a good starting point for X11/PRIMARY.
+
+----------------------------------------------------------------------
+8b. Strategy B — Common prefix/suffix coalescing (continuous selection)
+----------------------------------------------------------------------
+Instead of timing, compare the content of consecutive selection reads.
+If selection N and selection N-1 share a common prefix or common suffix,
+treat them as one continuous drag-select event and keep ONLY the last
+result within a coalescing window (e.g. X=2 seconds after the last
+content change).
+
+Algorithm:
+
+  1. Read PRIMARY content on every ownership notify (debounced to
+     e.g. 50ms read throttle so we don't fork xclip 100 times).
+  2. Maintain:  prev_text, prev_timestamp, coalesce_window_s.
+  3. When new text arrives:
+       if elapsed(prev_timestamp) < coalesce_window_s:
+           prefix = longest_common_prefix(prev_text, new_text)
+           suffix = longest_common_suffix(prev_text, new_text)
+           if len(prefix) >= min_overlap or len(suffix) >= min_overlap:
+               # Same drag-select — keep extending the window, store latest
+               coalesce_candidate = new_text
+               prev_timestamp = now()
+               continue  # don't emit yet
+       # No overlap or window expired — emit previous candidate
+       if coalesce_candidate exists:
+           enqueue(coalesce_candidate)
+           print_selection(coalesce_candidate)
+       coalesce_candidate = new_text
+       prev_timestamp = now()
+
+Tuning:
+  - min_overlap: 5-10 chars (avoids false-positive on adjacent words).
+  - coalesce_window_s: 1.5-3 seconds after the last content change.
+  - Good for: Konsole/Terminal where you drag across lines and content
+    grows linearly. Captures the full final selection, not partial.
+
+----------------------------------------------------------------------
+8c. Strategy C — Content-stability lockout (hybrid timing + content)
+----------------------------------------------------------------------
+Combine timing and content dedup. During a burst:
+  - Read PRIMARY.
+  - Hash the content; if hash == last_hash  → skip (same text,
+    owner re-asserted for non-content reasons).
+  - If content changed AND gap since last enqueue < THRESHOLD:
+      Only update "latest_content" and "latest_ts". Do NOT enqueue.
+  - If gap ≥ THRESHOLD OR content hasn't changed for ≥THRESHOLD:
+      Enqueue latest_content, reset.
+
+This is Strategy A with content dedup bolted on. Catches the case where
+the gap is small but content stabilised (user paused mid-drag on the
+exact same highlight).
+
+----------------------------------------------------------------------
+8d. Strategy D — Event-rate debounce (classic debounce)
+----------------------------------------------------------------------
+Classic debounce timer (like lodash debounce):
+  - On every event, reset a timer for N ms (e.g. 250ms).
+  - When the timer fires (no new events for N ms), read PRIMARY once and
+    enqueue.
+  - Detection = "the burst has settled".
+
+Variations:
+  - Leading-edge: Also enqueue the first event immediately (captures
+    mouse-down instant), then trailing-edge debounce for the release.
+    Risk: first event has partial content.
+  - Trailing-edge only: Wait for silence. Reliable but adds N ms latency
+    to every selection event.
+  - Max-wait: If events keep coming for >1s without a gap, force-enqueue
+    every 1s (prevents starvation during very long drags).
+
+Best for: developers familiar with frontend debounce patterns. Simple to
+implement with threading.Timer or asyncio.
+
+----------------------------------------------------------------------
+8e. Strategy E — Velocity-based adaptive threshold
+----------------------------------------------------------------------
+Track the inter-event interval over a sliding window (last 5-10 gaps).
+Compute a running average. When the current gap is ≥ 3× the running
+average, treat it as "release". Rationale: during a drag, gaps cluster
+around the system's event-reporting rate (~10-30ms). Release creates a
+much larger gap.
+
+Algorithm:
+  - Maintain deque of last N gaps (N=8).
+  - On each event: compute gap, push to deque, compute mean_gap.
+  - If gap > mean_gap * MULTIPLIER (e.g. 3x-5x):
+      → "Release detected" → enqueue current selection.
+  - Else: "Still dragging" → update content candidate.
+
+Adapts to fast vs slow drag speeds. Very robust but slightly more code.
+
+----------------------------------------------------------------------
+8f. Recommended approach for v1
+----------------------------------------------------------------------
+Start with Strategy C (content-stability lockout, §8c):
+  - Timing threshold: 250ms.
+  - Content dedup by hash.
+  - Ring buffer of 100 entries.
+  - On each enqueue, print the buffer stats and the new entry preview.
+
+Why: Timing alone (§8a) dedups events but can still enqueue mid-drag
+fragments if the user drags slowly. Content-only (§8b) fails when the
+selection changes topic (user highlights two different things). The
+hybrid catches both: a gap means "stopped selecting", hash dedup means
+"ignore re-assertions", and content-change-within-gap means "dragging
+past stable text, don't emit yet".
+
+----------------------------------------------------------------------
+9. AGGREGATION OUTPUT FORMAT
+----------------------------------------------------------------------
+When an event qualifies for enqueue (after debounce):
+
+  Buffer = ring buffer, max 100 entries.
+  Each entry = {timestamp, text, length_chars, hash}
+
+  On enqueue:
+    1. Increment global total_count.
+    2. Print:
+       ─────────────────────────────────────────────
+       [SELECTION #<count>] <HH:MM:SS.mmm>
+       Type: <TEXT | IMAGE | OTHER>
+       Size: <chars> chars, <bytes> bytes  |  Buffer: <n>/100
+       Preview: "<first 200 chars, ctrl chars escaped>" [+<remainder> more]
+       ─────────────────────────────────────────────
+
+  Periodic stats (every 5 enqueues or every 30s, whichever first):
+       [SELECTION BUFFER] total=<count>  buffered=<n>/100  last=<last_text_preview>
+
+  Optional: dump buffer to JSON on graceful shutdown or every 50 entries.
+
+----------------------------------------------------------------------
+10. TL;DR
+----------------------------------------------------------------------
+  - "Text selection (no copy)" == the PRIMARY selection. Highlighting sets PRIMARY
+    immediately; Ctrl+C is NOT involved (that's CLIPBOARD).
+  - It IS an event: XFIXES SetSelectionOwnerNotify on the PRIMARY atom. Same code
+    as the clipboard listener, atom swapped to PRIMARY.
+  - Read content via xclip -selection primary (or Qt selectionChanged / GTK
+    owner-change). Classify type + preview with the clipboard plan's rules.
+  - MUST debounce (toolkits update PRIMARY mid-drag) and dedup by hash.
+  - Strategy C (content-stability lockout, §8c) recommended for v1 — hybrid
+    timing + content dedup. Threshold 250ms. Ring buffer of 100.
+  - 5 alternative strategies in §8a-§8e for different noise profiles.
+  - Can't detect "deselect"; can't see selections in apps that don't publish
+    PRIMARY; X11 only (use wl-paste -p --watch on Wayland).
+================================================================================

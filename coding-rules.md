@@ -1,0 +1,1 @@
+when doing refactoring, best to copy and rename current scripts to a different place, modify the code in some sense to make it callable from other code, rearrange folder structure then write minimal logic in main script, avoid large chunk of code dumping without simple file copy, and write code file structure overview for future development and navigation.

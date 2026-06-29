@@ -1,0 +1,234 @@
+================================================================================
+PLAN: Focusing a window that lives on a DIFFERENT virtual desktop
+File: plan-focus-on-window-in-different-virtual-desktop.txt
+Target: Kubuntu 22.04 / KDE Plasma (KWin) on X11
+================================================================================
+
+--------------------------------------------------------------------------------
+0. THE QUESTION
+--------------------------------------------------------------------------------
+"If I want to focus a window on a different virtual desktop, do I have to:
+   (a) get the window's desktop id, (b) switch to that desktop,
+   (c) un-minimize the window, (d) then focus it
+ — or is operating on the WINDOW ID ALONE enough?"
+
+--------------------------------------------------------------------------------
+1. SHORT ANSWER
+--------------------------------------------------------------------------------
+The WINDOW ID ALONE is enough. ONE "activate" call does everything:
+
+    wmctrl -i -a 0x05400007
+  or
+    xdotool windowactivate 0x05400007     # see id-format note in §6
+
+"Activate" is an EWMH operation (it sends a _NET_ACTIVE_WINDOW client message to
+root). The window manager — KWin — then does ALL of the following for you,
+atomically and in the right order:
+    1. switches the current virtual desktop to the one the window is on,
+    2. un-minimizes / un-shades / un-iconifies it (maps it if hidden),
+    3. raises it to the top of the stack,
+    4. gives it input focus.
+
+So you do NOT have to manually read _NET_WM_DESKTOP, switch desktops, remove the
+hidden state, and call focus yourself. That manual 4-step sequence is only a
+FALLBACK for when activation is refused (see §4 focus-stealing) or when you
+deliberately do NOT want the side effects (see §3).
+
+What is NOT enough by itself:
+  - Raw input focus (xdotool windowfocus / XSetInputFocus) does NOT switch desktop
+    and FAILS (BadMatch) on a window that is minimized/unmapped on another desktop.
+    Use "activate", not "focus", for cross-desktop targets.  (See §5.)
+
+--------------------------------------------------------------------------------
+2. WHY ONE CALL WORKS — THE EWMH MECHANISM
+--------------------------------------------------------------------------------
+EWMH defines _NET_ACTIVE_WINDOW as a request to the WM (not a direct property
+poke). A pager/tool sends a ClientMessage to the root window:
+
+    type   = _NET_ACTIVE_WINDOW
+    window = <the client window id you want active>
+    data.l[0] = source indication (1 = app, 2 = pager/direct user action)
+    data.l[1] = timestamp
+    data.l[2] = requestor's currently-active window (or 0)
+
+KWin receives this and is REQUIRED by spec to make the window active, which
+explicitly includes "if the window is on another desktop, switch to that desktop"
+and bringing the window out of the iconified/hidden state. That is precisely the
+"switch desktop + unminimize + raise + focus" bundle — handled by the WM, so a
+client only needs the window id.
+
+  - wmctrl  -i -a <wid>           -> sends exactly this message (source = pager).
+  - xdotool windowactivate <wid>  -> sends this message too, with sync fallbacks.
+  - python-xlib                   -> you build and send the ClientMessage (§7).
+
+Minimized windows: "minimized" in EWMH terms = _NET_WM_STATE_HIDDEN + iconic.
+Activation removes that state and maps the window, so a separate un-minimize step
+is unnecessary when you activate.
+
+--------------------------------------------------------------------------------
+3. IMPORTANT SIDE EFFECT: ACTIVATION SWITCHES *YOUR* DESKTOP
+--------------------------------------------------------------------------------
+Activating a window on another desktop MOVES YOU to that desktop (your current
+desktop changes globally — _NET_CURRENT_DESKTOP fires; the desktop monitor in
+demo-virtual-desktop-monitoring.py will report it).
+
+If you do NOT want to leave your current desktop, do the opposite: bring the
+window TO you, then focus — keep your desktop, move the window:
+
+    cur=$(xdotool get_desktop)                 # or: wmctrl -d | awk '/\*/{print $1}'
+    wmctrl -i -r 0x05400007 -t "$cur"          # move window to MY current desktop
+    wmctrl -i -a 0x05400007                     # now activate (no desktop switch)
+
+Trade-off:
+  - "go to the window" (plain activate)  -> you switch desktops, window stays put.
+  - "bring the window here" (move then activate) -> you stay, window relocates.
+Pick per intent. Sticky windows (_NET_WM_DESKTOP = 0xFFFFFFFF) are on all desktops,
+so neither switch nor move is needed — just activate.
+
+--------------------------------------------------------------------------------
+4. THE ONE THING THAT CAN BLOCK IT: FOCUS-STEALING PREVENTION
+--------------------------------------------------------------------------------
+KWin has "Focus stealing prevention" (System Settings -> Window Management ->
+Window Behavior -> Focus). At higher levels KWin may REFUSE a programmatic
+activation and instead just flash/mark the taskbar entry (demands attention)
+rather than actually switching+focusing.
+
+Mitigations:
+  - Use source indication = 2 (pager / direct user action). wmctrl -a and
+    xdotool windowactivate already do this; KWin treats pager requests as
+    legitimate and normally honors them.
+  - Pass a correct, recent timestamp in the message (tools handle this).
+  - For testing, set Focus stealing prevention to "None" or "Low" to confirm your
+    code path works, then re-raise the level.
+  - If still blocked, the explicit fallback in §5 (manually switch desktop, then
+    activate locally) usually succeeds because the activation then happens on the
+    now-current desktop.
+Symptom of being blocked: the call returns success but focus doesn't move; the
+taskbar entry highlights instead. That's policy, not a bug in your call.
+
+--------------------------------------------------------------------------------
+5. EXPLICIT FALLBACK SEQUENCE (only if activation is refused / for full control)
+--------------------------------------------------------------------------------
+This is the manual "do each step yourself" route. Normally unnecessary.
+
+  1) Find the window's desktop:
+        xprop -id 0x05400007 _NET_WM_DESKTOP
+        # _NET_WM_DESKTOP(CARDINAL) = 1
+        # 4294967295 (0xFFFFFFFF) => sticky / all desktops -> SKIP the switch.
+
+  2) Switch to that desktop (skip if sticky or already current):
+        wmctrl -s 1            # or: xdotool set_desktop 1     (0-based)
+
+  3) Un-minimize the window (if it was minimized):
+        # EWMH state route:
+        wmctrl -i -r 0x05400007 -b remove,hidden
+        # or just map+activate, which also unminimizes:
+        xdotool windowactivate 0x05400007
+        # (xdotool windowmap maps it but does NOT focus/raise reliably.)
+
+  4) Raise + focus:
+        wmctrl -i -a 0x05400007
+        # or: xdotool windowactivate 0x05400007
+
+Note: steps 2-4 are EXACTLY what one `wmctrl -i -a` already bundles. The only
+reason to split them is to (a) work around focus-stealing prevention by switching
+desktop first, or (b) insert your own logic between steps.
+
+DON'T use raw focus for cross-desktop targets:
+        xdotool windowfocus 0x05400007        # XSetInputFocus — WRONG for this job
+  It does not switch desktops and throws BadMatch on an unmapped (minimized /
+  other-desktop) window. windowfocus is only safe for an already-visible window.
+
+--------------------------------------------------------------------------------
+6. ID FORMAT NOTES (so the tools accept your id)
+--------------------------------------------------------------------------------
+  - wmctrl wants the id after `-i`:        wmctrl -i -a 0x05400007   (hex, as in
+    `wmctrl -l`; 8-digit zero-padded lowercase is fine).
+  - xdotool historically wants DECIMAL ids (e.g. from `xdotool search`). Modern
+    xdotool accepts 0x-hex on windowactivate, but to be safe convert:
+        dec=$((16#5400007))    ;  xdotool windowactivate "$dec"
+    In Python:  dec = int("0x5400007", 16)
+  - Normalize everything to wmctrl form for display/logging:
+        hex     -> f"0x{int(s,16):08x}"
+        decimal -> f"0x{int(s,10):08x}"
+  - The id must be the CLIENT window (the one in `wmctrl -l` / _NET_CLIENT_LIST),
+    not a reparenting frame window.
+
+--------------------------------------------------------------------------------
+7. PYTHON-XLIB: SEND _NET_ACTIVE_WINDOW YOURSELF (no external tools)
+--------------------------------------------------------------------------------
+Fits the existing single-thread, python-xlib demos. Sketch:
+
+    from Xlib import X, display, protocol
+    dpy  = display.Display()
+    root = dpy.screen().root
+    NET_ACTIVE = dpy.intern_atom('_NET_ACTIVE_WINDOW')
+    win = dpy.create_resource_object('window', 0x05400007)
+
+    ev = protocol.event.ClientMessage(
+        window=win,
+        client_type=NET_ACTIVE,
+        data=(32, [
+            2,                 # source indication: 2 = pager / direct user action
+            X.CurrentTime,     # timestamp (CurrentTime works; a real ts is better)
+            0,                 # requestor's active window (0 = none)
+            0, 0,
+        ]),
+    )
+    mask = X.SubstructureRedirectMask | X.SubstructureNotifyMask
+    root.send_event(ev, event_mask=mask)
+    dpy.flush()
+
+This single message asks KWin to switch desktop + unminimize + raise + focus —
+the same bundle wmctrl -a triggers. To "bring it here" instead (§3), first set the
+window's _NET_WM_DESKTOP to your current desktop via a _NET_WM_DESKTOP
+ClientMessage (or wmctrl -i -r <wid> -t <cur>), then send _NET_ACTIVE_WINDOW.
+
+Optional confirmation: read root _NET_ACTIVE_WINDOW afterwards and check it equals
+your target (allow a brief delay; KDE may report the old value momentarily).
+
+--------------------------------------------------------------------------------
+8. KDE / KUBUNTU 22.04 (X11) CAVEATS
+--------------------------------------------------------------------------------
+  - X11 only. echo $XDG_SESSION_TYPE must be "x11". On Wayland, wmctrl/xdotool
+    activation and _NET_* messages do not work.
+  - Virtual Desktops != Activities. Activation switches Virtual Desktops only. If
+    the window is on another *Activity*, that is a separate KDE concept (D-Bus
+    org.kde.ActivityManager) and is out of scope here.
+  - Focus stealing prevention (see §4) is the usual reason "it didn't focus".
+  - Sticky windows (_NET_WM_DESKTOP = 0xFFFFFFFF) need no desktop switch.
+  - "Show Desktop"/minimized differences: activation un-minimizes; a window merely
+    behind others just needs the raise+focus that activation already does.
+  - Multiple monitors: virtual desktops are global across monitors (unless a Plasma
+    per-screen-desktops option is on); activation still targets the right desktop.
+
+--------------------------------------------------------------------------------
+9. DECISION TREE (TL;DR)
+--------------------------------------------------------------------------------
+  Want it focused, OK to switch desktops?
+      -> wmctrl -i -a <wid>            (or xdotool windowactivate <wid>)   DONE.
+
+  Want it focused but STAY on current desktop?
+      -> wmctrl -i -r <wid> -t $(xdotool get_desktop)   # bring window here
+         wmctrl -i -a <wid>                              # then activate
+
+  Activation silently refused (taskbar flashes, no focus)?
+      -> lower KWin "Focus stealing prevention", OR
+         wmctrl -s <window's desktop>  ; wmctrl -i -a <wid>   (explicit, §5)
+
+  Tempted to use xdotool windowfocus / XSetInputFocus for this?
+      -> DON'T for cross-desktop/minimized targets (no desktop switch, BadMatch).
+         Use "activate".
+
+--------------------------------------------------------------------------------
+10. QUICK MANUAL VERIFICATION
+--------------------------------------------------------------------------------
+  $ wmctrl -l                       # pick a window id on another desktop (col 2 != current)
+  $ xprop -id <wid> _NET_WM_DESKTOP # note its desktop
+  $ wmctrl -i -a <wid>              # expect: desktop switches AND window focused
+  $ xprop -root _NET_ACTIVE_WINDOW  # confirm it now equals <wid>
+  $ xprop -root _NET_CURRENT_DESKTOP# confirm desktop switched to the window's
+  # "bring here" variant:
+  $ cur=$(xdotool get_desktop); wmctrl -i -r <wid> -t "$cur"; wmctrl -i -a <wid>
+  $ wmctrl -l                       # confirm <wid>'s desktop column is now $cur
+================================================================================

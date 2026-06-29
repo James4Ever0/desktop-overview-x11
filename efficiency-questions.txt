@@ -1,0 +1,13 @@
+what is the most power efficient way of updating windows image capture?
+
+hooking on windows focus events? can we first capture all windows, then listen to windows focus events, only capture that window when focused, leaving others untouched instead of capturing all windows?
+
+so that we would only do new ocr over these updated images instead of all windows.
+
+can we poll for focused window name every 1 second? or is there a system event listener for that?
+
+or can we force a full update every x minutes like 15 or 30 alongside with existing event listener strategy? careful of system freeze?
+
+---
+
+or can we calculate semantic window capture image hash and compare with latest capture, decide to do ocr or not?

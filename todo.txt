@@ -1,0 +1,51 @@
+do not delete all candidates during refresh. instead only delete those not accessible.
+
+if new window capture is not available, display old window capture (could be at the window not minimized)
+
+add new window if found new one.
+
+do not make the entire candidate list frozen during refresh. instead make it scrollable, responsive. use async or threading when doing refresh?
+
+make background refreshing task every y seconds. default to 15 seconds. will cancel the task if window being focused (manually triggered refresh), will resume the repeating task if window is not focused.
+
+---
+
+sort window by:
+
+most recently focused time? display last focused time if possible?
+
+keyword relevancy?
+
+name in alphabetical order?
+
+group by app name? binary path?
+
+---
+
+enlarge the interface, make screenshots larger, easier to see
+
+---
+
+can jump to the window when clicking on preview
+
+can hide preview when keys are typed
+
+can hide preview when window is not focused
+
+---
+
+can tag window so we can search it via keyword (remove unmatched tags if window id not found)
+
+display app name along with window title
+
+---
+
+can we capture the keylogger along with the focused window handle? so that we can search via the keylogged text instead of ocr the entire window? or can we dump clipboard along with the focused window handle? (just kidding, not hope to be useful, but can leave agent to reason about this approach)
+
+---
+
+collect all previous titles of a window id, view its title history, and can search against that history
+
+---
+
+not only store active window id & title but also get current virtual desktop id, in timeline & sections view. think about how we can get it better viewed. first we need to know current active virtual desktop id for every poll

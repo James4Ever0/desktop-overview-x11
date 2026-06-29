@@ -1,0 +1,5 @@
+Pillow>=10.0.0
+python-xlib
+pynput
+
+# System dependency for demo-clipboard-event-listener.py: sudo apt install xclip

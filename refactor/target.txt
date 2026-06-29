@@ -1,0 +1,10 @@
+use a background daemon to store data, listen for events and provide http api for querying data in frontend or unix domain socket?
+
+currently frontend handles some compute. need to offload to daemon.
+
+use fastapi for daemon apis, use tkinter for frontend ui.
+
+write code for daemon, frontend, and api under this "refactor" folder. provide requirements.txt and assiciated python version.
+
+can we put api code in the daemon?
+

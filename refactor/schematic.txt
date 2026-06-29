@@ -1,0 +1,27 @@
+reference code at: /home/jamesbrown/Desktop/works/desktop_overview_with_search/reference_v2
+
+background daemon use sqlite for text storage, and file for storing images. reference those images with relative file path in the database.
+
+background daemon shall be fully async and non-blocking.
+
+the background daemon is responsible for:
+
+    - generate boot id per daemon process, and associate the boot id with window ids, to ensure the window is actually opening, instead of closed.
+    - track window lifespan, alive or not.
+    - tracking for focus changes, virtual desktop names, window titles
+    - get a list of opening windows and ids
+    - store clipboard content, selection content, selection read events, clipboard read events, associate them with window ids.
+    - store keyboard events (visible characters only), associate them with window ids. prepare those events for full text search by concatination using idle time threshold or triggered by window focus change.
+    - store window captures along with timestamp. can get latest window capture.
+
+the frontend ui is responsible for:
+
+    search windows by window title, clipboard content, selection content, keyboard input text. can optionally select which fields to search, or combine all fields.
+
+    display windows in a grid view in search results.
+
+    can sort windows by last access time, display current window title and current virtual desktop name & id associated with the window
+
+    display windows in timeline view, show which windows were active in the past, with what title or titles displayed (title change history)
+
+    can query for window history, if given from time and end time, display results, show whether those windows are accessible or not. can filter results by window liveness status, show "only alive" or "only dead" or "both" windows. display "hit" fields and highlight the search excerpt in those fields. (only show fields that were searched for and containing the search term, can be configured to show all fields or just the hit fields)

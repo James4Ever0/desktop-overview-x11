@@ -1,0 +1,184 @@
+================================================================================
+PLAN: Detecting window TITLE changes (which window + new title)
+File: plan-get-window-title-change.txt
+Target: Kubuntu 22.04 / KDE Plasma on X11
+================================================================================
+
+--------------------------------------------------------------------------------
+0. GOAL
+--------------------------------------------------------------------------------
+Know, in real time:
+  - WHEN any window's title changes (_NET_WM_NAME / WM_NAME),
+  - WHICH window changed (as a wmctrl-style id, e.g. 0x05400007),
+  - the NEW title text.
+
+--------------------------------------------------------------------------------
+1. THE KEY X11 FACT (and why your log looks the way it does)
+--------------------------------------------------------------------------------
+`xev -root` selects events on the ROOT window only. A PropertyNotify is delivered
+to a window only if THAT window has PropertyChangeMask selected. A window's title
+(_NET_WM_NAME, the UTF-8 title; or the legacy WM_NAME) is a property stored on the
+CLIENT window, NOT on root.
+
+Therefore: a pure title change of some app window produces NO event on root, and
+`xev -root` will never show it.
+
+Your pasted log confirms this exactly:
+  - EVERY PropertyNotify is `window 0x831` (root).
+  - The only atoms that appear are:
+        CLIP_TEMPORARY            -> clipboard churn, ignore
+        _NET_CLIENT_LIST_STACKING -> window stacking/open/close order changed
+        _NET_ACTIVE_WINDOW        -> focus/active window changed
+  - _NET_WM_NAME NEVER appears. The ConfigureNotify spam for 0x20079a and
+    0x44039b3 are tiny override-redirect popups/tooltips (note "override YES"),
+    not real app windows — also ignore.
+
+So "there might be a PropertyNewValue for the title on root" — unfortunately no.
+PropertyNewValue on root only refers to root-owned atoms above.
+
+CONCLUSION: to catch title changes you MUST watch the client windows themselves.
+The good news: that does NOT require a separate thread (see section 2). One
+process + one event loop can watch root AND every client window simultaneously,
+because the X server multiplexes all events for a single connection into one
+stream.
+
+--------------------------------------------------------------------------------
+2. WHY NO SEPARATE THREAD IS NEEDED
+--------------------------------------------------------------------------------
+A single X11 connection can XSelectInput(PropertyChangeMask) on many windows
+(root + every client). All their PropertyNotify events arrive on ONE event queue,
+read by ONE blocking loop (next_event). Threads are never required:
+  - Multiple windows  -> one connection, one select() / next_event() loop.
+  - Multiple pipes (if using subprocess approach) -> one select() over all fds.
+  - Integrating with a GUI/asyncio -> register the X connection fd with the event
+    loop (add_reader) so it stays single-threaded and non-blocking.
+
+The earlier "separate thread" remark was about spawning `xev -id <win>` PER
+window (many processes) — that's avoidable. The clean designs below are all
+single-thread.
+
+--------------------------------------------------------------------------------
+3. APPROACH A (RECOMMENDED): python-xlib, one process, one thread
+--------------------------------------------------------------------------------
+Dependency: python3-xlib  (pip install python-xlib  /  apt install python3-xlib)
+
+Steps:
+  1. Open display; get root window.
+  2. root.change_attributes(event_mask=PropertyChangeMask) so we get
+     _NET_CLIENT_LIST / _NET_ACTIVE_WINDOW / _NET_CURRENT_DESKTOP changes.
+  3. Read _NET_CLIENT_LIST (or _NET_CLIENT_LIST_STACKING) to enumerate all client
+     windows. For each window, win.change_attributes(event_mask=PropertyChangeMask).
+     Wrap in try/except for BadWindow (windows can vanish between list and select).
+  4. Keep a dict {window_id: last_title}.
+  5. Event loop (blocking, single thread):
+       ev = display.next_event()
+       if ev is PropertyNotify:
+           name = display.get_atom_name(ev.atom)
+           if ev.window == root and name in ("_NET_CLIENT_LIST",
+                                             "_NET_CLIENT_LIST_STACKING"):
+               -> re-enumerate clients; select PropertyChangeMask on NEW windows;
+                  drop ids that disappeared.
+           elif name in ("_NET_WM_NAME", "WM_NAME"):
+               -> title = read_title(ev.window)
+                  if title != last_title[ev.window]:
+                      emit(window_id=0x%08x, new_title=title)
+                      last_title[ev.window] = title
+  6. read_title(win): prefer _NET_WM_NAME (UTF8_STRING), fall back to WM_NAME.
+     Decode UTF-8. Handle empty / missing.
+  7. id format: python-xlib win.id is the X id integer -> format f"0x{win.id:08x}"
+     to match `wmctrl -l`.
+
+Error handling:
+  - Install a Display error handler (or try/except around every property get) so a
+    BadWindow on a just-closed window doesn't crash the loop.
+  - On _NET_CLIENT_LIST change, reconcile the watched set (add new, forget gone).
+
+Non-blocking / integration:
+  - Pure listener: next_event() blocking loop is fine.
+  - Inside a GUI/asyncio: use display.pending_events() + register display.fileno()
+    with select()/add_reader so you never block the UI. Still one thread.
+
+Pros: precise, event-driven, low latency, single process, exact window ids.
+Cons: adds python-xlib dependency.
+
+--------------------------------------------------------------------------------
+4. APPROACH B: xprop -spy per window (no python-xlib)
+--------------------------------------------------------------------------------
+`xprop -spy -id <wid> _NET_WM_NAME WM_NAME` stays running and prints a line every
+time those properties change on that one window.
+
+Design:
+  - Maintain one `xprop -spy` subprocess per client window.
+  - On startup, enumerate via `wmctrl -l` and spawn a spy per window.
+  - Also run `xprop -spy -root _NET_CLIENT_LIST _NET_ACTIVE_WINDOW` (or the xev
+    -root listener) to learn when windows open/close, then spawn/kill spies.
+  - Read ALL spy stdout pipes in ONE select() loop (single thread, non-blocking).
+    Each readable line -> parse new title -> emit (wid, title).
+
+Pros: no python-xlib; reuses CLI tools already present.
+Cons: N subprocesses (one per window); more lifecycle bookkeeping. Still 1 thread
+      via select(), but heavier than Approach A.
+
+--------------------------------------------------------------------------------
+5. APPROACH C: xev -root (events) + wmctrl polling (titles)  [simplest, no deps]
+--------------------------------------------------------------------------------
+Keep the existing single-thread xev -root listener for the cheap, event-driven
+signals (focus, active window, client list, desktop). For titles, poll:
+
+  - Build a title map from `wmctrl -l`: {wid: title}.
+  - Re-read it and diff on two triggers:
+      (a) event-driven: whenever _NET_ACTIVE_WINDOW or _NET_CLIENT_LIST_STACKING
+          fires (these often coincide with the title change you care about), AND
+      (b) a low-frequency timer (e.g. every 1-2 s) to catch "silent" title changes
+          of background windows that fire no root event.
+  - Any wid whose title differs from the stored map -> emit (wid, old, new).
+
+Pros: zero new dependencies; trivially single-thread (event loop + timer).
+Cons: up to ~1-2 s latency; periodic `wmctrl -l` cost; can miss a change that
+      reverts within one poll interval.
+
+--------------------------------------------------------------------------------
+6. READING A TITLE ON DEMAND (commands, for any approach)
+--------------------------------------------------------------------------------
+  xprop -id <wid> _NET_WM_NAME WM_NAME
+      _NET_WM_NAME(UTF8_STRING) = "terminal-searcher : claude — Konsole"
+  wmctrl -l                          # column 4+ is the title
+  xdotool getwindowname <decimal-wid>   # note: xdotool wants DECIMAL id
+
+Title source priority: _NET_WM_NAME (UTF-8, modern) > WM_NAME (legacy/Latin-1).
+
+--------------------------------------------------------------------------------
+7. ID NORMALIZATION (so ids match `wmctrl -l`)
+--------------------------------------------------------------------------------
+  wmctrl prints zero-padded 8-hex-digit lowercase: 0x05400007
+  xprop / xlib print without leading zeros:        0x5400007
+  xdotool prints DECIMAL:                          88080391
+Normalize all to wmctrl form:
+  hex string -> f"0x{int(s,16):08x}"
+  decimal    -> f"0x{int(s,10):08x}"
+
+--------------------------------------------------------------------------------
+8. EDGE CASES / CAVEATS
+--------------------------------------------------------------------------------
+  - Filter to REAL windows: only those listed in _NET_CLIENT_LIST / wmctrl -l.
+    Ignore override-redirect popups/tooltips (the 0x44039b3-style ConfigureNotify
+    churn in your log).
+  - Frame vs client window: _NET_WM_NAME and _NET_ACTIVE_WINDOW use the CLIENT
+    window; wmctrl lists the client window; these agree. (Reparenting WMs add a
+    frame window with a different id — don't watch the frame for the title.)
+  - Windows disappear mid-operation -> expect/catch BadWindow.
+  - UTF-8 decode; some apps update the title many times/sec (terminals) -> debounce
+    by comparing to last stored title before emitting.
+  - X11 only. Under Wayland none of this (xev/xprop/wmctrl/xdotool) works.
+
+--------------------------------------------------------------------------------
+9. RECOMMENDATION
+--------------------------------------------------------------------------------
+  - Want precise, low-latency, single-process: APPROACH A (python-xlib).
+  - Want zero new dependencies and can tolerate ~1-2 s latency: APPROACH C.
+  - Avoid B unless you specifically cannot add python-xlib and dislike polling.
+
+All three are single-threaded. The only thing that is genuinely impossible is
+"see title changes from `xev -root` alone" — you must watch the client windows
+(A/B) or poll their titles (C).
+================================================================================

@@ -1,0 +1,87 @@
+Keyboard Event Listener Plan
+============================
+Goal: A standalone script that globally listens to keyboard keydown events,
+captures printable/visible keypresses with timestamps, and prints the
+aggregated buffer at a configurable interval.
+
+The script is purely a keyboard event logger — no GUI, no window preview.
+
+Design
+------
+1. Dependencies
+   - `pynput` (pip package)
+   - Single file: demo-keyevent-listener.py
+
+2. Global config variable
+   - KEY_BUFFER_DUMP_INTERVAL_S = 60  (configurable, dump interval in seconds)
+
+3. Data structures (module-level)
+   - _key_buffer: list of (timestamp: float, key_repr: str) tuples
+     e.g. [(1234567890.123, 'a'), (1234567890.456, 'Enter'), ...]
+   - _buffer_lock: threading.Lock for thread-safe buffer access
+
+4. Key filtering logic (what counts as "visible"/printable)
+   Accept:
+   - KeyCode (character keys): letters, digits, punctuation, space
+   - Key.space -> 'Space'
+   - Key.tab -> 'Tab'
+   - Key.enter -> 'Enter'
+   - Key.backspace -> 'Backspace'
+   Reject:
+   - Key.shift, Key.shift_r, Key.ctrl_l, Key.ctrl_r, Key.alt_l, Key.alt_gr
+   - Key.cmd, Key.caps_lock, Key.num_lock, Key.scroll_lock
+   - Function keys (Key.f1 .. Key.f12)
+   - Key.esc, Key.insert, Key.delete, Key.home, Key.end, Key.page_up, Key.page_down
+   - Key.print_screen, Key.pause, Key.menu
+   - Any Key.left, Key.right, Key.up, Key.down (arrow keys)
+
+5. pynput listener callback (runs in pynput's internal thread)
+   def _on_key_press(key):
+       ts = time.time()
+       rep = _key_to_repr(key)       # returns None for non-printable
+       if rep is None:
+           return True                # keep listening
+       with _buffer_lock:
+           _key_buffer.append((ts, rep))
+       return True                    # always return True to keep listener alive
+
+6. _key_to_repr(key) helper
+   - If key is KeyCode (has .char attribute):
+       if key.char is not None -> return key.char (normal printable)
+       else -> return None
+   - If key is Key enum:
+       if key in {Key.space, Key.tab, Key.enter, Key.backspace} -> return str(key).replace('Key.', '')
+       else -> return None
+   - otherwise -> return None
+
+7. Buffer dump function (runs in its own daemon thread)
+   def _dump_key_buffer():
+       while True:
+           time.sleep(KEY_BUFFER_DUMP_INTERVAL_S)
+           with _buffer_lock:
+               if not _key_buffer:
+                   print("[keyboard] buffer empty this interval", file=sys.stderr)
+                   continue
+               print("=" * 60, file=sys.stderr)
+               print(f"[keyboard] Buffer dump ({len(_key_buffer)} keys):", file=sys.stderr)
+               for ts, rep in _key_buffer:
+                   dt = datetime.fromtimestamp(ts)
+                   print(f"  {dt.strftime('%H:%M:%S.%f')[:-3]}  {rep!r}", file=sys.stderr)
+               print("=" * 60, file=sys.stderr)
+   No clear() step — buffer accumulates forever as per requirement.
+
+8. Program structure (standalone script)
+   a. Imports: sys, time, threading, datetime, pynput.keyboard (Listener, Key, KeyCode)
+   b. Global config: KEY_BUFFER_DUMP_INTERVAL_S
+   c. Data: _key_buffer, _buffer_lock
+   d. Functions: _key_to_repr, _on_key_press, _dump_key_buffer, _start_listener
+   e. __main__: call _start_listener(), then keep main thread alive with a signal pause
+
+9. Thread safety
+   - pynput listener callback runs in pynput's internal thread
+   - dump thread reads buffer periodically
+   - threading.Lock protects all buffer access
+
+10. Files to modify:
+    - CREATE demo-keyevent-listener.py (standalone, ~80 lines)
+    - UPDATE requirements.txt (already has pynput)

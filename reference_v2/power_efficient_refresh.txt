@@ -1,0 +1,4 @@
+
+to be power efficient: for every x seconds, update current focused window image and selectively update y window images in the background. you would enqueue background window id update tasks, shuffle those ids and shuffle again if running out. for example, if total z background windows, after x seconds, you can select among x-y window ids (skip those gone), and perform image update, then after x seconds, you will have x-2*y window ids to update, and so on, till ids running out you would collect all ids and shuffle again.
+
+the first refresh on program start is always full refresh.

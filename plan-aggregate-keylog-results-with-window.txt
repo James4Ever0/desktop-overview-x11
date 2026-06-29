@@ -1,0 +1,8 @@
+if focused on the same window, aggregate keylog results every 10 seconds, concat and push to buffer
+if on defocusing, immediately push aggregated keys to buffer
+
+or just to store the single visible key event whenever received? could be more accurate but more memory intensive, and hard to perform full text search.
+
+could just store the aggregated keys on window focus change.
+
+what to store: window title, window id, timestamp, aggregated keys, virtual desktop id.

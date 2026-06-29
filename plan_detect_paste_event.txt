@@ -1,0 +1,263 @@
+================================================================================
+PLAN: Detect paste events on X11 (Kubuntu 22.04 / KDE Plasma, KWin)
+================================================================================
+Env    : /home/jamesbrown/miniforge3/envs/gui_agent  (python 3.12, python-xlib 0.33)
+Context: companion to demo-selection-event-listener-v1.py (XFIXES PRIMARY owner
+         listener = COPY/SELECT detection) and window-focus-tracker.py.
+         This plan adds PASTE detection.
+
+--------------------------------------------------------------------------------
+0. THE ONE FACT THAT SHAPES EVERYTHING
+--------------------------------------------------------------------------------
+"Paste" is NOT an X11 protocol concept. X11 has only:
+  - SELECTIONS (PRIMARY, CLIPBOARD) and OWNERSHIP of them.
+  - A pull-based CONVERSION handshake: the destination app calls
+    XConvertSelection(sel) -> the selection OWNER gets a SelectionRequest event
+    -> owner writes data to a property on the requestor -> sends SelectionNotify.
+
+A paste is an APPLICATION-LEVEL interpretation: a gesture (Ctrl+V, middle-click)
+that makes the focused app issue XConvertSelection. The conversion handshake
+happens privately between the OWNER client and the REQUESTOR client. No event is
+broadcast to the root window or to third parties.
+
+Consequence (direct answer to the .txt's third question — see §4):
+  - You CANNOT passively "read a PRIMARY/CLIPBOARD paste event" as an outside
+    observer, because no such event exists for non-participants.
+  - The only X-protocol-true paste signal is the SelectionRequest event, and you
+    receive it ONLY if YOU are the selection owner (i.e. you act as a clipboard
+    manager). That is the sole accurate method; everything else is a gesture
+    heuristic.
+
+So there are exactly two families of approach:
+  A. GESTURE-based (passive, easy, heuristic)   -> §1, §2  (covers the .txt asks)
+  B. OWNERSHIP-based (protocol-true, invasive)   -> §4.D
+
+--------------------------------------------------------------------------------
+1. KEYBOARD PASTE SHORTCUTS  (Ctrl+V, Ctrl+Shift+V)
+--------------------------------------------------------------------------------
+Goal: fire when the user presses a paste shortcut.
+
+Watched set: {Ctrl+V, Ctrl+Shift+V}.
+  - Ctrl+V is the near-universal paste.
+  - Ctrl+Shift+V is "paste special/unformatted" and is the paste chord in
+    terminals (Konsole).
+  => Keep the watched set CONFIGURABLE so it can be extended later if needed; log
+     which combo fired.
+
+HOW (recommended): XRecord extension — passive, non-intrusive global monitor.
+  - python-xlib: Xlib.ext.record  (record.CreateContext / enable_context).
+  - Record category: KeyPress (and KeyRelease if you want to debounce autorepeat).
+  - For each KeyPress, decode:
+      keysym  = display.keycode_to_keysym(event.detail, index)
+      mods    = event.state   (ButtonMask/ModMask bitfield — already populated)
+    Match: keysym == XK_v AND (mods & ControlMask) AND
+           (Shift required? -> check (mods & ShiftMask)).
+  - state already carries the modifier bits at press time, so NO manual modifier
+    bookkeeping is needed (unlike a from-scratch grab).
+  - XRecord SEES the event without consuming it — the keystroke still reaches the
+    focused app. This is the crucial advantage over XGrabKey (which is exclusive
+    and would require replaying the event).
+
+HOW (alternative, SIMPLEST): pynput — high-level cross-platform input listener.
+  - pip install pynput  (Linux/X11 backend wraps Xlib's record ext internally, so
+    it is passive/global and does NOT consume the event — same non-intrusive
+    property as raw XRecord, with far less boilerplate).
+  - Keyboard:
+        from pynput import keyboard
+        keyboard.Listener(on_press=..., on_release=...).start()
+    pynput delivers ONE event per physical key, with NO cooked modifier `state`
+    field, so you MUST track Ctrl/Shift yourself:
+      - on_press/on_release of Key.ctrl[_l/_r] and Key.shift[_l/_r] -> maintain a
+        small "held modifiers" set.
+      - when a KeyCode for 'v' is pressed, check the held set:
+            Ctrl only         -> Ctrl+V
+            Ctrl+Shift        -> Ctrl+Shift+V
+    Beware: with Ctrl held, the char may arrive as a control code; match on
+    key.vk / KeyCode.from_char('v').vk rather than key.char, and debounce
+    autorepeat (ignore repeats until a release).
+  - PROS: ~20-30 lines, no keycode->keysym table, cross-platform, easy mouse hook
+    too (§2).
+  - CONS vs XRecord: you track modifiers manually (no `state`); you do NOT get the
+    X server event timestamp or requestor window (use wall-clock _fmt_cst instead);
+    X11-only (no Wayland — fine here); runs its own background thread.
+
+  => Pick ONE backend: pynput for fastest implementation; raw XRecord (above) if
+     you want the X server timestamp, the pointer/window on the event, or to avoid
+     the extra dependency. Both are passive and non-consuming.
+
+ALTERNATIVE: XInput2 RawKeyPress on root via XISelectEvents.
+  - Also passive/global, but RawKeyPress gives raw keycodes WITHOUT the cooked
+    modifier `state`, so you must track Ctrl/Shift up/down yourself. More work.
+  - python-xlib's xinput support is thinner than its record support.
+  => Prefer XRecord.
+
+AVOID: XGrabKey on the root.
+  - Exclusive grab -> the app stops receiving the key unless you XAllowEvents /
+    XSendEvent replay it. Fragile, can break the very paste you wanted to observe.
+  - Only acceptable if you intend to INTERCEPT (not just observe).
+
+DIFFICULTY: MODERATE.
+  - Boilerplate to set up the record context + a keycode->keysym decode + modifier
+    mask check + autorepeat debounce. ~60-100 lines. Well-trodden (this is how
+    key-loggers / hotkey daemons work).
+LIMITATION (state clearly in output):
+  - A shortcut press only proves the KEYS were pressed, NOT that the focused app
+    interpreted them as paste (app may be unfocused-on-a-menu, may rebind, the
+    field may be read-only, paste may be empty). It is a STRONG candidate, not
+    proof. For proof you need §4.D.
+
+--------------------------------------------------------------------------------
+2. MIDDLE MOUSE BUTTON  (PRIMARY-selection paste)
+--------------------------------------------------------------------------------
+Goal: fire on middle-click, the classic X11 PRIMARY paste.
+
+HOW: same XRecord loop as §1, but record the ButtonPress category and filter
+     event.detail == 2  (button 2 = middle).
+  - Optionally capture the pointer window/coords from the event for correlation
+    with window-focus-tracker (which app received the click).
+
+HOW (pynput alternative): same listener family as §1.
+        from pynput import mouse
+        def on_click(x, y, button, pressed):
+            if pressed and button == mouse.Button.middle:
+                ...   # candidate PRIMARY paste; x, y give pointer location
+        mouse.Listener(on_click=on_click).start()
+  - One callback, trivial filter on Button.middle. If you adopt pynput for §1,
+    use it here too so there is a single backend.
+
+DIFFICULTY: EASY (once the §1 XRecord loop exists, this is a one-line filter).
+LIMITATION (state clearly):
+  - Middle-click is heavily overloaded: browser autoscroll, open-link-in-new-tab,
+    close-tab, app-specific actions. So a middle-click is an even WEAKER paste
+    signal than a keyboard shortcut. Treat as a candidate; corroborate (§5).
+
+--------------------------------------------------------------------------------
+3. WHAT YOU CAN DO ONCE A GESTURE FIRES  (capture the pasted content)
+--------------------------------------------------------------------------------
+A detected gesture tells you a paste is LIKELY; to record WHAT was pasted, read
+the relevant selection at that instant — reuse the existing xclip path:
+  - Ctrl+V / Ctrl+Shift+V  -> read CLIPBOARD:
+        xclip -selection clipboard -o -t UTF8_STRING
+  - Middle-click           -> read PRIMARY:
+        xclip -selection primary  -o -t UTF8_STRING   (already in demo code)
+NOTE: reading the selection does NOT by itself detect a paste — it is pull-based
+and readable at any time. It only ENRICHES a gesture you already detected. The
+content read is the likely-pasted text (subject to a tiny race if the user copies
+again within milliseconds).
+
+--------------------------------------------------------------------------------
+4. "OTHER WAYS" — reading PRIMARY / CLIPBOARD events on X11  (the .txt's Q3)
+--------------------------------------------------------------------------------
+Evaluated honestly, with reasons:
+
+  4.A  XFIXES selection notifications  -> CANNOT detect paste.
+       XFIXES only emits, for a watched selection:
+         SetSelectionOwnerNotify     (owner changed = a COPY/new selection)
+         SelectionWindowDestroyNotify (owner window destroyed)
+         SelectionClientCloseNotify   (owner client disconnected)
+       There is NO "selection was requested/converted" notification. XFIXES was
+       designed to tell you when content CHANGES, not when it is READ. So the very
+       extension this project already uses gives copy-detection but is structurally
+       incapable of paste-detection. (This is why the existing listener catches
+       selects, not pastes.)
+
+  4.B  Passively observing the SelectionRequest/SelectionNotify handshake
+       as a third party  -> IMPOSSIBLE in core X11.
+       Those events are delivered only to the two participating windows (owner and
+       requestor). A monitor that owns neither is never sent them. There is no
+       "promiscuous mode" for selection traffic. REASON: X11 selection transfer is
+       point-to-point by design (privacy + no broadcast storm).
+
+  4.C  clipnotify / clipmon / `xclip` polling  -> detects COPY, not paste.
+       clipnotify blocks on XFIXES owner-change (same as 4.A). Polling xclip shows
+       content CHANGES (copies), never reads (pastes). Wrong signal entirely.
+
+  4.D  BECOME the selection owner (clipboard-manager pattern) -> the ONLY
+       protocol-true paste detection.  Difficulty: HARD / invasive.
+       Mechanism:
+         - Take ownership of CLIPBOARD (and/or PRIMARY) with XSetSelectionOwner
+           on a window you create.
+         - When ANY app pastes, IT calls XConvertSelection on the selection you
+           own, so the X server sends YOU a SelectionRequest event. THAT event is
+           a real, ground-truth paste signal, and it includes:
+               .requestor  -> the window doing the paste (=> which app pasted!)
+               .target     -> the format requested (UTF8_STRING, TARGETS, etc.)
+               .time       -> server timestamp
+         - You MUST then serve the data: write the real clipboard content to the
+           requestor's property and send SelectionNotify — otherwise you have
+           silently destroyed the user's clipboard.
+       Costs / why it's hard:
+         - You must cache and faithfully re-serve the true content for every
+           target type the app asks for (TARGETS negotiation, text/html, images…),
+           i.e. implement a real clipboard manager.
+         - You only own a selection until the next real copy steals ownership
+           (you get SelectionClear); to keep seeing pastes you must re-assert
+           ownership after the source vanishes, which fights klipper (KDE already
+           runs a clipboard manager — TWO managers conflict).
+         - PRIMARY ownership is even more disruptive (every text selection re-owns
+           PRIMARY constantly), so PRIMARY-paste-via-ownership is impractical;
+           middle-click gesture (§2) is the realistic PRIMARY path.
+       Verdict: technically the correct answer, but it means replacing/dueling
+       KDE's klipper and shouldering full clipboard-manager responsibilities.
+       Recommended ONLY if ground-truth "app X pasted at time T" is a hard
+       requirement. Otherwise prefer the gesture heuristics.
+
+  4.E  XConvertSelection issued BY us  -> N/A (that is us pasting, not observing).
+
+  4.F  AT-SPI2 accessibility bus  -> unreliable.
+       Some toolkits expose edit actions over AT-SPI, but coverage is partial,
+       toolkit-dependent, and not a dependable paste signal. Not worth it.
+
+  Edge: synthetic pastes (xdotool / XSendEvent) — XRecord captures real device
+  events; injected events may or may not appear depending on how they are sent.
+  Ownership-based detection (4.D) DOES catch a synthetic paste, because it still
+  issues a real XConvertSelection. Minor; note in logs.
+
+--------------------------------------------------------------------------------
+5. RECOMMENDED DESIGN  (pragmatic, matches existing project shape)
+--------------------------------------------------------------------------------
+Tier 1 (DO THIS — easy/moderate, non-invasive, covers the .txt asks):
+  - One input monitor watching KeyPress + ButtonPress. Backend choice:
+      * pynput  -> fastest to build (keyboard.Listener + mouse.Listener), track
+                   Ctrl/Shift manually; OR
+      * XRecord -> lower-level, gives X server timestamp + event window.
+    Use a SINGLE backend for both keys and mouse.
+  - KeyPress: match configurable set {Ctrl+V, Ctrl+Shift+V}; debounce autorepeat.
+  - ButtonPress detail==2: middle-click candidate.
+  - On any match: timestamp (reuse _fmt_cst CST helper), read the matching
+    selection via xclip (CLIPBOARD for keys, PRIMARY for middle-click), log
+    "PASTE CANDIDATE | gesture=… | <chars> chars | preview=…", and (optionally)
+    correlate with the focused window from window-focus-tracker.
+  - Clearly label these as CANDIDATES, not confirmed pastes.
+
+Tier 2 (OPTIONAL — only if ground truth is required): the §4.D clipboard-owner
+  approach, ideally limited to CLIPBOARD, and coordinated with / replacing klipper.
+
+CONFIDENCE LADDER (how to phrase detections):
+  middle-click            -> weak candidate (overloaded button)
+  paste keychord          -> strong candidate (still app-dependent)
+  SelectionRequest (4.D)  -> confirmed paste (+ requestor window)
+
+--------------------------------------------------------------------------------
+6. DIFFICULTY SUMMARY
+--------------------------------------------------------------------------------
+  Ctrl+V / Ctrl+Shift+V detection (XRecord or pynput) ... MODERATE  (do it)
+  Middle-click detection (XRecord or pynput)          ... EASY      (do it)
+  Enrich with selection content (xclip)               ... EASY      (reuse demo)
+  Passive 3rd-party paste event from X11              ... IMPOSSIBLE (reason §4.A/B)
+  Ground-truth paste via owning the selection         ... HARD      (§4.D, invasive)
+
+--------------------------------------------------------------------------------
+7. DEPENDENCIES / NOTES
+--------------------------------------------------------------------------------
+  - XRecord must be enabled in the X server (default on Xorg; verify with
+    `xdpyinfo | grep -i record`). python-xlib ships Xlib.ext.record.
+  - pynput backend (if chosen): pip install pynput; on Linux it uses the X11
+    backend (Xlib record) under the hood, so the same XRecord server support
+    applies. X11 only (no Wayland) — fine for this target.
+  - Run a SEPARATE display connection for the record context (XRecord best
+    practice: one connection records, one controls), mirroring how the existing
+    demo opens its own Display.
+  - python binary: /home/jamesbrown/miniforge3/envs/gui_agent/bin/python
+  - xclip already a project dependency.
+================================================================================

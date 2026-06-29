@@ -1,0 +1,323 @@
+================================================================================
+PLAN: Clipboard event listener — log copy/paste events + content type + preview
+File: plan-clipboard-event-listener.txt
+Target: Kubuntu 22.04 / KDE Plasma (KWin, Klipper) on X11
+================================================================================
+
+--------------------------------------------------------------------------------
+0. GOAL
+--------------------------------------------------------------------------------
+Listen for clipboard activity and, for each event, print:
+  - a TIMESTAMP,
+  - whether it was a WRITE (copy) or a READ (paste) event,
+  - the CONTENT TYPE: image / file path(s) / text / other,
+  - a PREVIEW for text-like content:
+        total chars, total bytes, and the first 100 chars (rest discarded),
+    and a compact descriptor for non-text (e.g. "<image PNG 24KB 1920x1080>",
+    "<3 files>").
+
+--------------------------------------------------------------------------------
+1. THE HARD TRUTH ABOUT X11 CLIPBOARDS (read THIS first)
+--------------------------------------------------------------------------------
+X11 has NO central clipboard buffer. The app that copied is the "selection
+OWNER" and holds the data; a paste is a peer-to-peer request from the pasting app
+to the owner. Consequences for a *listener*:
+
+  WRITE / COPY events  -> OBSERVABLE.
+      When some app takes ownership of a selection (i.e. a copy happens), the
+      XFIXES extension emits a SelectionOwnerNotify. A passive listener gets this
+      for every copy, system-wide. This is the reliable event.
+
+  READ / PASTE events  -> NOT OBSERVABLE in general.
+      A paste is a direct conversation between the pasting app and the current
+      OWNER. A third-party process is not in that loop and CANNOT see that a paste
+      happened. The ONLY way to see read/paste requests is to BE the owner
+      yourself — then you receive SelectionRequest events telling you who asked
+      and which target (type) they wanted. That means hijacking ownership
+      (clipboard-manager behaviour), which changes system behaviour and is
+      generally undesirable.
+
+  => Practical design: treat "clipboard CHANGED (a copy/write happened)" as the
+     primary event. Honestly label it WRITE. Only attempt READ logging in the
+     special, opt-in mode where this tool deliberately owns the selection (§6).
+     Do not promise global paste detection — X11 cannot deliver it.
+
+There are THREE selections; watch the two that matter:
+  CLIPBOARD  = explicit Ctrl+C / Ctrl+V copy buffer        (watch this)
+  PRIMARY    = highlight-to-copy / middle-click-paste       (watch this too; noisy)
+  SECONDARY  = legacy, essentially unused                   (ignore)
+
+--------------------------------------------------------------------------------
+2. CAN WE USE pyperclip?  -> NO (not for this)
+--------------------------------------------------------------------------------
+pyperclip is get/set TEXT only. Specifically it CANNOT:
+  - give events (you'd have to POLL paste() in a loop -> misses fast changes,
+    burns CPU, and still can't tell read vs write),
+  - detect images or file lists (text only),
+  - report content type or byte counts of non-text.
+So pyperclip is unsuitable. Use it (or xsel/xclip) at most as a text-only
+last-resort polling fallback. The right tools are XFIXES (events) + xclip/xsel or
+Qt's QClipboard (events + type) — see §3.
+
+--------------------------------------------------------------------------------
+3. APPROACHES (ranked)
+--------------------------------------------------------------------------------
+A) python-xlib + XFIXES  (events) + xclip (content)   [RECOMMENDED, pure X11]
+   - XFIXES gives event-driven copy/ownership notifications for CLIPBOARD &
+     PRIMARY — no polling.
+   - For each event, read the available TARGETS and the content. Reading raw via
+     Xlib means convert_selection + SelectionNotify + INCR handling (images arrive
+     chunked via the INCR protocol) — fiddly. PRAGMATIC HYBRID: use XFIXES only
+     for the EVENT, and shell out to `xclip` for the CONTENT/type. This avoids
+     reimplementing INCR and is robust:
+         xclip -selection clipboard -o -t TARGETS      # list available types
+         xclip -selection clipboard -o -t <type>       # fetch that type's bytes
+   - No desktop-environment dependency; works on any X11 WM.
+
+B) PyQt5 / PySide QClipboard.dataChanged              [easiest, great on KDE]
+   - Qt is already present on Kubuntu. QClipboard emits dataChanged (CLIPBOARD)
+     and selectionChanged (PRIMARY). QMimeData gives rich type detection:
+         cb.mimeData().hasImage() / hasUrls() / hasText() / formats()
+   - Event-driven, handles images & file urls natively, no INCR worries.
+   - Cost: pulls in a Qt event loop + python3-pyqt5.
+
+C) D-Bus Klipper signal  (org.kde.klipper)            [KDE-specific, text-centric]
+   - Klipper exposes signal `clipboardHistoryUpdated` and methods
+     getClipboardContents/getClipboardHistoryItem. Easy for TEXT copies, but
+     history is text-oriented and depends on Klipper running. Good as a
+     supplement, weak for images/files.
+
+D) Polling xclip/xsel/pyperclip                        [fallback only]
+   - Poll TARGETS+content every ~300-500ms, diff against last hash. No true
+     events; can miss transient copies; text-mostly. Use only if A/B unavailable.
+
+RECOMMENDATION: A (xlib+XFIXES for events, xclip for content) if you want pure
+X11 and no Qt; B (QClipboard) if a Qt dependency is fine and you want the simplest
+robust type detection.
+
+--------------------------------------------------------------------------------
+4. CONTENT-TYPE CLASSIFICATION (from the TARGETS list)
+--------------------------------------------------------------------------------
+First fetch the list of offered targets (MIME-ish atom names), then classify by
+priority:
+
+   1. IMAGE   : any target starting with "image/" (image/png, image/jpeg,
+                image/bmp, image/tiff). Prefer image/png.
+   2. FILES   : "text/uri-list", or KDE/GNOME file-copy targets
+                "x-special/gnome-copied-files", "application/x-kde-cutselection",
+                "x-special/KDE-..." -> parse uri-list ("file:///path" per line).
+   3. HTML    : "text/html" present -> rich text (still has a plain-text form).
+   4. TEXT    : "UTF8_STRING", "STRING", "TEXT", "text/plain", "text/plain;charset=utf-8".
+   5. OTHER   : none of the above -> print the raw target list as the "type".
+
+Example raw target dumps:
+   text copy:   TARGETS  UTF8_STRING  STRING  TEXT  text/plain;charset=utf-8
+   image copy:  TARGETS  image/png  image/bmp  image/x-bmp  image/x-MS-bmp
+   file copy:   TARGETS  text/uri-list  x-special/gnome-copied-files  UTF8_STRING
+
+--------------------------------------------------------------------------------
+5. PREVIEW / ABBREVIATION RULES (what to PRINT)
+--------------------------------------------------------------------------------
+TEXT-like (TEXT / HTML / uri-list-as-text):
+   raw   = fetched bytes
+   text  = raw.decode("utf-8", "replace")
+   total_chars = len(text)
+   total_bytes = len(raw)
+   preview = text[:100] with control chars escaped (\\n -> "\\n", \\t -> "\\t")
+   line  -> "TEXT  chars=<total_chars> bytes=<total_bytes>  preview="<preview>"
+            (+<total_chars-100> more chars)"    # show "+N more" only if truncated
+
+IMAGE (do NOT dump bytes):
+   total_bytes = len(raw)
+   optionally width/height via PIL: Image.open(BytesIO(raw)).size
+   line  -> "IMAGE <fmt> <human_bytes>  <WxH>"    e.g. "IMAGE PNG 24.1KB 1920x1080"
+
+FILES (text/uri-list):
+   uris  = [l for l in text.splitlines() if l and not l.startswith("#")]
+   paths = [unquote(u[7:]) for u in uris if u.startswith("file://")]
+   line  -> "FILES count=<n>  " + "; ".join(paths[:5]) + (" ..." if n>5 else "")
+
+OTHER:
+   line  -> "OTHER targets=[...]  bytes=<len>"  (no content dump)
+
+Human bytes helper: B / KB / MB with one decimal.
+
+Every line is prefixed with: "<HH:MM:SS.mmm> | <WRITE|READ> | <SELECTION> | ..."
+where SELECTION is CLIPBOARD or PRIMARY.
+
+--------------------------------------------------------------------------------
+6. WRITE vs READ — WHAT YOU CAN HONESTLY LABEL
+--------------------------------------------------------------------------------
+WRITE (copy): every XFIXES SelectionOwnerNotify => a new owner => something was
+   copied. Label "WRITE". This is the dependable case. The notify carries a server
+   TIMESTAMP (event.timestamp / selection_timestamp) in addition to wall clock.
+
+READ (paste): not visible globally (§1). Two honest options:
+   (a) DON'T claim to detect pastes; only log WRITE/CHANGE events. (default)
+   (b) OWN-THE-SELECTION mode (opt-in): this tool itself sets the clipboard (or
+       re-offers what it sees), so it becomes the OWNER. Then every paste sends us
+       a SelectionRequest, and we log:
+           "READ | requestor=<window id> | target=<type they asked for>"
+       This reveals read events + the type requested + (via _NET_WM_NAME on the
+       requestor) which app pasted. Caveats: you must serve the data back
+       correctly (handle TARGETS + INCR), you fight Klipper for ownership, and you
+       alter system behaviour. Treat as an explicit, clearly-labelled mode, not
+       the default.
+
+So: WRITE events = easy & global; READ events = only in owner mode, with effort.
+
+--------------------------------------------------------------------------------
+7. APPROACH A — CONCRETE SKELETON (python-xlib XFIXES + xclip)
+--------------------------------------------------------------------------------
+    import time, subprocess
+    from Xlib import display, X
+    from Xlib.ext import xfixes
+
+    dpy  = display.Display()
+    root = dpy.screen().root
+    if not dpy.has_extension('XFIXES'):
+        raise SystemExit("XFIXES missing (need libxfixes / python-xlib XFIXES).")
+    dpy.xfixes_query_version(4, 0)
+
+    SELS = {dpy.intern_atom('CLIPBOARD'): 'CLIPBOARD',
+            dpy.intern_atom('PRIMARY')  : 'PRIMARY'}
+    mask = (xfixes.XFixesSetSelectionOwnerNotifyMask
+            | xfixes.XFixesSelectionWindowDestroyNotifyMask
+            | xfixes.XFixesSelectionClientCloseNotifyMask)
+    for sel in SELS:
+        dpy.xfixes_select_selection_input(root, sel, mask)
+
+    def xclip(sel_name, target, binary=False):
+        # returns bytes or None; add timeout; never throw
+        try:
+            p = subprocess.run(
+                ['xclip', '-selection', sel_name.lower(), '-o', '-t', target],
+                capture_output=True, timeout=2.0)
+        except Exception:
+            return None
+        return p.stdout if p.returncode == 0 else None
+
+    last_hash = {}   # per-selection dedup
+    base = dpy.extension_event.SetSelectionOwnerNotify   # XFIXES event code
+    while True:
+        ev = dpy.next_event()
+        if ev.type != base:           # only XFIXES selection notifies
+            continue
+        sel_name = SELS.get(ev.selection)
+        if not sel_name:
+            continue
+        ts = time.strftime('%H:%M:%S')
+        targets = (xclip(sel_name, 'TARGETS') or b'').decode('ascii', 'replace').split()
+        kind = classify(targets)                     # §4
+        if kind == 'TEXT':
+            raw = xclip(sel_name, 'UTF8_STRING') or b''
+            ...                                       # §5 text preview + dedup by hash(raw)
+        elif kind == 'IMAGE':
+            raw = xclip(sel_name, pick_image_target(targets), binary=True) or b''
+            ...                                       # §5 image descriptor
+        elif kind == 'FILES':
+            raw = xclip(sel_name, 'text/uri-list') or b''
+            ...                                       # §5 files
+        # print: f"{ts} | WRITE | {sel_name} | {line}"
+
+Notes:
+  - Dedup: hash the fetched bytes; skip if equal to last_hash[sel_name] (owners
+    re-assert ownership and XFIXES can fire repeatedly for one logical copy).
+  - PRIMARY is very chatty (fires on every text highlight). Consider a flag to
+    mute PRIMARY, or rate-limit it.
+  - Reading content races the next copy; for a logger that's acceptable — note it.
+  - Pure-Xlib (no xclip) content read = convert_selection -> wait SelectionNotify
+    -> get_full_property, and you MUST handle INCR for large data (images). The
+    xclip hybrid sidesteps that; only go pure-Xlib if you can't depend on xclip.
+
+--------------------------------------------------------------------------------
+8. APPROACH B — CONCRETE SKELETON (PyQt5 QClipboard)
+--------------------------------------------------------------------------------
+    from PyQt5.QtWidgets import QApplication
+    import time, sys
+    app = QApplication(sys.argv)
+    cb  = app.clipboard()
+
+    def dump(mode_label, md):
+        ts = time.strftime('%H:%M:%S')
+        if md.hasImage():
+            img = cb.image()
+            print(f"{ts} | WRITE | {mode_label} | IMAGE {img.width()}x{img.height()}")
+        elif md.hasUrls():
+            urls = md.urls()
+            print(f"{ts} | WRITE | {mode_label} | FILES count={len(urls)} "
+                  + "; ".join(u.toLocalFile() for u in urls[:5]))
+        elif md.hasText():
+            t = md.text(); b = t.encode('utf-8')
+            prev = t[:100].replace('\\n','\\\\n')
+            more = f" (+{len(t)-100} more)" if len(t) > 100 else ""
+            print(f"{ts} | WRITE | {mode_label} | TEXT chars={len(t)} "
+                  f"bytes={len(b)} preview=\"{prev}\"{more}")
+        else:
+            print(f"{ts} | WRITE | {mode_label} | OTHER formats={md.formats()}")
+
+    cb.dataChanged.connect(lambda: dump('CLIPBOARD', cb.mimeData()))
+    cb.selectionChanged.connect(lambda: dump('PRIMARY',
+                                cb.mimeData(cb.Selection)))
+    sys.exit(app.exec_())
+
+Pros: native image/url/text detection, event-driven, ~30 lines. Cons: Qt dep;
+still WRITE-only (Qt also cannot see third-party pastes).
+
+--------------------------------------------------------------------------------
+9. PRIVACY / SECURITY (clipboard logging is sensitive)
+--------------------------------------------------------------------------------
+  - Password managers mark secret clipboard entries; honour them and DO NOT log
+    content. KDE/Plasma hint target: "x-kde-passwordManagerHint" (value "secret"),
+    also seen: "x-kde-passwordManagerHint", Firefox "application/x-moz-...". If a
+    concealment target is present -> log "TEXT <REDACTED: password-manager hint>"
+    with counts only, never the preview.
+  - Consider not persisting clipboard contents to disk; if you must, restrict file
+    perms and/or store only hashes + metadata, not the text.
+  - This tool can observe everything the user copies — make that explicit and
+    opt-in; don't run it silently.
+
+--------------------------------------------------------------------------------
+10. KDE / KUBUNTU 22.04 (X11) CAVEATS
+--------------------------------------------------------------------------------
+  - X11 only. echo $XDG_SESSION_TYPE must be "x11". On WAYLAND, XFIXES/xclip/Qt-X11
+    clipboard interception is restricted; the analog is `wl-paste --watch <cmd>`
+    (from wl-clipboard), which runs <cmd> on every clipboard change — use that
+    instead under Wayland.
+  - KLIPPER is KDE's clipboard manager and is itself a selection owner / re-offerer.
+    Expect to sometimes see Klipper as the owner, and to get extra ownership
+    notifies when Klipper restores history. Dedup by content hash to tame this.
+  - PRIMARY fires constantly (every text selection). Default to CLIPBOARD; make
+    PRIMARY opt-in.
+  - Large images use the INCR protocol; xclip handles it, raw Xlib must implement
+    it. (Another reason for the xclip hybrid.)
+  - Some apps offer stale TARGETS or fail conversion; treat xclip non-zero / empty
+    as "type unavailable" and fall back to the next candidate target.
+
+--------------------------------------------------------------------------------
+11. DEPENDENCIES & QUICK CHECKS
+--------------------------------------------------------------------------------
+  Approach A:  sudo apt install python3-xlib xclip        (xsel is an alt to xclip)
+  Approach B:  sudo apt install python3-pyqt5
+  Optional:    python3-pil (Pillow) for image WxH in Approach A.
+
+  Manual sanity checks:
+    $ xclip -selection clipboard -o -t TARGETS      # what types are on the clipboard now
+    $ xclip -selection clipboard -o -t UTF8_STRING  # current text
+    $ xfixes presence: python3 -c "from Xlib import display;print(display.Display().has_extension('XFIXES'))"
+    # copy some text / an image / a file in Dolphin, watch the listener print WRITE lines.
+
+--------------------------------------------------------------------------------
+12. TL;DR
+--------------------------------------------------------------------------------
+  - Copy/WRITE events: easy & global via XFIXES (or QClipboard.dataChanged).
+  - Paste/READ events: NOT globally observable on X11; only if THIS tool owns the
+    selection (opt-in §6). pyperclip can't do any of this (text-only, no events).
+  - Per event print: timestamp | WRITE/READ | selection | TYPE | preview.
+      TEXT  -> chars, bytes, first 100 chars (rest discarded).
+      IMAGE -> format + human bytes + WxH.
+      FILES -> count + first few paths.
+  - Recommended build: python-xlib XFIXES for the event + xclip for content
+    (handles INCR/images), or PyQt5 QClipboard for the simplest robust version.
+  - Redact password-manager content; X11 only (use wl-paste --watch on Wayland).
+================================================================================

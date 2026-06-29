@@ -1,0 +1,242 @@
+================================================================================
+OCR PERFORMANCE REVIEW — demo-improved.py
+Date: 2026-06-26
+Scope: Analysis only. No code was changed. All code shown below is a
+       RECOMMENDATION for ocr-review-report.txt readers, not an applied edit.
+================================================================================
+
+--------------------------------------------------------------------------------
+1. HEADLINE
+--------------------------------------------------------------------------------
+A single OCR pass, run in isolation, took ~4.7 s (the very first one). The same
+workload, run 8-at-a-time on the shared thread pool, ballooned to 206–263 s PER
+IMAGE. That is a ~50x slowdown caused almost entirely by CPU OVERSUBSCRIPTION,
+not by tesseract being inherently slow.
+
+The dominant problem is NOT "OCR is slow" — it is "we run many heavy OCR jobs
+concurrently, and each tesseract process itself tries to use every CPU core, so
+the cores are oversubscribed by ~8x and the machine thrashes."
+
+Two secondary problems make it worse:
+  - chi_sim (Chinese LSTM) + eng is one of the heaviest tesseract configs.
+  - Each `tesseract` subprocess reloads the language models from disk on every
+    single call (31 windows x every refresh), which is pure repeated overhead.
+
+--------------------------------------------------------------------------------
+2. EVIDENCE FROM THE LOG
+--------------------------------------------------------------------------------
+Captures (import) all finished by ~18:24:07. Then OCR ran on the same 8-thread
+executor. Observed OCR durations (elapsed measured INSIDE ocr_image, i.e. real
+tesseract wall-time, started when the thread picked the task up):
+
+    win 0x02a00017   4,699 ms     9 chars   (ran early, little contention)
+    win 0x04e00007  51,374 ms    76 chars
+    win 0x03e00003 206,699 ms   707 chars   \
+    win 0x04400007 236,279 ms   852 chars    |
+    win 0x02e00006 248,431 ms   853 chars    |  all 8 overlapping,
+    win 0x04000007 254,973 ms 1,448 chars    >  finishing together
+    win 0x05400007 258,801 ms 1,527 chars    |  around 18:28:2x
+    win 0x04800007 260,163 ms 1,373 chars    |
+    win 0x03a00007 261,083 ms 1,539 chars    |
+    win 0x03400007 262,674 ms 2,503 chars   /
+
+Key reads:
+  * The lone early job = 4.7 s. The batch of 8 = ~250 s each. The per-image cost
+    did not actually grow 50x of "real work" — they were all fighting for the
+    same cores at the same time, so each one's wall-clock inflated to ~the
+    duration of the whole batch.
+  * The total batch (~18:24:06 -> 18:28:29) is ~4m23s to OCR ~30 windows.
+  * More text -> longer: the 9-char desktop was fast; the 1,500–2,500 char
+    terminals/browsers were the slow ones (LSTM cost scales with content/layout).
+  * After the GUI was closed at 18:27:11 (CancelledError raised on the asyncio
+    task), tesseract jobs KEPT RUNNING until 18:28:29 — i.e. ~1m18s of orphaned
+    CPU work. subprocess.run() was never cancelled/killed; cancelling the
+    asyncio future does not kill the child process.
+
+--------------------------------------------------------------------------------
+3. ROOT CAUSES (ranked by impact)
+--------------------------------------------------------------------------------
+[C1] CPU OVERSUBSCRIPTION (biggest factor, ~50x)
+     - The ThreadPoolExecutor has 8 workers (capture_0..capture_7 in the log).
+     - OCR shares that SAME executor with captures, so up to 8 tesseract
+       processes run at once.
+     - tesseract 4/5 (LSTM, OEM 1) is built with OpenMP and by DEFAULT spawns
+       one OMP thread PER CPU CORE. So 8 processes x N cores = 8N software
+       threads competing for N physical cores. The result is cache thrashing,
+       context-switch storms, and memory-bandwidth saturation. Throughput
+       collapses well below even a single-threaded serial queue.
+
+[C2] HEAVY LANGUAGE CONFIG: chi_sim+eng
+     - Chinese (chi_sim) has a very large character set and a big LSTM model;
+       it is among the slowest tesseract languages. Adding +eng roughly stacks
+       a second recognition pass. This alone is several-fold slower than eng.
+
+[C3] PER-CALL MODEL RELOAD
+     - Spawning a fresh `tesseract` process for each window reloads
+       chi_sim.traineddata + eng.traineddata and re-initialises the LSTM engine
+       EVERY call. With 31 windows x every refresh, that init cost is paid
+       dozens of times. A long-lived in-process API (tesserocr) pays it once.
+
+[C4] FULL-RESOLUTION INPUT
+     - Images are fed at native size (mostly 1920x1036). OCR cost scales with
+       pixel count and layout-analysis area. Much of that resolution is not
+       needed for legible on-screen text.
+
+[C5] OCR RUNS UNCONDITIONALLY, INCLUDING THE 15s BACKGROUND REFRESH
+     - Every refresh re-OCRs every window, even if the capture is identical to
+       last cycle and even when the user is not searching. This repeats the
+       entire expensive batch indefinitely while the app sits unfocused.
+
+[C6] NO TIMEOUT / NO CHILD-PROCESS CLEANUP
+     - subprocess.run() has no timeout, so a pathological image can run for
+       minutes. On shutdown the children are not killed (see the 18:28 orphans).
+
+--------------------------------------------------------------------------------
+4. RECOMMENDED FIXES — QUICK WINS FIRST (highest impact / lowest effort)
+--------------------------------------------------------------------------------
+These are ordered so the first 2–3 alone should turn minutes into seconds.
+
+[F1] *** Set OMP_THREAD_LIMIT=1 for tesseract.  (THE single biggest lever) ***
+     Force each tesseract process to be single-threaded, then control
+     parallelism yourself. Counter-intuitively this is FASTER here, because it
+     stops the 8x core oversubscription. Tesseract's own docs note OpenMP often
+     hurts throughput; for batch work, prefer many single-threaded instances.
+         env = {**os.environ, "OMP_THREAD_LIMIT": "1"}
+         subprocess.run(cmd, input=png, capture_output=True, env=env)
+
+[F2] *** Give OCR its OWN small executor and cap concurrency. ***
+     Do not share the capture pool. Run OCR on 1–2 workers (or cores-2 IF F1 is
+     applied). A dedicated ThreadPoolExecutor(max_workers=2) plus F1 keeps total
+     OMP threads <= cores and removes the thrash.
+         self.ocr_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ocr")
+     Combine with F1: 2 concurrent single-threaded tesseracts ~= predictable,
+     near-linear scaling.
+
+[F3] Downscale before OCR.
+     Cap the long edge to ~1280–1600 px (or target ~150 DPI for the text). This
+     cuts pixel count 2–4x with little accuracy loss for screen text. Tesseract
+     likes ~300 DPI for the text glyphs, so do not go too small; test a couple
+     of sizes. Downscaling 1920->1280 alone often halves runtime.
+
+[F4] Skip OCR when the capture has not changed.
+     Hash the captured image bytes (or a downscaled grayscale) and store it per
+     window. If unchanged since the last successful OCR, reuse the cached text.
+     This kills the repeated cost from the 15s background refresh (C5).
+         h = hashlib.blake2b(png_bytes, digest_size=16).digest()
+         if h == item.get('ocr_hash'): skip
+
+[F5] Make OCR on-demand / lazy instead of eager.
+     Only OCR a window the first time it is needed — e.g. when the user actually
+     types in the search box (OCR the not-yet-OCR'd windows then), or OCR only
+     the currently visible/most-recently-focused windows first. Most refreshes
+     never get searched, so most OCR work is wasted.
+
+[F6] Add a per-call timeout and kill children on shutdown.
+     subprocess.run(..., timeout=20) and, on app close, terminate any running
+     OCR processes (track Popen handles, or run them in a process group and
+     kill the group). Prevents the 1-minute orphan tail seen at 18:28.
+
+[F7] Tune tesseract flags.
+     Use LSTM only and a sane page-seg mode; avoid legacy engine:
+         --oem 1  --psm 6   (assume a uniform block of text; try 3/4/11/12 too)
+     psm 6 or 11/12 ("sparse text") is often faster and adequate for UI text.
+
+[F8] Reconsider chi_sim necessity per window.
+     If many windows are English-only (terminals, VS Code, IPs), running
+     chi_sim on them is wasted. Options: default to eng, and only add chi_sim
+     when needed; or run a cheap script/lang detect first; or make the language
+     configurable per use. Dropping chi_sim where unneeded is a large saving.
+
+--------------------------------------------------------------------------------
+5. ENGINE / LIBRARY RECOMMENDATIONS
+--------------------------------------------------------------------------------
+Same-engine, lower overhead:
+  - tesserocr (Python C-API binding to libtesseract):
+      * Keeps ONE PyTessBaseAPI initialised in memory -> pays the chi_sim+eng
+        model-load cost ONCE, not per window (fixes C3). Set the image and call
+        GetUTF8Text() repeatedly. Typically a big win for many-image workloads.
+      * Still the tesseract engine, so apply F1/F3/F7 as well.
+      * pip install tesserocr (needs libtesseract-dev + tesseract lang data).
+
+  - pytesseract: convenience wrapper over the SAME subprocess approach you
+    already use. It does NOT fix speed (still spawns tesseract + reloads models).
+    Not a performance recommendation; only nicer API. tesserocr is the speed one.
+
+Faster engines (recommended for Chinese specifically):
+  - RapidOCR (ONNXRuntime + PP-OCR models): STRONG recommendation for a local
+    CPU tool. Pip-installable, no GPU required, very good chi_sim+eng accuracy,
+    and markedly faster than tesseract on Chinese. Long-lived in-process model
+    (no per-call reload). Can use ONNXRuntime threading controls.
+      * pip install rapidocr-onnxruntime
+  - PaddleOCR (PP-OCRv4): best-in-class Chinese accuracy and very fast,
+    especially with GPU. CPU mode works (enable MKLDNN), GPU mode is 10–50x.
+    Heavier install (paddlepaddle). Great if a GPU is available.
+  - EasyOCR: good multilingual incl. Chinese, but heavy and SLOW on CPU; really
+    wants a CUDA GPU. Only attractive if you already have a GPU.
+
+Platform OCR / cloud:
+  - Apple Vision / Windows.Media.Ocr: not applicable on Kubuntu/X11.
+  - Cloud OCR (Google/Azure/Baidu): fast and accurate but sends screenshots off
+    the machine — a privacy concern for a "window snooping" desktop tool, and
+    adds latency/network dependency. Not recommended for this local utility.
+
+Recommendation summary:
+  - Lowest effort, keep tesseract: F1 + F2 + F3 + F4 (expected: minutes -> a few
+    seconds for the whole batch).
+  - Best local quality+speed for Chinese, modest rewrite: switch to RapidOCR
+    (CPU) with a single persistent instance and your own 1–2 worker queue.
+  - If a CUDA GPU is available: PaddleOCR GPU is the fastest/most accurate path.
+
+--------------------------------------------------------------------------------
+6. HARDWARE CONFIGURATION NOTES
+--------------------------------------------------------------------------------
+  - CPU cores help ONLY if oversubscription is fixed (F1+F2). Without F1, adding
+    cores can even make it worse because each tesseract grabs more OMP threads.
+    With F1, parallelism scales roughly linearly up to ~(cores-1) workers.
+  - RAM: tesseract chi_sim+eng is modest, but 8 simultaneous processes each load
+    models -> several hundred MB transient. A persistent in-process engine
+    (tesserocr/RapidOCR) keeps one copy resident and is friendlier to RAM/cache.
+  - Disk: model reload per call (C3) hits disk/page-cache repeatedly; an SSD and
+    warm page cache help, but eliminating per-call reload (tesserocr/RapidOCR)
+    helps far more.
+  - GPU: an NVIDIA CUDA GPU unlocks PaddleOCR/EasyOCR GPU paths — typically
+    10–50x faster than CPU tesseract for Chinese, and frees the CPU for capture
+    and UI. This is the single biggest hardware lever IF you switch engines.
+
+--------------------------------------------------------------------------------
+7. SUGGESTED TARGET ARCHITECTURE (if staying on tesseract)
+--------------------------------------------------------------------------------
+  1. Dedicated OCR queue: ThreadPoolExecutor(max_workers = max(1, cores//2 ... )),
+     SEPARATE from captures.
+  2. Every tesseract call: env OMP_THREAD_LIMIT=1, --oem 1 --psm 6, timeout=20.
+  3. Downscale capture to <=1440px long edge before OCR.
+  4. Per-window image hash; skip OCR if unchanged; cache text + hash on the item.
+  5. OCR lazily — prioritise windows the user is about to search / most recently
+     focused; do not OCR on every silent 15s background refresh.
+  6. Track child processes; kill them on app shutdown to avoid orphan tail.
+
+Rough expectation with steps 1–4: the ~4m23s batch should drop to well under
+~10–20 s for 31 windows, and to near-zero on subsequent unchanged refreshes.
+
+--------------------------------------------------------------------------------
+8. A 2-MINUTE EXPERIMENT TO CONFIRM THE DIAGNOSIS (no app changes needed)
+--------------------------------------------------------------------------------
+Pick one already-captured window image and time it three ways from a shell:
+
+  # baseline (default OpenMP, all cores)
+  time tesseract page.png stdout -l chi_sim+eng
+
+  # single-threaded
+  OMP_THREAD_LIMIT=1 time tesseract page.png stdout -l chi_sim+eng --oem 1 --psm 6
+
+  # eng only, downscaled to 1280 wide first (ImageMagick)
+  convert page.png -resize 1280x out.png
+  OMP_THREAD_LIMIT=1 time tesseract out.png stdout -l eng --oem 1 --psm 6
+
+Then launch 8 of the baseline command in parallel (&) and watch each one's time
+explode — that reproduces the log's 250s figures and proves oversubscription
+(C1) is the dominant cause.
+
+================================================================================
+END OF REPORT
+================================================================================

@@ -1,0 +1,6 @@
+rewrite the backend (daemon) first.
+backend in golang/rust.
+
+frontend could be in rust tauri. or some cross platform lightweight and musl friendly gui framework. ask for advice.
+
+ask ai for easy rewrite plan. sort difficulties and stability tradeoffs.

@@ -1,0 +1,4 @@
+listen for ctrl+shift+v or ctrl+v
+listen for mid mouse button click (PRIMARY buffer paste)
+
+think of other ways of detecting paste events like reading event of PRIMARY buffer, reading event of clipboard on x11. if not just describe reason. if yes tell me how to do it or how hard it is.

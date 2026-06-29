@@ -1,0 +1,170 @@
+================================================================================
+PLAN: Associating WINDOWS with VIRTUAL DESKTOPS (id + name)
+File: plan-window-virtual-desktop-assiciation-kde.txt
+Target: Kubuntu 22.04 / KDE Plasma on X11
+================================================================================
+
+--------------------------------------------------------------------------------
+0. GOALS
+--------------------------------------------------------------------------------
+  (1) For every window, know WHICH virtual desktop id (index) it lives on.
+  (2) Know the NAME of a virtual desktop given its id (index).
+  (3) Combine: list windows with {window id, desktop index, desktop name}.
+Bonus: detecting when a window MOVES to another desktop.
+
+--------------------------------------------------------------------------------
+1. THE UNDERLYING EWMH PROPERTIES
+--------------------------------------------------------------------------------
+Per WINDOW (stored on the client window):
+  _NET_WM_DESKTOP (CARDINAL) = the desktop index the window is on.
+     Special value 0xFFFFFFFF (= 4294967295) means "all desktops" (sticky / pinned).
+
+Per ROOT (global desktop info):
+  _NET_NUMBER_OF_DESKTOPS (CARDINAL)      = how many desktops exist.
+  _NET_DESKTOP_NAMES      (UTF8_STRING[]) = the names, indexed by desktop id.
+  _NET_CURRENT_DESKTOP    (CARDINAL)      = which one is active right now.
+
+So: window -> desktop id comes from _NET_WM_DESKTOP; desktop id -> name comes from
+the root's _NET_DESKTOP_NAMES (or `wmctrl -d`).
+
+--------------------------------------------------------------------------------
+2. (1) WHICH WINDOW IS ON WHICH DESKTOP
+--------------------------------------------------------------------------------
+EASIEST — `wmctrl -l` ALREADY tells you. Column 2 IS the desktop index:
+
+   $ wmctrl -l
+   0x03a00007   0 rainbow (ytwl) 10.10.11.240 — Konsole
+   0x02e00006   0 rainbow desktop_overview_with_search — Dolphin
+   0x02a00017  -1 rainbow Desktop — Plasma
+   0x02a00034  -1 rainbow Plasma
+   ^id          ^desktop index   ^title
+   |            |
+   |            +-- 0,1,2,...   = that virtual desktop
+   |                -1          = sticky / on ALL desktops (wmctrl shows 0xFFFFFFFF as -1)
+   +-- window id (matches wmctrl form 0x0XXXXXXX)
+
+   Parse: parts = line.split(maxsplit=3) -> parts[0]=id, parts[1]=desktop, parts[3]=title.
+   (In your earlier capture the plasmashell/Desktop windows show -1 = sticky.)
+
+Per-window query alternatives:
+   $ xprop -id 0x05400007 _NET_WM_DESKTOP
+   _NET_WM_DESKTOP(CARDINAL) = 0
+   # sticky window:
+   _NET_WM_DESKTOP(CARDINAL) = 4294967295        # = 0xFFFFFFFF = all desktops
+
+   $ xdotool get_desktop_for_window 0x05400007
+   0
+   # (xdotool may error for sticky/special windows; handle that.)
+
+RECOMMENDATION: use `wmctrl -l` — one call gives id + desktop + title for every
+window, already in the id format you want. Use xprop/xdotool only for a single
+specific window or as a fallback.
+
+--------------------------------------------------------------------------------
+3. (2) DESKTOP ID -> DESKTOP NAME
+--------------------------------------------------------------------------------
+A) `wmctrl -d`  (best: gives index, active flag, AND name in one shot):
+   $ wmctrl -d
+   0  * DG: 3840x1080  VP: 0,0  WA: 0,0 3840x1053  Desktop 1
+   1  - DG: 3840x1080  VP: N/A  WA: 0,0 3840x1053  Desktop 2
+   2  - DG: 3840x1080  VP: N/A  WA: 0,0 3840x1053  Desktop 3
+   ^idx ^active(*)                                  ^name (everything after WA field)
+   Build {index: name}. The name is the trailing text; simplest robust parse:
+   split into at most 10 fields and take the remainder as the name, OR regex
+   capture after the "WA: x,y WxH " block.
+
+B) `xprop -root _NET_DESKTOP_NAMES`:
+   _NET_DESKTOP_NAMES(UTF8_STRING) = "Desktop 1", "Desktop 2", "Desktop 3"
+   The 0th string is desktop 0, etc.
+
+C) python-xlib: read root _NET_DESKTOP_NAMES (UTF8 list) and _NET_NUMBER_OF_DESKTOPS.
+
+Map desktop index -> name with these. For sticky windows (index -1 / 0xFFFFFFFF)
+use a synthetic label like "All Desktops (sticky)".
+
+--------------------------------------------------------------------------------
+4. (3) COMBINED SNAPSHOT  (window id + desktop id + desktop name)
+--------------------------------------------------------------------------------
+Algorithm (no extra dependencies, two subprocess calls):
+   1. names = parse `wmctrl -d`  -> {index: name}     (also note which is active)
+   2. for each line of `wmctrl -l`:
+        wid     = parts[0]                  # already 0x0XXXXXXX
+        desk    = int(parts[1])             # -1 = sticky
+        title   = parts[3]
+        dname   = "All Desktops (sticky)" if desk == -1 else names.get(desk, f"Desktop {desk+1}?")
+        emit {window_id: wid, desktop_id: desk, desktop_name: dname, title: title}
+
+Example result:
+   0x03a00007  desktop 0  "Desktop 1"            (ytwl) 10.10.11.240 — Konsole
+   0x02e00006  desktop 0  "Desktop 1"            desktop_overview_with_search — Dolphin
+   0x05000016  desktop 1  "Desktop 2"            X11事件监听实现 - DeepSeek — Firefox
+   0x02a00017  sticky     "All Desktops (sticky)" Desktop — Plasma
+
+Group by desktop_id to get "windows per desktop".
+
+--------------------------------------------------------------------------------
+5. ID / VALUE NORMALIZATION NOTES
+--------------------------------------------------------------------------------
+  - wmctrl ids are already 0x0XXXXXXX (8 hex, lowercase). xprop/xlib give
+    0xXXXXXXX (no leading zeros); xdotool gives DECIMAL. Normalize:
+        hex -> f"0x{int(s,16):08x}" ;  decimal -> f"0x{int(s,10):08x}".
+  - Sticky encoding: _NET_WM_DESKTOP = 4294967295 (0xFFFFFFFF) == wmctrl's -1.
+    Treat both as "all desktops".
+  - KDE quirk: len(_NET_DESKTOP_NAMES) can be LARGER than
+    _NET_NUMBER_OF_DESKTOPS (KDE pre-seeds extra names). When showing a list,
+    clamp names to the real desktop count; but for id->name lookup of an existing
+    window the extra entries are harmless.
+
+--------------------------------------------------------------------------------
+6. BONUS — DETECTING A WINDOW CHANGING DESKTOPS
+--------------------------------------------------------------------------------
+_NET_WM_DESKTOP is a property on the CLIENT window, so (exactly like title
+changes, see plan-get-window-title-change.txt) a window moving to another desktop
+does NOT emit an event on root, and `xev -root` will NOT see it directly.
+
+Options (all single-thread):
+  - python-xlib: select PropertyChangeMask on each client window; react to
+    _NET_WM_DESKTOP PropertyNotify on that window. Re-sync the watched set on
+    root _NET_CLIENT_LIST changes.
+  - xprop -spy -id <wid> _NET_WM_DESKTOP   (one spy per window).
+  - Poll: re-run `wmctrl -l` periodically and diff the desktop column.
+NOTE: switching the WHOLE desktop (you moving to another desktop) DOES fire on
+root via _NET_CURRENT_DESKTOP — that part is event-driven (see
+plan-virtual-desktop.txt). It's only per-window moves that need window watching.
+
+--------------------------------------------------------------------------------
+7. KDE PLASMA (KUBUNTU 22.04, X11) CAVEATS
+--------------------------------------------------------------------------------
+  - X11 only. Confirm: echo $XDG_SESSION_TYPE  -> must be "x11".
+    On Wayland, wmctrl/xprop/xdotool desktop queries don't work.
+  - Configure >1 virtual desktop: System Settings -> Window Management ->
+    Virtual Desktops. With one desktop everything is index 0.
+  - Virtual Desktops != Activities. _NET_WM_DESKTOP / wmctrl reflect Virtual
+    Desktops only. A window's Activity association is separate (D-Bus
+    org.kde.ActivityManager / _KDE_NET_WM_ACTIVITIES) and out of scope here.
+  - plasmashell / "Desktop — Plasma" / panels are sticky (-1) by design.
+  - Indices are 0-based; KDE UI label "Desktop 1" == index 0.
+  - Some special/override-redirect windows have no _NET_WM_DESKTOP; skip them
+    (they also won't appear in `wmctrl -l`).
+
+--------------------------------------------------------------------------------
+8. QUICK COMMAND REFERENCE
+--------------------------------------------------------------------------------
+  All windows + their desktop:        wmctrl -l
+  Desktops + names + active:          wmctrl -d
+  One window's desktop:               xprop -id <wid> _NET_WM_DESKTOP
+                                      xdotool get_desktop_for_window <wid>
+  Desktop names (root):               xprop -root _NET_DESKTOP_NAMES
+  Desktop count:                      xprop -root _NET_NUMBER_OF_DESKTOPS
+  Move a window to desktop N:         wmctrl -i -r <wid> -t N
+                                      xdotool set_desktop_for_window <wid> N
+
+--------------------------------------------------------------------------------
+9. MANUAL VERIFICATION
+--------------------------------------------------------------------------------
+  $ wmctrl -d                       # note indices + names + which has '*'
+  $ wmctrl -l                       # note each window's desktop column
+  $ wmctrl -i -r <some-wid> -t 1    # move a window to desktop 2 (index 1)
+  $ wmctrl -l                       # confirm that window's column changed to 1
+  $ xprop -id <some-wid> _NET_WM_DESKTOP   # confirm = 1
+================================================================================

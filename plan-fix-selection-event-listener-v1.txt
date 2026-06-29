@@ -1,0 +1,142 @@
+================================================================================
+PLAN: Fix demo-selection-event-listener-v1.py (without editing the file)
+================================================================================
+Target env : /home/jamesbrown/miniforge3/envs/gui_agent  (python 3.12)
+python-xlib: 0.33  (Xlib.__version__ == (0, 33))
+
+--------------------------------------------------------------------------------
+ROOT CAUSE (verified by inspecting the installed library)
+--------------------------------------------------------------------------------
+Both errors come from ONE source: the XFIXES version-negotiation call.
+
+1) line 401  dpy.xfixes_query_version(4, 0)
+   In python-xlib 0.33 the bound method is:
+
+       def query_version(self):                 # <-- NO version params
+           return QueryVersion(display=self.display,
+                               opcode=...,
+                               major_version=4,  # hardcoded
+                               minor_version=0)  # hardcoded
+
+   So the correct call takes ZERO arguments. Passing (4, 0) gives:
+       TypeError: query_version() takes 1 positional argument but 3 were given
+   (the "1" is self; you supplied self + 4 + 0 = 3).
+
+   NOTE: the (major, minor) form is the C Xlib signature
+   XFixesQueryVersion(dpy, major, minor) — it was never python-xlib's API.
+   There is no python-xlib release where dpy.xfixes_query_version(4, 0) works,
+   so "pin to another version" will NOT fix issue 1.
+
+2) The BadRRCrtcError / "no attribute 'sequence_number'" crash at dpy.sync()
+   is a CONSEQUENCE of skipping (1). The XFIXES protocol spec requires the
+   client to call XFixesQueryVersion before any other XFIXES request; otherwise
+   the server errors on the subsequent xfixes_select_selection_input. That error
+   is asynchronous and only gets read during the next round-trip — dpy.sync()
+   (which internally issues GetPointerControl). python-xlib 0.33 then fails to
+   parse that error cleanly (an internal quirk where the extension error object
+   lacks sequence_number), producing the confusing AttributeError traceback.
+
+   => Restore a CORRECT query_version() call and the XFIXES extension is
+      negotiated, the server stops erroring, and sync() no longer crashes.
+   => Do NOT "fix" it by commenting out line 401 — that re-creates issue 2.
+
+--------------------------------------------------------------------------------
+FIX — Option A (RECOMMENDED): launcher that monkeypatches, file untouched
+--------------------------------------------------------------------------------
+Create a SEPARATE launcher next to the demo (this does not modify the demo):
+
+    File: run-selection-listener.py
+    ------------------------------------------------------------------
+    #!/usr/bin/env python3
+    """Launch demo-selection-event-listener-v1.py unmodified, making its
+    xfixes_query_version(4, 0) call compatible with python-xlib 0.33."""
+    import runpy
+    from Xlib.ext import xfixes
+
+    # 0.33's query_version(self) ignores any client-supplied version and
+    # hardcodes 4.0. Wrap it so the demo's (4, 0) args are accepted and dropped.
+    _orig_query_version = xfixes.query_version
+    def _compat_query_version(self, *args, **kwargs):
+        return _orig_query_version(self)
+    xfixes.query_version = _compat_query_version   # patched in the module ns
+
+    # Run the demo as __main__. Display() is constructed INSIDE the demo, and
+    # python-xlib binds xfixes_query_version from the module global at that
+    # point, so the patch above is picked up. Negotiation then runs correctly,
+    # which also resolves the dpy.sync() / BadRRCrtc crash.
+    runpy.run_path("demo-selection-event-listener-v1.py", run_name="__main__")
+    ------------------------------------------------------------------
+
+    Run with:
+      /home/jamesbrown/miniforge3/envs/gui_agent/bin/python run-selection-listener.py
+
+    Why this works:
+      - The patch replaces the module-level xfixes.query_version BEFORE the demo
+        calls display.Display(). python-xlib's extension init reads the module
+        global when binding 'xfixes_query_version' onto the Display, so the
+        wrapped (arg-tolerant) version is what gets bound.
+      - The wrapper calls _orig_query_version(self) with no version args ->
+        satisfies 0.33 -> the demo's literal (4, 0) is harmlessly discarded.
+      - query_version actually executes -> XFIXES is negotiated -> issue 2 gone.
+
+--------------------------------------------------------------------------------
+FIX — Option B (one-line edit, if you later allow touching the file)
+--------------------------------------------------------------------------------
+    line 401:  dpy.xfixes_query_version(4, 0)
+        ->     dpy.xfixes_query_version()
+    Keep the line (do NOT comment it out). This is the minimal real fix and also
+    clears issue 2. Listed only for completeness; Option A leaves the file as-is.
+
+--------------------------------------------------------------------------------
+FALLBACK — if a BadRRCrtc/sync error somehow persists after Option A
+--------------------------------------------------------------------------------
+(Only if needed; should not be necessary once query_version runs.)
+Add to the launcher, before runpy, a defensive guard so a stray async
+extension error cannot crash the parser. Two choices, in order of preference:
+
+  B1. Install a no-op default X error handler so async errors are logged, not
+      raised. This needs the Display object, which lives inside the demo, so do
+      it by patching the constructor in the launcher:
+
+        from Xlib import display as _display
+        _orig_init = _display.Display.__init__
+        def _init(self, *a, **k):
+            _orig_init(self, *a, **k)
+            self.set_error_handler(lambda err, req: None)  # swallow async errors
+        _display.Display.__init__ = _init
+
+  B2. As a last resort, patch the RandR error class so the missing attribute
+      can't raise:
+        from Xlib.ext import randr
+        if not hasattr(randr.BadRRCrtcError, "sequence_number"):
+            randr.BadRRCrtcError.sequence_number = 0
+      (Masks the symptom only; prefer B1 or, ideally, just Option A alone.)
+
+--------------------------------------------------------------------------------
+VERIFICATION STEPS
+--------------------------------------------------------------------------------
+1. Create run-selection-listener.py (Option A) — leave the demo unmodified
+   (revert line 401 back to its original dpy.xfixes_query_version(4, 0); the
+   wrapper makes that call valid).
+2. Run:
+     /home/jamesbrown/miniforge3/envs/gui_agent/bin/python run-selection-listener.py
+3. Expect the banner, then:
+     "PRIMARY atom = 1"
+     "XFIXES selection input registered for PRIMARY."
+     "Event base for SetSelectionOwnerNotify = <N>"
+   and NO traceback at sync().
+4. Highlight text in any window; confirm SetSelectionOwnerNotify events arrive
+   and enqueue messages print after the 250 ms stabilization gap.
+5. Ctrl+C -> clean shutdown with final stats.
+
+--------------------------------------------------------------------------------
+NOTES / ANSWER TO "is this code for a specific python-xlib version?"
+--------------------------------------------------------------------------------
+- The (4, 0) call reflects the C Xlib API, not any python-xlib release. python-
+  xlib has always exposed xfixes query_version as query_version(self) with the
+  client version hardcoded. So version pinning cannot make (4, 0) valid; the
+  call must pass zero args (Option B) or be adapted by a wrapper (Option A).
+- The masks used later (XFixesSetSelectionOwnerNotifyMask, etc.) and
+  xfixes_select_selection_input(root, atom, mask) DO match 0.33 and need no
+  change — the user's run already reached and passed line 413 successfully.
+================================================================================

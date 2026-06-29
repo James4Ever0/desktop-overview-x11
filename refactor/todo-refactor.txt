@@ -1,0 +1,23 @@
+eliminate sensitive information from keyboard capture.
+
+store those sensitive information in a hash based file. whenever the string containing that hash is captured anywhere, that string is replaced with a placeholder.
+
+need we store the hash with the string length? or just the hash? or with one char of the string prefix?
+
+any existing solution recommended?
+
+---
+
+reconstruct string from backspace (deletion)
+
+---
+
+set global keyboard shortcut to switch to previous window? bring back the main window selector ui interface? or something else?
+
+---
+
+make keyboard chunk flushing with threshold of 3 (greater than three chars.), otherwise won't getting into the buffer or db. strip the chunk before checking the threshold. update config files, docs, plans etc
+
+---
+
+do not include the frontend window id, which is automatically filtered by frontend? or by some special window title filter rule? like matching "Desktop Overview UI"

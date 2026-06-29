@@ -1,0 +1,142 @@
+================================================================================
+PLAN: Multi-title view for `sections` and `timeline`
+================================================================================
+
+PROBLEM
+-------
+A single window_id keeps a stable identity but its title (window_name) changes
+over time — e.g. a browser whose title follows the active tab, or an editor
+whose title follows the open file. Each poll row is (timestamp, window_id,
+window_name, is_locked), so the DB already captures the changing title.
+
+Current behavior loses this:
+  - cmd_top / cmd_sections / cmd_timeline aggregate ONLY by window_id.
+  - The title shown is fetched separately as "the most recent window_name for
+    this id" (the ORDER BY timestamp DESC LIMIT 1 subquery). It is a display
+    label, not part of the counting.
+  - Result: every distinct title a window had during the window collapses into
+    one line, and we can't see how time split across titles. Sorting happens at
+    the window_id level only.
+
+GOAL
+----
+Keep window_id as the primary grouping (it answers "which app/window"), but
+surface the per-title breakdown underneath it (it answers "doing what in it").
+  - Count at the (window_id, title) granularity.
+  - Sort outer groups by total samples (desc).
+  - Sort inner titles within each group by their own samples (desc).
+  - Render nested: a window_id header line + indented per-title sub-lines.
+
+This removes the need for the "latest name" subquery entirely — the title is
+taken from the sample rows we already have in memory.
+
+--------------------------------------------------------------------------------
+DATA-SHAPE CHANGE (shared by both commands)
+--------------------------------------------------------------------------------
+Replace the flat counter
+        counts: Dict[window_id, int]
+with a nested counter
+        counts: Dict[window_id, Dict[title, int]]
+plus a per-id total (or just sum the inner dict on demand).
+
+Locked samples stay a special bucket: key "__LOCKED__" with no title breakdown
+(or a single synthetic title "SCREEN LOCKED").
+
+Titles that are None -> normalize to a placeholder like "(no title)" so they
+group consistently instead of being dropped.
+
+Helper to add:
+    add_sample(counts, wid, title, locked):
+        bucket by "__LOCKED__" when locked, else by wid, then by title.
+
+Helper to order:
+    for each wid: total = sum(title_counts.values())
+    outer order = sort wids by total desc
+    inner order = sort titles by count desc (optionally cap to top-N + "other")
+
+--------------------------------------------------------------------------------
+cmd_sections  — REARRANGEMENT
+--------------------------------------------------------------------------------
+1. Change section_data from {sec_start: {wid: count}} to
+   {sec_start: {wid: {title: count}}} using add_sample().
+
+2. Per section:
+   - Compute each wid's total; pick the dominant wid by total (locked still
+     competes as "__LOCKED__").
+   - For the dominant wid, list its titles sorted by count.
+   - Percentages: report the dominant wid's share of the section (as today),
+     AND each title's share — decide a single base and state it. Recommended:
+     title % is relative to that wid's samples in the section (so a window's
+     titles sum to 100% within the window), and the wid % is relative to the
+     whole section.
+
+3. Drop the "latest window_name" subquery; the title strings are already in the
+   nested counter.
+
+OUTPUT (sections) — proposed:
+    Sections of 60 minute(s) from <FROM> to <TO> (CST):
+      14:13 – 15:13 : Firefox (ID: 0x340)  (72.0% of section)
+            - "GitHub - repo/pull/12"      48%
+            - "Gmail - Inbox"              31%
+            - "(no title)"                 21%
+      15:13 – 16:13 : SCREEN LOCKED  (88.0% of section)
+
+Optionally add a --titles/-T flag (default on) to toggle the breakdown so the
+old one-line-per-section view is still available when not wanted.
+
+--------------------------------------------------------------------------------
+cmd_timeline — REARRANGEMENT
+--------------------------------------------------------------------------------
+Key decision: should a title change start a new interval?
+
+Today intervals break only when (window_id, is_locked) changes; title changes
+inside one window_id are invisible. Two options:
+
+  Option A (recommended) — break on (window_id, title, is_locked):
+    - Finer-grained intervals; each row shows one title span with its duration.
+    - Most faithful to a real timeline (you see when the tab/file changed).
+    - To preserve the "which window" readability, group consecutive same-wid
+      intervals under a wid header and indent the title spans:
+
+    Timeline from <FROM> to <TO> (CST):
+      Firefox (ID: 0x340)
+        14:58:54 – 15:02:10  (196.0s) : "GitHub - repo/pull/12"
+        15:02:10 – 15:07:41  (331.0s) : "Gmail - Inbox"
+      Konsole (ID: 0x512)
+        15:07:41 – 15:07:51  (10.0s)  : "claude — focus tracker"
+      SCREEN LOCKED
+        15:07:51 – 15:13:00  (309.0s)
+
+  Option B — keep id-level intervals, annotate with titles seen:
+    - Break on (window_id, is_locked) as today, but accumulate the set of
+      titles + per-title duration within each interval and print them as a
+      sub-summary. Coarser; good if you want fewer rows.
+
+Implementation for Option A:
+  - Compare key = (wid, title, locked) when deciding to close an interval.
+  - When emitting, track the previous wid; print the wid header only when wid
+    (or locked state) changes, then indent the title spans beneath it.
+  - Remove the "latest window_name" subquery — use the title carried on each
+    interval. Keep the existing tail-interval close-out to end_ts.
+
+--------------------------------------------------------------------------------
+cmd_top — (optional, for consistency)
+--------------------------------------------------------------------------------
+Same treatment: nest titles under each window_id so the top list can expand to
+show what each top window was actually showing. Gate behind the same --titles
+flag. Not required by the question but keeps the three commands consistent.
+
+--------------------------------------------------------------------------------
+EDGE CASES / NOTES
+--------------------------------------------------------------------------------
+  - None title -> "(no title)" placeholder before counting.
+  - Same title under different window_ids stays separate (grouping is by id
+    first) — correct, since they are different windows.
+  - Locked buckets have no title breakdown; render a single label.
+  - Percentage base must be stated explicitly in the header to avoid confusion
+    (section-relative vs window-relative).
+  - Verbose (vlog) lines should note the nested counts: number of distinct
+    (wid, title) pairs per section/interval.
+  - Backward-compatibility: keep a flag to fall back to the current flat,
+    single-title-per-line output.
+================================================================================

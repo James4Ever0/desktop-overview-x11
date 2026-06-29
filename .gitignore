@@ -1,0 +1,47 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs
+*.log
+
+# Binary artifacts
+*.bin
+*.o
+*.so
+*.a
+*.class
+*.exe
+*.dll
+*.dylib
+*.out
+*.obj
+*.lib
+*.exp
+*.ilk
+*.pdb
+
+# Virtual environment
+venv/
+.venv/
+env/
+.env/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment / secrets
+.env.local
+.env.*.local
+*.key
+*.pem

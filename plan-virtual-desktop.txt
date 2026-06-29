@@ -1,0 +1,152 @@
+================================================================================
+PLAN: Virtual desktop — detect change, read current id, switch to an id
+File: plan-virtual-desktop.txt
+Target: Kubuntu 22.04 / KDE Plasma on X11
+================================================================================
+
+--------------------------------------------------------------------------------
+0. GOALS
+--------------------------------------------------------------------------------
+  (1) Get an EVENT when the current virtual desktop changes.
+  (2) Read the CURRENT active virtual desktop id (index) on demand.
+  (3) SWITCH to a given virtual desktop id via a command.
+Plus supporting: number of desktops, desktop names, which desktop a window is on.
+
+--------------------------------------------------------------------------------
+1. THE RELEVANT EWMH PROPERTIES (all on the ROOT window)
+--------------------------------------------------------------------------------
+  _NET_CURRENT_DESKTOP     (CARDINAL)      current desktop index, 0-based
+  _NET_NUMBER_OF_DESKTOPS  (CARDINAL)      how many desktops exist
+  _NET_DESKTOP_NAMES       (UTF8_STRING[]) desktop names
+  _NET_WM_DESKTOP          (CARDINAL)      per-WINDOW: which desktop it lives on
+                                           (0xFFFFFFFF = 4294967295 = all / sticky)
+
+IMPORTANT: unlike window titles (see plan-get-window-title-change.txt), the
+current-desktop value IS a property ON ROOT. So `xev -root` CAN detect desktop
+switches event-driven — no polling, no extra window watching needed. It simply
+did not appear in your captured log because you did not switch desktops during
+that capture.
+
+--------------------------------------------------------------------------------
+2. (1) DETECTING THE CHANGE EVENT  — via the existing xev -root listener
+--------------------------------------------------------------------------------
+When you switch desktops, the WM updates root's _NET_CURRENT_DESKTOP, producing:
+
+    PropertyNotify event, serial NN, synthetic NO, window 0x831,
+        atom 0xXX (_NET_CURRENT_DESKTOP), time ..., state PropertyNewValue
+
+Plan:
+  - Ensure xev includes property events: `xev -root -event property` (already so).
+  - In the parsed atom stream, treat atom NAME == "_NET_CURRENT_DESKTOP" as the
+    trigger (key off the NAME, not the numeric atom id like 0xXX — that id is
+    per-session and not stable).
+  - On that trigger -> read the new value (section 3) -> log "desktop changed:
+    old -> new (name)". Debounce duplicates (compare to last known index).
+  - Also worth watching on root:
+        _NET_NUMBER_OF_DESKTOPS  -> desktops added/removed
+        _NET_DESKTOP_NAMES       -> renamed
+
+This stays single-threaded: just add _NET_CURRENT_DESKTOP to the listener's set of
+"interesting" atoms alongside _NET_ACTIVE_WINDOW.
+
+--------------------------------------------------------------------------------
+3. (2) READING THE CURRENT DESKTOP ID  (three interchangeable ways)
+--------------------------------------------------------------------------------
+A) xprop (x11-utils):
+     $ xprop -root _NET_CURRENT_DESKTOP
+     _NET_CURRENT_DESKTOP(CARDINAL) = 2
+   Parse the integer after '='.
+
+B) wmctrl:
+     $ wmctrl -d
+     0  - DG: 1920x1080  VP: N/A  WA: 0,0 1920x1053  Desktop 1
+     1  * DG: 1920x1080  VP: 0,0  WA: 0,0 1920x1053  Desktop 2
+     2  - DG: 1920x1080  VP: N/A  WA: 0,0 1920x1053  Desktop 3
+   The row whose 2nd column is '*' is the ACTIVE desktop. Column 0 = index,
+   trailing text = name. (This one call also gives count + names + active.)
+
+C) xdotool:
+     $ xdotool get_desktop
+     2
+
+Recommended for code: `wmctrl -d` (gives active + count + names in one shot),
+with xprop as a fallback. Add a timeout; tolerate empty/error output.
+
+--------------------------------------------------------------------------------
+4. (3) SWITCHING TO A DESKTOP ID  (commands)
+--------------------------------------------------------------------------------
+Switch the CURRENT desktop (index N, 0-based):
+     wmctrl -s N
+     xdotool set_desktop N
+
+Move a WINDOW to a desktop (bonus):
+     wmctrl -i -r <wid> -t N          # -i: id is numeric; <wid> e.g. 0x05400007
+     xdotool set_desktop_for_window <wid> N
+
+Notes:
+  - N is 0-based. The KDE UI label "Desktop 1" is usually index 0.
+  - After `wmctrl -s N`, _NET_CURRENT_DESKTOP updates and your xev listener (2)
+    will see the change event — useful to confirm the switch took effect.
+
+--------------------------------------------------------------------------------
+5. COUNT / NAMES (supporting queries)
+--------------------------------------------------------------------------------
+  Count:  wmctrl -d | wc -l   |   xprop -root _NET_NUMBER_OF_DESKTOPS   |   xdotool get_num_desktops
+  Names:  xprop -root _NET_DESKTOP_NAMES
+          _NET_DESKTOP_NAMES(UTF8_STRING) = "Desktop 1", "Desktop 2", ...
+          (or the name column from `wmctrl -d`)
+
+--------------------------------------------------------------------------------
+6. KDE PLASMA (X11) SPECIFICS / CAVEATS  — READ THIS
+--------------------------------------------------------------------------------
+  - X11 ONLY. On a Wayland Plasma session, _NET_CURRENT_DESKTOP / wmctrl / xdotool
+    do NOT work. Verify the session: echo $XDG_SESSION_TYPE  (must be "x11").
+  - Configure >1 virtual desktop first: System Settings -> Window Management ->
+    Virtual Desktops. With a single desktop there is only index 0 and nothing to
+    detect or switch.
+  - VIRTUAL DESKTOPS != ACTIVITIES. KDE "Activities" are a separate concept and
+    are NOT exposed through _NET_CURRENT_DESKTOP; wmctrl/xdotool cannot switch
+    Activities. If you actually need Activities, use the D-Bus API instead, e.g.:
+        qdbus org.kde.ActivityManager /ActivityManager/Activities CurrentActivity
+        qdbus org.kde.ActivityManager /ActivityManager/Activities SetCurrentActivity <uuid>
+    (Out of scope here; flagged so you don't confuse the two.)
+  - Indices are 0-based and row-major in the desktop grid, matching wmctrl's order.
+  - Virtual desktops are global across monitors (not per-monitor) unless a Plasma
+    per-screen option is enabled.
+  - Sticky windows report _NET_WM_DESKTOP = 0xFFFFFFFF (on all desktops).
+  - Reading _NET_CURRENT_DESKTOP immediately after a switch can momentarily return
+    the old value; a re-read or reacting to the xev event avoids races.
+  - Sanity check WM support: if `wmctrl -d` errors or is empty, the WM doesn't
+    advertise EWMH desktops and none of this applies.
+
+--------------------------------------------------------------------------------
+7. INTEGRATION PLAN (single thread, no new dependencies)
+--------------------------------------------------------------------------------
+Extend the existing xev -root listener:
+  - Add "_NET_CURRENT_DESKTOP" (and optionally _NET_NUMBER_OF_DESKTOPS,
+    _NET_DESKTOP_NAMES) to the set of interesting root atoms.
+  - Helper functions (each with subprocess timeout + graceful fallback):
+        get_current_desktop()  -> int   (wmctrl -d '*', fallback xprop, xdotool)
+        list_desktops()        -> [(index, name, active_bool), ...]   (wmctrl -d)
+        switch_desktop(n)      -> run `wmctrl -s n` (fallback `xdotool set_desktop n`)
+  - On a _NET_CURRENT_DESKTOP event: read get_current_desktop(); if it differs
+    from the last known value, log:
+        "★ 虚拟桌面切换: <old> -> <new>  (name=<desktop name>)"
+    and update state. Debounce identical repeats.
+  - Print a startup baseline: current desktop + total count + names.
+
+Pseudostructure (mirrors the active-window resolution already in the listener):
+    TRIGGER_DESKTOP_ATOMS = {"_NET_CURRENT_DESKTOP"}
+    on atom line:
+        if atom_name in TRIGGER_DESKTOP_ATOMS:
+            resolve_desktop(state)     # query + diff + log
+
+--------------------------------------------------------------------------------
+8. QUICK MANUAL VERIFICATION
+--------------------------------------------------------------------------------
+  Terminal 1:  python3 x11-event-listener.py     (after adding the desktop atom)
+  Terminal 2:  wmctrl -s 1   ; sleep 1 ; wmctrl -s 0
+  Expect: listener prints a _NET_CURRENT_DESKTOP PropertyNotify + a
+          "虚拟桌面切换" line for each switch; `xprop -root _NET_CURRENT_DESKTOP`
+          and `xdotool get_desktop` agree with the reported index.
+================================================================================

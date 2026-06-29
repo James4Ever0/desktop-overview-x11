@@ -1,0 +1,23 @@
+# desktop-overview-with-search — daemon + frontend
+# Python >=3.11,<3.13  (developed on 3.12).  X11 only.
+
+# --- daemon: event capture ---
+python-xlib==0.33          # X11: focus/title/vdesktop/XFIXES/XRecord
+# pynput>=1.7              # OPTIONAL alt keyboard backend (KBD_BACKEND=pynput); xrecord preferred — see plans/daemon/04 §1a
+
+# --- daemon: API ---
+fastapi>=0.111
+uvicorn[standard]>=0.30    # serves UDS + optional TCP
+pydantic>=2.7
+
+# --- daemon: storage ---
+aiosqlite>=0.20            # async SQLite (WAL); FTS5 ships with stdlib sqlite3
+
+# --- imaging (daemon capture + frontend render) ---
+Pillow>=10.3
+
+# --- frontend HTTP-over-UDS client ---
+httpx>=0.27
+
+# System deps (apt, not pip):
+#   python3-tk wmctrl imagemagick xdotool x11-utils xclip
