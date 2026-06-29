@@ -95,4 +95,4 @@ pip install -r requirements.txt
 
 ## License
 
-Everything stays on your machine, no telemetry, no cloud.
+[Unlicense](LICENSE) — public domain. Do what you want.
