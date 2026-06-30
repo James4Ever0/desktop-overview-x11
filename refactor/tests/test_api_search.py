@@ -130,10 +130,33 @@ async def test_list_and_timeline(store, a, b, c):
     print("[search] list_windows + timeline")
     wins = await search.list_windows(store, current_session_key="sess")
     order = [w["window_uid"] for w in wins]
-    check("list_windows sorted by last_access desc", order[:3] == [a, c, b])
+    check("list_windows sorted by last_access desc", order[:3] == [c, b, a])
     check("dead window present in both filter", b in order)
     alive_list = await search.list_windows(store, alive="only", current_session_key="sess")
     check("list alive=only excludes dead", b not in {w["window_uid"] for w in alive_list})
+
+    # new sort options
+    by_title = await search.list_windows(store, sort="title", order="asc",
+                                         current_session_key="sess")
+    check("list_windows sort=title asc",
+          [w["window_uid"] for w in by_title] == [b, a, c])
+    by_title_desc = await search.list_windows(store, sort="title", order="desc",
+                                              current_session_key="sess")
+    check("list_windows sort=title desc",
+          [w["window_uid"] for w in by_title_desc] == [c, a, b])
+    by_id = await search.list_windows(store, sort="window_id", order="asc",
+                                      current_session_key="sess")
+    check("list_windows sort=window_id asc",
+          [w["window_uid"] for w in by_id] == sorted([a, b, c]))
+
+    # search sort/order
+    srch = await search.search(store, q="invoice", sort="last_access", order="desc",
+                               current_session_key="sess")
+    check("search sort=last_access desc", [w["window_uid"] for w in srch] == [b, a])
+    srch_title = await search.search(store, q="invoice", sort="title", order="asc",
+                                     current_session_key="sess")
+    check("search sort=title asc",
+          [w["window_uid"] for w in srch_title] == [b, a])
 
     tl = await search.timeline(store, current_session_key="sess")
     lanes = {l["window_uid"]: l for l in tl}
@@ -142,6 +165,16 @@ async def test_list_and_timeline(store, a, b, c):
     check("lane carries title history", lanes[a]["titles"][0]["title"] == "Inbox — invoice 2026")
     tl_one = await search.timeline(store, window_uid=a, current_session_key="sess")
     check("timeline window_uid scopes to one lane", [l["window_uid"] for l in tl_one] == [a])
+
+    # timeline sort/order
+    tl_la = await search.timeline(store, sort="last_access", order="desc",
+                                  current_session_key="sess")
+    check("timeline sort=last_access desc",
+          [l["window_uid"] for l in tl_la[:3]] == [c, b, a])
+    tl_title = await search.timeline(store, sort="title", order="asc",
+                                     current_session_key="sess")
+    check("timeline sort=title asc",
+          [l["window_uid"] for l in tl_title[:3]] == [b, a, c])
 
 
 # ───────────────────────── API endpoints (ASGI in-process) ─────────────────────────

@@ -12,9 +12,12 @@ PropertyNotify, so xpump owns the loop and routes by atom.  Emits:
 """
 from __future__ import annotations
 
+import logging
 import time
 
 from Xlib import X, error
+
+log = logging.getLogger("dovw.vdesktop")
 
 
 class VirtualDesktopCollector:
@@ -84,6 +87,7 @@ class VirtualDesktopCollector:
         if new is None or new == self.current:
             return
         self.current = new
+        log.debug("vdesktop_current -> idx=%d name=%s", new, self.name_for(new))
         self.emit({"kind": "vdesktop_current", "index": new,
                    "name": self.name_for(new), "ts": time.time()})
 
@@ -119,6 +123,8 @@ class VirtualDesktopCollector:
     def prime(self):
         """Emit an initial baseline so the desktop cache is populated at startup."""
         self.refresh_state()
+        log.info("vdesktop initial: count=%d current=%d names=%s",
+                 self.count, self.current, self.names)
         self.emit({"kind": "vdesktop_meta", "count": self.count,
                    "names": list(self.names), "ts": time.time()})
         if self.current is not None:

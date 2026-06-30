@@ -15,9 +15,12 @@ disables it (from the *local* connection, per the demo) when ``stop`` is set.
 """
 from __future__ import annotations
 
+import logging
 import threading
 
 from Xlib import X, display
+
+log = logging.getLogger("dovw.xrecord")
 from Xlib.ext import record
 from Xlib.protocol import rq
 
@@ -45,13 +48,15 @@ class XRecordPump:
             for fn in self._handlers:
                 try:
                     fn(event)
-                except Exception:               # 01 §7: one bad decode ≠ crash pump
-                    pass
+                except Exception as exc:        # 01 §7: one bad decode ≠ crash pump
+                    log.debug("xrecord handler failed: %s", exc)
 
     def run(self, stop) -> None:
         """Blocking pump; returns when ``stop`` (threading.Event) is set."""
         if not self.record_dpy.has_extension("RECORD"):
+            log.warning("RECORD extension not available; skipping XRecord pump")
             return
+        log.info("xrecord pump starting (%d handlers)", len(self._handlers))
         self.ctx = self.record_dpy.record_create_context(
             0, [record.AllClients],
             [{

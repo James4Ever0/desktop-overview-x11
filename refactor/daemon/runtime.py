@@ -14,7 +14,10 @@ slow API query can never stall the writer.
 from __future__ import annotations
 
 import asyncio
+import logging
 from concurrent.futures import ThreadPoolExecutor
+
+log = logging.getLogger("dovw.runtime")
 
 # Events safe to drop first under back-pressure (01 §2): raw high-rate keystrokes.
 _LOW_VALUE_KINDS = frozenset({"key"})
@@ -38,6 +41,7 @@ class Runtime:
     def register(self, kind: str, handler) -> None:
         """Bind an event ``kind`` to an async handler ``handler(ev) -> None``."""
         self._handlers[kind] = handler
+        log.debug("registered handler kind=%s", kind)
 
     # ───────────────────────── thread → loop shim (01 §2) ─────────────────────────
     def emit(self, event: dict) -> None:
@@ -82,8 +86,8 @@ class Runtime:
                 continue
             try:
                 await handler(ev)          # validate, enrich, enqueue DB write
-            except Exception as exc:        # 01 §7: isolate; one bad event ≠ crash
-                print(f"[dispatch] handler for {ev.get('kind')!r} failed: {exc}")
+            except Exception:                # 01 §7: isolate; one bad event ≠ crash
+                log.exception("dispatch handler for %r failed", ev.get("kind"))
 
     # ───────────────────────── lifecycle ─────────────────────────
     async def start_core(self) -> None:

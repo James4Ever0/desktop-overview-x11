@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import signal
 import sys
 from pathlib import Path
 
@@ -26,6 +27,16 @@ def parse_args(argv=None) -> FrontendSettings:
     p.add_argument("--tcp", nargs="?", const="127.0.0.1:8765", metavar="HOST:PORT",
                    help="connect over TCP instead of the UNIX socket")
     p.add_argument("--columns", type=int, help="fixed grid column count (default: auto-fit)")
+    p.add_argument("--refresh-interval", type=int, metavar="SEC",
+                   help="auto-refresh interval in seconds (0 = off, default 2)")
+    p.add_argument("--show-back-button", action="store_true",
+                   help="show the Back navigation button (hidden by default)")
+    p.add_argument("--hide-self", dest="hide_self", action="store_true",
+                   help="hide the GUI's own window from results (default: on)")
+    p.add_argument("--no-hide-self", dest="hide_self", action="store_false",
+                   help="show the GUI's own window in results")
+    p.add_argument("--hide-self-method", choices=["id", "title_prefix"], default="id",
+                   help="how to identify the GUI window: id (default) or title_prefix")
     p.add_argument("--log-level", default="info",
                    choices=["debug", "info", "warning", "error"])
     args = p.parse_args(argv)
@@ -39,6 +50,13 @@ def parse_args(argv=None) -> FrontendSettings:
         over["tcp_endpoint"] = args.tcp
     if args.columns:
         over["grid_columns"] = args.columns
+    if args.refresh_interval is not None:
+        over["grid_auto_refresh_s"] = args.refresh_interval
+    if args.show_back_button:
+        over["show_back_button"] = True
+    over["hide_self"] = args.hide_self
+    if args.hide_self_method:
+        over["hide_self_method"] = args.hide_self_method
     s = s.with_overrides(**over) if over else s
     s._log_level = args.log_level   # type: ignore[attr-defined]
     return s
@@ -61,6 +79,10 @@ def main(argv=None) -> int:
         log.exception("failed to build GUI")
         client.close()
         return 1
+
+    # SIGINT → clean shutdown in the Tk event loop (Tk swallows KeyboardInterrupt
+    # inside C-level callbacks, so we route it through the event queue instead).
+    signal.signal(signal.SIGINT, lambda sig, frame: app.after(0, app.on_close))
 
     try:
         app.mainloop()

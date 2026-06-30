@@ -1,0 +1,97 @@
+window thumbnail does now show up in search view.
+
+cannot jump back to search (grid) view from timeline view.
+
+most windows have (no title) but i think this shall be wrong.
+
+do not know the meaning of timeline view, i do not see a line, instead i see vertical bars. i think i need horizontal lines showing what timespan a window is focused, and clear guides showing time 16:00 16:10 16:20 etc, can be precise to seconds. can shift the timespan.
+
+tell me how to enable verbose logging in run scripts. change those default to verbose or debug logging to stdout by default.
+
+shall add an option for viewing only those windows appearing current boot, filtering out those boot id mismatched.
+
+---
+
+2026-06-30 00:23:59 DEBUG   dovw.fe.app          window_capture decode failed uid=12: 'PngImageFile' object has no attribute 'window_capture'
+
+---
+
+hide those windows not associated with any virtual desktop id, in frontend or in backend? discuss. many are useless, like the taskbar, the desktop interface. would recommend to not track for those windows in backend and eliminate issues.
+
+in search interface, everytime encountering refresh, the window order shuffles. can we sort by: last active time, alphabetical order by title name, window id convert to integer and so on?
+
+in timeline interface one cannot zoom in easily. making clicking and viewing details difficult. can we sort the timeline candidate order similarly by most recently focused time, window name, window id and so on in frontend? can we display a red line vertically to hit the time visually and select the candidate there by dragging or pressing left/right arrow key, and pressing up/down to zoom in/out in the timeline? one may also control zooming level by entering digits in input box, and specifying the red line position by entering data & time in input box with validation. ui operation will sync with input values.
+
+---
+
+make frontend ui respond to keyboard interrupt, will shutdown ui if in the console or process receives SIGINT
+
+---
+
+shall only display those alive ones by default on frontend.
+
+also are all checkboxes wired to both view (config effective) to search and timeline? do not see the show checkbox working in timeline view. if possible make all knobs wired to both view. if not, hide those ineffective ones on switching and differentiate the knobs for each view.
+
+---
+
+use ai to check todo list, which are done, which are not.
+
+---
+
+explain the timeline view, what are those blue vertical bars about? what else i do not know? how to improve? what reference design i can view online, like activity timeline overview or something else?
+
+---
+
+do not check x11 presense beforehand (using environment variable? device path? shell command to get gui session type? get os type? platform name?) in frontend ui launch init. instead do the check before starting the main daemon process loop. if not running x11 print detailed error message, reasons for exiting (why? platform is not linux? linux but running wayland? and so on, and hint the user this program is for linux x11 desktop only, what env variable is not detected and so on.)
+
+---
+
+refactor code, for frontend, connect to daemon using websocket to subscribe for window capture update events to prevent full update, subscribe for screenshot update, title update, window close & create, attr update events. when switching view, reconnect websocket or reuse the hidden view and keep the websocket connection. at connection init, websocket will send full window candidate info, then provide incremental update events. fetch picture using http request. reuse existing apis. only provide necessary event driven data using websocket.
+
+---
+
+do not know what is that back button all about? when i press it i will get some glitches and the ui does not arrange correctly. can you remove that button or explain why it exists so that i can think over it and iterate its specs?
+
+---
+
+display last access time in search grid view per window, add dropdown box to select sort by last access time (cst), window title (alphabetical) and window id, order ascending, decending, avoid unconditional shuffling grid of refresh. do it also for timeline? default to sort by last access time, the latest first. by last access time i mean last focused time.
+
+
+---
+
+the hover preview is still updated when the thumbnail is updated. also the thumbnail is not updated quick enough on focus from backend? how to prove? can you log something like "update window thumbnail for window id xxx because of window focus/ window title change" or something?
+
+---
+
+make each grid of the same size, do not resize the grid because of window screenshot dimensions.
+
+---
+
+capture process name or binary name in backend and display in frontend just like /home/jamesbrown/Desktop/works/desktop_overview_with_search/reference_v2/demo-no-ocr-efficient-refresh.py
+
+lots of uncaptured window screenshot and window titles. check out /home/jamesbrown/Desktop/works/desktop_overview_with_search/reference_v2/demo-no-ocr-efficient-refresh.py and do it at daemon launch to do a full sweep against all opening windows.
+
+also wmctrl -l shows lots of windows on desktop_id=0 so why so many windows still not captured and labeled without desktop id? is that a database error? shall we store window id along with timestamp along with desktop id along with desktop name? what table shall we touch then? what table to use to query for window metadata including desktop name and id?
+
+want only those listed in wmctrl -l and with existing desktop ids being tracked. what method do you use instead to list available windows? do you do filtering inappropriately? 
+
+your currently "alive" window count exceeds those in wmctrl -l, and many are missing desktop ids and title and capture image.
+---
+
+default to uncheck "current desktop"
+
+---
+
+the text in dropbox in frontend is not observable since background is white and text is white. make it observable.
+
+---
+
+shall enable hover on text thumbnail result into detailed metadata view in search view, including: search hit terms, clipboard, keyboard (recent records) and so much more, just like hovering image thumbnail result into enlarged preview.
+
+---
+
+add button to "hide self", first get current window id in gui init, then set the hide self button to true in gui (default), filter results in frontend (no business to backend). but to prevent xlib usage, maybe we shall use window title prefix instead of window id? you decide? make the method configurable in frontend config file?
+
+also even for the "self" window you did not get the title. 0x0a40003e  0     N/A Desktop Overview — search which is output from wmctrl -l. why you obtain no title for this window? this will not going to make prefix based filtering works.
+
+also want to hide a window with title called "Desktop - Plasma". so can you make it into a list in frontend config or backend config something, filtering those out, if any window has title exactly matching those things, refuse to track events, return results in api and so on. like "Desktop Overview - search" and "Desktop Overview - timeline"

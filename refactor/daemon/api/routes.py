@@ -32,15 +32,17 @@ def _fields(fields: str | None) -> list[str]:
 @router.get("/windows", response_model=list[models.WindowOut])
 async def get_windows(
     ctx: DaemonContext = Depends(get_ctx),
-    sort: str = Query("last_access", pattern="^(last_access|title)$"),
+    sort: str = Query("last_access", pattern="^(last_access|title|window_id)$"),
     order: str = Query("desc", pattern="^(asc|desc)$"),
     alive: str = Query("both", pattern="^(only|dead|both)$"),
     limit: int = Query(200, ge=1, le=2000),
     offset: int = Query(0, ge=0),
 ):
+    log.debug("GET /windows sort=%s order=%s alive=%s limit=%d", sort, order, alive, limit)
     return await search.list_windows(
         ctx.store, alive=alive, sort=sort, order=order, limit=limit, offset=offset,
-        current_session_key=ctx.session_key)
+        current_session_key=ctx.session_key,
+        title_denylist=ctx.settings.window_title_denylist)
 
 
 @router.get("/windows/{uid}", response_model=models.WindowDetail)
@@ -84,12 +86,15 @@ async def get_search(
     window_uid: int | None = Query(None),
     fields: str | None = Query(None),
     alive: str = Query("both", pattern="^(only|dead|both)$"),
-    sort: str = Query("last_access", pattern="^(last_access|relevance|recency)$"),
+    sort: str = Query("last_access", pattern="^(last_access|relevance|recency|title|window_id)$"),
+    order: str = Query("desc", pattern="^(asc|desc)$"),
     hits: str = Query("hit_only", pattern="^(hit_only|all)$"),
     t_from: float | None = Query(None, alias="from"),
     t_to: float | None = Query(None, alias="to"),
 ):
-    return await _do_search(ctx, q, window_uid, fields, alive, sort, hits, t_from, t_to)
+    log.debug("GET /search q=%s window_uid=%s fields=%s sort=%s order=%s",
+              q, window_uid, fields, sort, order)
+    return await _do_search(ctx, q, window_uid, fields, alive, sort, order, hits, t_from, t_to)
 
 
 # from/to need explicit aliasing because `from` is a Python keyword
@@ -100,21 +105,23 @@ async def get_history(
     window_uid: int | None = Query(None),
     fields: str | None = Query(None),
     alive: str = Query("both", pattern="^(only|dead|both)$"),
-    sort: str = Query("last_access", pattern="^(last_access|relevance|recency)$"),
+    sort: str = Query("last_access", pattern="^(last_access|relevance|recency|title|window_id)$"),
+    order: str = Query("desc", pattern="^(asc|desc)$"),
     hits: str = Query("hit_only", pattern="^(hit_only|all)$"),
     t_from: float | None = Query(None, alias="from"),
     t_to: float | None = Query(None, alias="to"),
 ):
-    return await _do_search(ctx, q, window_uid, fields, alive, sort, hits, t_from, t_to)
+    return await _do_search(ctx, q, window_uid, fields, alive, sort, order, hits, t_from, t_to)
 
 
-async def _do_search(ctx, q, window_uid, fields, alive, sort, hits, t_from=None, t_to=None):
+async def _do_search(ctx, q, window_uid, fields, alive, sort, order, hits, t_from=None, t_to=None):
     s = ctx.settings
     limit = min(s.search_default_limit, s.search_max_limit)
     return await search.search(
         ctx.store, q=q, window_uid=window_uid, fields=_fields(fields), alive=alive,
-        t_from=t_from, t_to=t_to, sort=sort, hits=hits, limit=limit,
-        current_session_key=ctx.session_key)
+        t_from=t_from, t_to=t_to, sort=sort, order=order, hits=hits, limit=limit,
+        current_session_key=ctx.session_key,
+        title_denylist=s.window_title_denylist)
 
 
 # ───────────────────────── timeline ─────────────────────────
@@ -122,12 +129,16 @@ async def _do_search(ctx, q, window_uid, fields, alive, sort, hits, t_from=None,
 async def get_timeline(
     ctx: DaemonContext = Depends(get_ctx),
     window_uid: int | None = Query(None),
+    sort: str = Query("last_access", pattern="^(last_access|title|window_id)$"),
+    order: str = Query("desc", pattern="^(asc|desc)$"),
     t_from: float | None = Query(None, alias="from"),
     t_to: float | None = Query(None, alias="to"),
 ):
+    log.debug("GET /timeline window_uid=%s sort=%s order=%s", window_uid, sort, order)
     return await search.timeline(
         ctx.store, t_from=t_from, t_to=t_to, window_uid=window_uid,
-        current_session_key=ctx.session_key)
+        sort=sort, order=order, current_session_key=ctx.session_key,
+        title_denylist=ctx.settings.window_title_denylist)
 
 
 # ───────────────────────── vdesktops ─────────────────────────

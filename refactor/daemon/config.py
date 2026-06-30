@@ -64,10 +64,20 @@ class Settings:
     window_capture_retention_days: int | None = None
     window_capture_max_dim: int = 1920
     ocr_enabled: bool = False
+    filter_no_vdesktop: bool = True       # skip windows without a vdesktop
+    capture_on_focus: bool = True         # capture on focus change
+    capture_on_title: bool = True         # capture on focused-window title change
+
+    # --- §3b title denylist ---
+    window_title_denylist: tuple[str, ...] = (
+        "Desktop Overview — search",
+        "Desktop Overview — timeline",
+        "Desktop - Plasma",
+    )
 
     # --- §4 storage, db & search ---
     write_queue_max_n: int = 200
-    write_queue_max_wait_s: float = 0.25
+    write_queue_max_wait_s: float = 0.05   # batch window: lower = fresher, higher = fewer fsyncs
     write_queue_maxsize: int = 10_000      # back-pressure bound (01 §2)
     event_queue_maxsize: int = 10_000      # dispatch back-pressure bound (01 §2)
     sqlite_journal_mode: str = "WAL"

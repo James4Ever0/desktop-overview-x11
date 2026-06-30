@@ -17,7 +17,7 @@ import logging
 import logging.handlers
 from pathlib import Path
 
-_FMT = "%(asctime)s %(levelname)-7s %(name)-22s %(message)s"
+_FMT = "%(asctime)s %(levelname)-7s %(name)-22s %(filename)s:%(lineno)d %(message)s"
 _DATEFMT = "%Y-%m-%d %H:%M:%S"
 _configured = False
 

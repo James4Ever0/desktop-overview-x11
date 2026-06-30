@@ -23,6 +23,9 @@ last char (best-effort edit fidelity, 04 §4).  At flush time the segment text i
 from __future__ import annotations
 
 import asyncio
+import logging
+
+log = logging.getLogger("dovw.aggregator")
 
 
 class KeyboardAggregator:
@@ -98,7 +101,11 @@ class KeyboardAggregator:
         # noise (stray keys, lone whitespace) and never reaches the buffer/db.
         text = "".join(seg["buf"]).strip()
         if len(text) <= self.s.kbd_min_segment_chars:
+            log.debug("flush(%s): segment too short (%d chars), dropped",
+                      reason, len(text))
             return
+        log.debug("flush(%s): window_uid=%s chars=%d text=%r",
+                  reason, seg["window_uid"], len(text), text[:80])
         self.store.enqueue(
             "INSERT INTO kbd_segment(window_uid, text, started_at, ended_at,"
             " vdesktop_index, vdesktop_name, flush_reason) VALUES(?,?,?,?,?,?,?)",

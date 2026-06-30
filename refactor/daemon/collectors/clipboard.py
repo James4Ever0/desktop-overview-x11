@@ -14,10 +14,13 @@ Refactor of ``reference_v2/demo-clipboard-event-listener.py``.  Split in two:
 """
 from __future__ import annotations
 
+import logging
 import subprocess
 import time
 
 from Xlib.ext import xfixes
+
+log = logging.getLogger("dovw.clipboard")
 
 try:
     from PIL import Image
@@ -143,6 +146,7 @@ class ClipboardCollector:
         """Return True if this XFIXES owner-notify was for CLIPBOARD."""
         if getattr(ev, "selection", None) != self.A_CLIPBOARD:
             return False
+        log.debug("clipboard write detected")
         self.emit({"kind": "clipboard_write", "selection": "CLIPBOARD",
                    "ts": time.time()})
         return True

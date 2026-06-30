@@ -22,4 +22,4 @@ fi
 
 # Logs go to BOTH stdout and a rotating file under the data dir
 # ($XDG_DATA_HOME/desktop-overview/logs/daemon.log, default ~/.local/share/...).
-exec "$PYTHON" -u -m daemon "$@"
+exec "$PYTHON" -u -m daemon --log-level debug "$@"

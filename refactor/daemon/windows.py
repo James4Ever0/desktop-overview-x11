@@ -14,7 +14,10 @@ for event attribution (02 §5); collectors call :meth:`bump_last_seen` on activi
 """
 from __future__ import annotations
 
+import logging
 import time
+
+log = logging.getLogger("dovw.windows")
 
 
 class WindowRegistry:
@@ -62,6 +65,7 @@ class WindowRegistry:
              x_window_id, wm_class, now, now),
         )
         self._alive[x_window_id] = uid
+        log.debug("minted window_uid=%d x=0x%08x wm_class=%s", uid, x_window_id, wm_class)
         return uid
 
     # ───────────────────────── liveness ─────────────────────────
@@ -74,6 +78,8 @@ class WindowRegistry:
             "WHERE session_key=? AND x_window_id=? AND alive=1",
             (now, self.session_key, x_window_id),
         )
+        if uid is not None:
+            log.debug("mark_dead window_uid=%d x=0x%08x", uid, x_window_id)
         if uid is not None and self.current_focus_window_uid == uid:
             self.current_focus_window_uid = None
 
@@ -103,6 +109,7 @@ class WindowRegistry:
         for xid in current:
             wm = wm_class_of(xid) if wm_class_of else None
             await self.ensure_window(xid, wm, now)
+        log.debug("reconcile done: %d alive, %d current", len(self._alive), len(current))
 
     # ───────────────────────── activity ─────────────────────────
     async def bump_last_seen(self, window_uid: int | None, now: float | None = None) -> None:

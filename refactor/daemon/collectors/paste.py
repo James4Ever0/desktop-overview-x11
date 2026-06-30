@@ -12,9 +12,12 @@ Gestures → candidates (never "confirmed", 03 §5):
 """
 from __future__ import annotations
 
+import logging
 import time
 
 from Xlib import X, XK
+
+log = logging.getLogger("dovw.paste")
 
 
 class PasteDetector:
@@ -47,6 +50,7 @@ class PasteDetector:
                            getattr(event, "time", None))
 
     def _emit(self, selection, gesture, confidence, server_time):
+        log.debug("paste gesture: %s -> %s (%s)", gesture, selection, confidence)
         self.emit({"kind": "read_event", "selection": selection, "gesture": gesture,
                    "confidence": confidence, "server_time": server_time,
                    "ts": time.time()})

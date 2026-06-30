@@ -15,9 +15,12 @@ PropertyNotify events here by atom.  Emits:
 """
 from __future__ import annotations
 
+import logging
 import time
 
 from Xlib import X, Xatom, error
+
+log = logging.getLogger("dovw.focus")
 
 
 def wid_str(wid: int) -> str:
@@ -37,6 +40,7 @@ class FocusTitleCollector:
         self.A_NET_CLIENT_LIST_STACKING = dpy.intern_atom("_NET_CLIENT_LIST_STACKING")
         self.A_NET_ACTIVE_WINDOW = dpy.intern_atom("_NET_ACTIVE_WINDOW")
         self.A_NET_WM_NAME = dpy.intern_atom("_NET_WM_NAME")
+        self.A_NET_WM_VISIBLE_NAME = dpy.intern_atom("_NET_WM_VISIBLE_NAME")
         self.A_UTF8_STRING = dpy.intern_atom("UTF8_STRING")
         self.titles: dict[int, str | None] = {}
         self.watched: set[int] = set()
@@ -57,6 +61,12 @@ class FocusTitleCollector:
     def read_title(self, win):
         try:
             p = win.get_full_property(self.A_NET_WM_NAME, self.A_UTF8_STRING)
+            if p and p.value:
+                return self._decode(p.value)
+        except error.XError:
+            return None
+        try:
+            p = win.get_full_property(self.A_NET_WM_VISIBLE_NAME, self.A_UTF8_STRING)
             if p and p.value:
                 return self._decode(p.value)
         except error.XError:
@@ -94,11 +104,23 @@ class FocusTitleCollector:
         win = self._win(wid)
         try:
             win.change_attributes(event_mask=X.PropertyChangeMask)
-            title = self.read_title(win)
         except error.XError:
             return
+        try:
+            title = self.read_title(win)
+        except error.XError:
+            title = None
         self.watched.add(wid)
+        old = self.titles.get(wid)
         self.titles[wid] = title
+        # Seed the title we just read.  Many windows never change their title
+        # after they appear (and ones already open before the daemon started
+        # never fire a change at all), so without this their current title stays
+        # NULL in the DB and the UI shows a blank card.  Title *changes* are
+        # still handled by handle_title_change; this covers the initial read.
+        if title and title != old:
+            self.emit({"kind": "title", "x_window_id": int(wid), "old": old,
+                       "new": title, "ts": time.time()})
 
     # ----------------------------- emit-translated handlers -----------------------------
     def sync_clients(self, initial=False):
@@ -112,6 +134,7 @@ class FocusTitleCollector:
             self.titles.pop(wid, None)
         self.dpy.sync()
         if added or gone or initial:
+            log.debug("window_list added=%d gone=%d", len(added), len(gone))
             self.emit({"kind": "window_list", "added": [int(w) for w in added],
                        "gone": [int(w) for w in gone], "ts": time.time()})
 
@@ -124,6 +147,7 @@ class FocusTitleCollector:
         self.active = wid
         self.watch(wid)
         title = self.titles.get(wid) or self.read_title(self._win(wid))
+        log.debug("focus -> 0x%08x title=%s", wid, title)
         self.emit({"kind": "focus", "x_window_id": int(wid), "title": title,
                    "ts": time.time()})
 
@@ -134,6 +158,7 @@ class FocusTitleCollector:
         if new == old:
             return
         self.titles[wid] = new
+        log.debug("title 0x%08x: %r -> %r", wid, old, new)
         self.emit({"kind": "title", "x_window_id": int(wid), "old": old,
                    "new": new, "ts": time.time()})
 

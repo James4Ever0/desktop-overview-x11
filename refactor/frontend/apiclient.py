@@ -48,6 +48,7 @@ class Window:
     jumpable: bool
     last_access: float | None
     window_capture_url: str | None
+    window_capture_ts: int | None
     hits: list[Hit] = field(default_factory=list)
 
     @property
@@ -66,6 +67,7 @@ class Window:
             vdesktop=(VDesktop(vd.get("index"), vd.get("name")) if vd else None),
             alive=bool(d.get("alive")), jumpable=bool(d.get("jumpable")),
             last_access=d.get("last_access"), window_capture_url=d.get("window_capture_url"),
+            window_capture_ts=d.get("window_capture_ts"),
             hits=[Hit(h["field"], h.get("excerpt")) for h in d.get("hits", [])],
         )
 
@@ -73,6 +75,7 @@ class Window:
 @dataclass
 class TimelineLane:
     window_uid: int
+    x_window_id: str | None
     wm_class: str | None
     current_title: str | None
     alive: bool | None
@@ -83,10 +86,10 @@ class TimelineLane:
     @classmethod
     def from_json(cls, d: dict) -> "TimelineLane":
         return cls(
-            window_uid=d["window_uid"], wm_class=d.get("wm_class"),
-            current_title=d.get("current_title"), alive=d.get("alive"),
-            jumpable=d.get("jumpable"), focus_spans=d.get("focus_spans", []),
-            titles=d.get("titles", []))
+            window_uid=d["window_uid"], x_window_id=d.get("x_window_id"),
+            wm_class=d.get("wm_class"), current_title=d.get("current_title"),
+            alive=d.get("alive"), jumpable=d.get("jumpable"),
+            focus_spans=d.get("focus_spans", []), titles=d.get("titles", []))
 
 
 class ApiClient:
@@ -138,13 +141,16 @@ class ApiClient:
 
     # ───────────────────────── endpoints (08 §2-5) ─────────────────────────
     def windows(self, *, sort="last_access", order="desc", alive="both") -> list[Window]:
+        log.debug("api windows sort=%s order=%s alive=%s", sort, order, alive)
         data = self._get("/windows", sort=sort, order=order, alive=alive)
         return [Window.from_json(d) for d in data]
 
     def search(self, *, q=None, window_uid=None, fields=None, alive="both",
-               sort="last_access", hits="hit_only", t_from=None, t_to=None) -> list[Window]:
+               sort="last_access", order="desc", hits="hit_only", t_from=None, t_to=None) -> list[Window]:
         path = "/history" if (t_from is not None or t_to is not None) else "/search"
-        params = dict(q=q, window_uid=window_uid, alive=alive, sort=sort, hits=hits)
+        log.debug("api search q=%s window_uid=%s fields=%s sort=%s order=%s",
+                  q, window_uid, fields, sort, order)
+        params = dict(q=q, window_uid=window_uid, alive=alive, sort=sort, order=order, hits=hits)
         if fields:
             params["fields"] = ",".join(fields)
         if t_from is not None:
@@ -156,8 +162,9 @@ class ApiClient:
     def window(self, uid: int) -> dict:
         return self._get(f"/windows/{uid}")
 
-    def timeline(self, *, window_uid=None, t_from=None, t_to=None) -> list[TimelineLane]:
-        params = dict(window_uid=window_uid)
+    def timeline(self, *, window_uid=None, sort="last_access", order="desc",
+                 t_from=None, t_to=None) -> list[TimelineLane]:
+        params = dict(window_uid=window_uid, sort=sort, order=order)
         if t_from is not None:
             params["from"] = t_from
         if t_to is not None:
@@ -171,6 +178,7 @@ class ApiClient:
         return self._get("/health")
 
     def activate(self, uid: int) -> dict:
+        log.debug("api activate window_uid=%d", uid)
         return self._post(f"/windows/{uid}/activate")
 
     def refresh_window_captures(self) -> dict:

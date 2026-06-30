@@ -26,4 +26,4 @@ fi
 
 # Logs go to BOTH stdout and a rotating file
 # ($XDG_DATA_HOME/desktop-overview/logs/frontend.log, default ~/.local/share/...).
-exec "$PYTHON" -u -m frontend "$@"
+exec "$PYTHON" -u -m frontend --log-level debug "$@"

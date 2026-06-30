@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 from . import capture
 
@@ -30,6 +31,49 @@ class WindowCaptureScheduler:
         self.boot = daemon_boot_id
         self._bg_queue: list[str] = []   # shuffled background x_window_id (hex) rotation
         self._shuffle_i = 0              # deterministic-rotation cursor (no Math.random needed)
+
+    # ───────────────────────── event hooks ─────────────────────────
+    async def on_focus_change(self, window_uid: int) -> None:
+        """Capture the newly focused window immediately (config: capture_on_focus)."""
+        if not self.s.capture_on_focus:
+            return
+        now = time.time()
+        wid_hex = await self._wid_hex_for_uid(window_uid)
+        if wid_hex is None:
+            return
+        title = await self._title_for_uid(window_uid)
+        await self._capture_and_save(wid_hex, title or "", is_focused=True, now=now)
+        log.debug("capture_on_focus window_uid=%d", window_uid)
+
+    async def on_title_change(self, window_uid: int) -> None:
+        """Capture the focused window when its title changes (config: capture_on_title)."""
+        if not self.s.capture_on_title:
+            return
+        uid = self.reg.current_focus_window_uid
+        if uid is None or uid != window_uid:
+            return
+        now = time.time()
+        wid_hex = await self._wid_hex_for_uid(uid)
+        if wid_hex is None:
+            return
+        title = await self._title_for_uid(uid)
+        await self._capture_and_save(wid_hex, title or "", is_focused=True, now=now)
+        log.debug("capture_on_title window_uid=%d", uid)
+
+    async def _wid_hex_for_uid(self, window_uid: int) -> str | None:
+        """Look up x_window_id from the window table, return as hex string."""
+        row = await self.store.fetchone(
+            "SELECT x_window_id FROM window WHERE window_uid=?", (window_uid,))
+        if row is None:
+            return None
+        return f"0x{int(row[0]):08x}"
+
+    async def _title_for_uid(self, window_uid: int) -> str | None:
+        """Get the latest known title for a window_uid."""
+        row = await self.store.fetchone(
+            "SELECT title FROM title_history WHERE window_uid=? "
+            "ORDER BY changed_at DESC LIMIT 1", (window_uid,))
+        return row[0] if row else None
 
     # ───────────────────────── capture orchestration ─────────────────────────
     async def full_sweep(self, now: float) -> int:
@@ -104,6 +148,12 @@ class WindowCaptureScheduler:
             return False
         wm = await self.rt.run_in_executor(capture.get_app_name, wid_hex)
         uid = await self.reg.ensure_window(xid, wm or None, now)
+        if self.s.filter_no_vdesktop:
+            vrow = await self.store.fetchone(
+                "SELECT 1 FROM focus_event WHERE window_uid=? AND vdesktop_index IS NOT NULL"
+                " LIMIT 1", (uid,))
+            if vrow is None:
+                return False
         img = await self.rt.run_in_executor(
             capture.capture_window, wid_hex, title, self.s.window_capture_max_dim)
         if img is None:
@@ -155,8 +205,8 @@ class WindowCaptureScheduler:
                 break
             try:
                 await self.tick(clock())
-            except Exception as exc:           # 01 §7: a bad tick never kills the task
-                log.warning("window_capture tick failed: %s", exc)
+            except Exception:                    # 01 §7: a bad tick never kills the task
+                log.exception("window_capture tick failed")
 
 
 def _save_png(img, abs_path: str) -> None:

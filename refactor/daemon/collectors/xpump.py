@@ -13,6 +13,7 @@ instead of blocking forever in ``next_event``.  All X errors are swallowed
 """
 from __future__ import annotations
 
+import logging
 import select
 
 from Xlib import X, display, error
@@ -21,6 +22,8 @@ from .clipboard import ClipboardCollector
 from .focus import FocusTitleCollector
 from .selection import PrimarySelectionCollector
 from .vdesktop import VirtualDesktopCollector
+
+log = logging.getLogger("dovw.xpump")
 
 
 class XPump:
@@ -45,9 +48,10 @@ class XPump:
             self._sel_handlers = [self.clipboard, self.selection]
             code = self.dpy.extension_event.SetSelectionOwnerNotify
             self._sel_type = code[0] if isinstance(code, tuple) else code
+        log.info("xpump initialized (xfixes=%s)", self._xfixes_ok)
 
-    def _on_x_error(self, err, request):
-        pass  # 01 §7: ignore BadWindow/BadAtom from races
+    def _on_x_error(self, err):
+        log.debug("X error: %s", err)
 
     def _atom_name(self, atom):
         if atom in self._atom_name_cache:
@@ -69,6 +73,8 @@ class XPump:
         self.dpy.sync()
         self.focus.prime()
         self.vdesktop.prime()
+        log.info("xpump event loop starting")
+        _ev_count = 0
 
         fd = self.dpy.fileno()
         while not stop.is_set():
@@ -82,6 +88,7 @@ class XPump:
             n = self.dpy.pending_events()
             for _ in range(n):
                 ev = self.dpy.next_event()
+                _ev_count += 1
                 if self._sel_type is not None and ev.type == self._sel_type:
                     for h in self._sel_handlers:
                         try:
@@ -101,6 +108,7 @@ class XPump:
                             break
                     except error.XError:
                         pass
+        log.info("xpump event loop stopped (processed %d events)", _ev_count)
 
     def close(self):
         try:

@@ -31,7 +31,36 @@ from . import views
 
 log = logging.getLogger("dovw.fe.app")
 
+
+def _lane_has_vdesktop(lane) -> bool:
+    """True if at least one focus_span carries a vdesktop_index."""
+    return any(
+        sp.get("vdesktop_index") is not None
+        for sp in getattr(lane, "focus_spans", []) or []
+    )
+
+
+def _fmt_last_access(ts: float | None) -> str:
+    """Human-readable last-focus/access label for a tile."""
+    if ts is None or ts <= 0:
+        return "last: —"
+    import datetime
+    dt = datetime.datetime.fromtimestamp(ts)
+    now = datetime.datetime.now()
+    if dt.date() == now.date():
+        return f"last: {dt.strftime('%H:%M')}"
+    if dt.year == now.year:
+        return f"last: {dt.strftime('%b %d %H:%M')}"
+    return f"last: {dt.strftime('%Y-%m-%d %H:%M')}"
+
+
 ALL_FIELDS = ["title", "clipboard", "selection", "keyboard"]
+SORT_OPTIONS = [
+    ("last access", "last_access"),
+    ("title", "title"),
+    ("window id", "window_id"),
+]
+SORT_LABELS = {v: k for k, v in SORT_OPTIONS}
 HOVER_POLL_MS = 120
 HOVER_MOVE_THRESHOLD_PX = 6
 
@@ -66,16 +95,23 @@ class WindowPreviewApp(tk.Tk):
             "view": "search",        # 'search' | 'timeline'
             "q": "",
             "fields": list(ALL_FIELDS),
-            "alive": "both",         # only | dead | both
+            "alive": "only",         # only | dead | both
             "hits": "hit_only",      # hit_only | all
             "from": None, "to": None,
             "sort": "last_access",
+            "order": "desc",         # asc | desc
             "selected_window_uid": None,
+            "filter_no_vdesktop": True,
+            "hide_self": self.s.hide_self,
         }
+        # identify our own X window for the hide-self filter (Tk-only, no Xlib)
+        self._self_xid = self._get_self_xid()
+        self._self_title_prefix = self.title()
         self._history_stack: list[dict] = []
 
         # tiles keyed by window_uid (08 §2: reconcile by uid, not raw x id)
         self.tiles: dict[int, dict] = {}
+        self._last_order_uids: tuple[int, ...] = ()
         self._window_capture_cache: dict[int, ImageTk.PhotoImage] = {}
         self._preview_cache: dict[int, ImageTk.PhotoImage] = {}
 
@@ -144,8 +180,51 @@ class WindowPreviewApp(tk.Tk):
         style.configure("Accent.TButton", background=c["accent"], foreground="#ffffff")
         style.configure("TEntry", fieldbackground=c["entry_bg"], foreground=c["entry_fg"],
                         insertcolor=c["fg"])
+        style.configure("TCombobox", fieldbackground=c["entry_bg"], foreground=c["entry_fg"],
+                        background=c["tile_bg"])
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", c["entry_bg"]), ("active", c["entry_bg"])],
+                  foreground=[("readonly", c["entry_fg"]), ("active", c["entry_fg"])],
+                  selectbackground=[("readonly", c["select_bg"])])
+        # the popped listbox is a plain Listbox widget; set its colors via option db
+        self.option_add("*TCombobox*Listbox.background", c["entry_bg"])
+        self.option_add("*TCombobox*Listbox.foreground", c["entry_fg"])
+        self.option_add("*TCombobox*Listbox.selectBackground", c["select_bg"])
+        self.option_add("*TCombobox*Listbox.selectForeground", c["entry_fg"])
         style.configure("TCheckbutton", background=c["bg"], foreground=c["fg"])
         style.configure("TRadiobutton", background=c["bg"], foreground=c["fg"])
+
+    def _get_self_xid(self) -> str | None:
+        """Return this Tk window's X11 id as '0xXXXXXXXX', or None if unknown."""
+        try:
+            # ensure the window is realized before reading its X id
+            self.update_idletasks()
+            wid = self.winfo_id()
+            if wid:
+                return f"0x{int(wid):08x}"
+        except Exception as exc:                           # noqa: BLE001
+            log.debug("could not get own X window id: %s", exc)
+        return None
+
+    def _refresh_self_xid(self):
+        """Re-read our own X id once the window is mapped; called before first render."""
+        if self._self_xid is None:
+            self._self_xid = self._get_self_xid()
+            log.debug("self x_window_id=%s title=%r", self._self_xid, self.title())
+
+    def _is_self(self, w) -> bool:
+        """True if the given Window/TimelineLane is this GUI's own window."""
+        if not self.view_state.get("hide_self", True):
+            return False
+        method = self.s.hide_self_method
+        if method == "title_prefix":
+            title = getattr(w, "current_title", None) or ""
+            return title.startswith(self._self_title_prefix)
+        # method == "id"
+        xid = getattr(w, "x_window_id", None)
+        if xid and self._self_xid and xid.lower() == self._self_xid.lower():
+            return True
+        return False
 
     # ───────────────────────── controls ─────────────────────────
     def _build_controls(self):
@@ -157,7 +236,9 @@ class WindowPreviewApp(tk.Tk):
         self.tab_timeline = ttk.Button(bar, text="🕑 Timeline", command=lambda: self.switch_view("timeline"))
         self.tab_search.pack(side=tk.LEFT)
         self.tab_timeline.pack(side=tk.LEFT, padx=(4, 12))
-        ttk.Button(bar, text="◀ Back", command=self.go_back).pack(side=tk.LEFT)
+        self.back_btn = ttk.Button(bar, text="◀ Back", command=self.go_back)
+        if self.s.show_back_button:
+            self.back_btn.pack(side=tk.LEFT)
 
         ttk.Label(bar, text="Search:").pack(side=tk.LEFT, padx=(12, 4))
         self.search_var = tk.StringVar()
@@ -171,29 +252,63 @@ class WindowPreviewApp(tk.Tk):
         self.status_var = tk.StringVar(value="ready")
         ttk.Label(bar, textvariable=self.status_var).pack(side=tk.RIGHT, padx=8)
 
-        # filter row (08 §4): fields, liveness, hits toggle, scope reset
+        # filter row (08 §4): fields (search-only), liveness, hits toggle, scope reset
         flt = ttk.Frame(self)
         flt.pack(fill=tk.X, padx=6, pady=(2, 6))
-        ttk.Label(flt, text="Fields:").pack(side=tk.LEFT)
+        self._flt = flt
+        self._search_only_filters: list[tk.Widget] = []
+
+        self._fields_label = ttk.Label(flt, text="Fields:")
+        self._fields_label.pack(side=tk.LEFT)
         self.field_vars = {}
+        self._field_cbs = []
         for f in ALL_FIELDS:
             v = tk.BooleanVar(value=True)
             self.field_vars[f] = v
-            ttk.Checkbutton(flt, text=f, variable=v, command=self._apply_filters).pack(side=tk.LEFT, padx=2)
+            cb = ttk.Checkbutton(flt, text=f, variable=v, command=self._apply_filters)
+            cb.pack(side=tk.LEFT, padx=2)
+            self._field_cbs.append(cb)
 
         ttk.Label(flt, text="   Show:").pack(side=tk.LEFT)
-        self.alive_var = tk.StringVar(value="both")
+        self.alive_var = tk.StringVar(value="only")
         for label, val in [("alive", "only"), ("dead", "dead"), ("both", "both")]:
             ttk.Radiobutton(flt, text=label, value=val, variable=self.alive_var,
                             command=self._apply_filters).pack(side=tk.LEFT, padx=2)
+        self._show_alive = self.alive_var.get
 
         self.hits_var = tk.StringVar(value="hit_only")
-        ttk.Checkbutton(flt, text="all fields", onvalue="all", offvalue="hit_only",
-                        variable=self.hits_var, command=self._apply_filters).pack(side=tk.LEFT, padx=(8, 2))
+        self._hits_cb = ttk.Checkbutton(flt, text="all fields", onvalue="all", offvalue="hit_only",
+                                        variable=self.hits_var, command=self._apply_filters)
+        self._hits_cb.pack(side=tk.LEFT, padx=(8, 2))
+
+        self.filter_no_vdesktop_var = tk.BooleanVar(value=self.s.filter_no_vdesktop)
+        self._vdesktop_cb = ttk.Checkbutton(flt, text="current desktop",
+                                            variable=self.filter_no_vdesktop_var,
+                                            command=self._apply_filters)
+        self._vdesktop_cb.pack(side=tk.LEFT, padx=(8, 2))
 
         self.scope_var = tk.StringVar(value="")
         self.scope_label = ttk.Label(flt, textvariable=self.scope_var, style="Muted.TLabel")
         self.scope_label.pack(side=tk.LEFT, padx=8)
+
+        # hide self (kept in frontend so it works regardless of daemon title capture)
+        self.hide_self_var = tk.BooleanVar(value=self.view_state["hide_self"])
+        self._hide_self_cb = ttk.Checkbutton(flt, text="hide self", variable=self.hide_self_var,
+                                             command=self._apply_filters)
+        self._hide_self_cb.pack(side=tk.LEFT, padx=(8, 2))
+
+        # sort / order (applies to search grid and timeline lanes)
+        ttk.Label(flt, text="   Sort:").pack(side=tk.LEFT)
+        self.sort_var = tk.StringVar(value="last_access")
+        self.sort_combo = ttk.Combobox(flt, textvariable=self.sort_var, state="readonly",
+                                       values=[v for _l, v in SORT_OPTIONS], width=14)
+        self.sort_combo.bind("<<ComboboxSelected>>", self._on_sort_changed)
+        self.sort_combo.pack(side=tk.LEFT, padx=2)
+        self.order_var = tk.StringVar(value="desc")
+        self.order_combo = ttk.Combobox(flt, textvariable=self.order_var, state="readonly",
+                                        values=["asc", "desc"], width=6)
+        self.order_combo.bind("<<ComboboxSelected>>", self._on_sort_changed)
+        self.order_combo.pack(side=tk.LEFT, padx=2)
 
     def _build_grid(self):
         self.canvas = tk.Canvas(self, bg=self.theme["canvas_bg"], highlightthickness=0)
@@ -233,6 +348,7 @@ class WindowPreviewApp(tk.Tk):
 
     # ───────────────────────── render dispatch (08 §5) ─────────────────────────
     def render(self):
+        self._refresh_self_xid()
         if self.view_state["view"] == "timeline":
             self._render_timeline()
         else:
@@ -241,7 +357,15 @@ class WindowPreviewApp(tk.Tk):
     def switch_view(self, view: str):
         if view != self.view_state["view"]:
             self._push_history()
+            self._clear_view()
+            # clear scope when switching views via tabs (it's only meaningful
+            # when set explicitly via open_window_scope / right-click)
+            self.view_state["selected_window_uid"] = None
+            self.scope_var.set("")
         self.view_state["view"] = view
+        self.title(f"Desktop Overview — {view}")
+        self._self_title_prefix = self.title()
+        self._show_search_filters(view == "search")
         log.info("switch view -> %s", view)
         self.render()
 
@@ -250,21 +374,25 @@ class WindowPreviewApp(tk.Tk):
         self.status_var.set("loading…")
         q = st["q"].strip() or None
         scope = st["selected_window_uid"]
+        log.debug("render_search q=%r scope=%s t_from=%s t_to=%s", q, scope, st["from"], st["to"])
 
         def call():
             if q is None and scope is None and st["from"] is None and st["to"] is None:
-                return self.api.windows(sort=st["sort"], alive=st["alive"])
+                return self.api.windows(sort=st["sort"], order=st["order"], alive=st["alive"])
             return self.api.search(q=q, window_uid=scope, fields=st["fields"],
-                                   alive=st["alive"], sort=st["sort"], hits=st["hits"],
-                                   t_from=st["from"], t_to=st["to"])
+                                   alive=st["alive"], sort=st["sort"], order=st["order"],
+                                   hits=st["hits"], t_from=st["from"], t_to=st["to"])
         self._submit(call, self._on_search_results)
 
     def _on_search_results(self, windows, err):
         if err is not None:
             self._on_error(err)
             return
+        windows = self._filter_vdesktop(windows)
+        windows = [w for w in windows if not self._is_self(w)]
         self._hide_banner()
         self.status_var.set(f"{len(windows)} window(s)")
+        log.debug("search returned %d windows", len(windows))
         self._reconcile_tiles(windows)
 
     def _render_timeline(self):
@@ -273,6 +401,7 @@ class WindowPreviewApp(tk.Tk):
 
         def call():
             return self.api.timeline(window_uid=st["selected_window_uid"],
+                                     sort=st["sort"], order=st["order"],
                                      t_from=st["from"], t_to=st["to"])
         self._submit(call, self._on_timeline_results)
 
@@ -280,6 +409,20 @@ class WindowPreviewApp(tk.Tk):
         if err is not None:
             self._on_error(err)
             return
+        n_before = len(lanes)
+        alive_mode = self.view_state.get("alive", "only")
+        if alive_mode == "only":
+            lanes = [l for l in lanes if l.alive]
+        elif alive_mode == "dead":
+            lanes = [l for l in lanes if not l.alive]
+        removed_alive = n_before - len(lanes)
+        if self.view_state.get("filter_no_vdesktop", True):
+            lanes = [l for l in lanes if _lane_has_vdesktop(l)]
+        removed = n_before - len(lanes)
+        if removed:
+            log.debug("timeline filters removed %d lane(s) (alive=%d, vdesktop=%d)",
+                      removed, removed_alive, removed - removed_alive)
+        lanes = [l for l in lanes if not self._is_self(l)]
         self._hide_banner()
         self.status_var.set(f"{len(lanes) if lanes else 0} lane(s)")
         self._clear_grid()
@@ -294,32 +437,74 @@ class WindowPreviewApp(tk.Tk):
             self.status_var.set(f"error: {err}")
 
     # ───────────────────────── grid tiles (08 §2) ─────────────────────────
-    def _clear_grid(self):
-        self._destroy_tip()
-        for uid, tile in list(self.tiles.items()):
-            tile["frame"].destroy()
+    def _clear_view(self):
+        """Destroy every child widget in inner_frame (tiles, timeline lanes, etc)."""
+        for child in list(self.inner_frame.winfo_children()):
+            child.destroy()
         self.tiles.clear()
+        self._last_order_uids = ()
+        # caches NOT cleared — they survive view switches for faster re-render;
+        # only on_close drops them.
+
+    def _clear_grid(self):
+        """Legacy — kept for callers that predate _clear_view."""
+        self._clear_view()
+
+    def _filter_vdesktop(self, windows: list[Window]) -> list[Window]:
+        """Filter out windows with no virtual-desktop association when enabled."""
+        if not self.view_state.get("filter_no_vdesktop", True):
+            return windows
+        out = [w for w in windows if w.vdesktop is not None and w.vdesktop.index is not None]
+        if len(out) < len(windows):
+            log.debug("vdesktop filter removed %d window(s)", len(windows) - len(out))
+        return out
 
     def _reconcile_tiles(self, windows: list[Window]):
-        """Add/remove/keep tiles keyed by window_uid; render in API order (08 §2)."""
+        """Add/remove/keep tiles keyed by window_uid; render in API order (08 §2).
+
+        To avoid visual shuffling on every refresh, existing tiles are only
+        re-gridded when the desired UID order actually changes.  Content is still
+        updated every render.
+        """
         self._destroy_tip()
         seen = {w.window_uid for w in windows}
+        order_uids = tuple(w.window_uid for w in windows)
+        reorder = order_uids != self._last_order_uids
+
         for uid in list(self.tiles):
             if uid not in seen:
                 self.tiles[uid]["frame"].destroy()
                 self.tiles.pop(uid, None)
-        cols = self.s.grid_columns or max(1, self.canvas.winfo_width() // (self.s.window_capture_display_dim + 20) or 4)
-        for i, w in enumerate(windows):
+
+        for w in windows:
             tile = self.tiles.get(w.window_uid)
             if tile is None:
                 tile = self._create_tile(w)
                 self.tiles[w.window_uid] = tile
+                reorder = True   # a new tile has no grid position yet
             else:
                 self._update_tile(tile, w)
-            r, c = divmod(i, cols)
-            tile["frame"].grid(row=r, column=c, padx=6, pady=6, sticky="nsew")
-        for c in range(cols):
-            self.inner_frame.columnconfigure(c, weight=1)
+                old_ts = tile.get("capture_ts")
+                if w.window_capture_ts is not None and w.window_capture_ts != old_ts:
+                    log.debug("reconcile: uid=%d capture_ts changed %s -> %s, re-fetch",
+                              w.window_uid, old_ts, w.window_capture_ts)
+                    self._window_capture_cache.pop(w.window_uid, None)
+                    self._preview_cache.pop(w.window_uid, None)
+                    tile.pop("capture_ts", None)
+                    self._load_window_capture(tile, w)
+
+        if reorder and windows:
+            cols = self.s.grid_columns or max(1, self.canvas.winfo_width() // (self.s.window_capture_display_dim + 20) or 4)
+            for i, w in enumerate(windows):
+                tile = self.tiles[w.window_uid]
+                r, c = divmod(i, cols)
+                tile["frame"].grid(row=r, column=c, padx=6, pady=6, sticky="nsew")
+            for c in range(cols):
+                self.inner_frame.columnconfigure(c, weight=1)
+            self._last_order_uids = order_uids
+        elif not windows:
+            self._last_order_uids = ()
+
         self.inner_frame.update_idletasks()
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
@@ -332,6 +517,8 @@ class WindowPreviewApp(tk.Tk):
         app_label.pack(anchor="w")
         title_label = ttk.Label(frame, style="Tile.TLabel", wraplength=self.s.window_capture_display_dim)
         title_label.pack(anchor="w")
+        access_label = ttk.Label(frame, style="Muted.TLabel")
+        access_label.pack(anchor="w")
         badge_label = ttk.Label(frame, style="Muted.TLabel")
         badge_label.pack(anchor="w")
         status_label = ttk.Label(frame, style="Tile.TLabel")
@@ -342,8 +529,9 @@ class WindowPreviewApp(tk.Tk):
         hits_box.tag_configure("field", foreground=c["accent"])
 
         tile = {"frame": frame, "img_label": img_label, "app_label": app_label,
-                "title_label": title_label, "badge_label": badge_label,
-                "status_label": status_label, "hits_box": hits_box, "win": w}
+                "title_label": title_label, "access_label": access_label,
+                "badge_label": badge_label, "status_label": status_label,
+                "hits_box": hits_box, "win": w}
 
         def jump(_e=None, uid=w.window_uid):
             self.jump_to(uid)
@@ -361,6 +549,7 @@ class WindowPreviewApp(tk.Tk):
         tile["app_label"].configure(text=w.wm_class or "")
         title = w.current_title or "(no title)"
         tile["title_label"].configure(text=(title[:48] + "…") if len(title) > 48 else title)
+        tile["access_label"].configure(text=_fmt_last_access(w.last_access))
         tile["badge_label"].configure(text=w.desktop_badge)
         if w.alive and w.jumpable:
             tile["status_label"].configure(text="● accessible", style="Alive.Tile.TLabel")
@@ -407,6 +596,7 @@ class WindowPreviewApp(tk.Tk):
         if cached is not None:
             tile["img_label"].configure(image=cached)
             tile["img_label"].image = cached
+            tile["capture_ts"] = w.window_capture_ts
             return
 
         def fetch():
@@ -417,12 +607,13 @@ class WindowPreviewApp(tk.Tk):
                 return
             try:
                 img = Image.open(io.BytesIO(data))
-                img.window_capture((self.s.window_capture_display_dim, self.s.window_capture_display_dim), Image.LANCZOS)
+                img.thumbnail((self.s.window_capture_display_dim, self.s.window_capture_display_dim), Image.LANCZOS)
                 photo = ImageTk.PhotoImage(img)
             except Exception as exc:                       # noqa: BLE001
                 log.debug("window_capture decode failed uid=%s: %s", w.window_uid, exc)
                 return
             self._window_capture_cache[w.window_uid] = photo
+            tile["capture_ts"] = w.window_capture_ts
             tile["img_label"].configure(image=photo)
             tile["img_label"].image = photo
         self._submit(fetch, done)
@@ -458,6 +649,7 @@ class WindowPreviewApp(tk.Tk):
         self.render()
 
     def on_refresh(self):
+        log.debug("manual refresh triggered")
         self.status_var.set("refreshing window_captures…")
         self._window_capture_cache.clear()
 
@@ -486,13 +678,44 @@ class WindowPreviewApp(tk.Tk):
         self.view_state["fields"] = [f for f, v in self.field_vars.items() if v.get()] or list(ALL_FIELDS)
         self.view_state["alive"] = self.alive_var.get()
         self.view_state["hits"] = self.hits_var.get()
+        self.view_state["filter_no_vdesktop"] = self.filter_no_vdesktop_var.get()
+        self.view_state["hide_self"] = self.hide_self_var.get()
+        self.render()
+
+    def _on_sort_changed(self, _event=None):
+        self.view_state["sort"] = self.sort_var.get()
+        self.view_state["order"] = self.order_var.get()
         self.render()
 
     def _select_all(self, _event):
         self.search_entry.selection_range(0, tk.END)
         return "break"
 
+    def _show_search_filters(self, visible: bool):
+        """Show/hide knobs that only apply to the search view."""
+        if visible:
+            self._fields_label.pack(side=tk.LEFT)
+            for cb in self._field_cbs:
+                cb.pack(side=tk.LEFT, padx=2)
+            self._hits_cb.pack(side=tk.LEFT, padx=(8, 2))
+        else:
+            self._fields_label.pack_forget()
+            for cb in self._field_cbs:
+                cb.pack_forget()
+            self._hits_cb.pack_forget()
+
     # ───────────────────────── history stack (08 §5) ─────────────────────────
+    def _sync_filter_widgets(self):
+        """Set filter widget variables from the current view_state."""
+        for f, v in self.field_vars.items():
+            v.set(f in self.view_state.get("fields", ALL_FIELDS))
+        self.alive_var.set(self.view_state.get("alive", "only"))
+        self.hits_var.set(self.view_state.get("hits", "hit_only"))
+        self.filter_no_vdesktop_var.set(self.view_state.get("filter_no_vdesktop", True))
+        self.sort_var.set(self.view_state.get("sort", "last_access"))
+        self.order_var.set(self.view_state.get("order", "desc"))
+        self.hide_self_var.set(self.view_state.get("hide_self", self.s.hide_self))
+
     def _push_history(self):
         self._history_stack.append(dict(self.view_state))
         if len(self._history_stack) > self.s.history_stack_depth:
@@ -505,6 +728,8 @@ class WindowPreviewApp(tk.Tk):
         self.search_var.set(self.view_state.get("q", ""))
         uid = self.view_state.get("selected_window_uid")
         self.scope_var.set(f"scoped to window #{uid}  (clear ✕)" if uid else "")
+        self._sync_filter_widgets()
+        self._show_search_filters(self.view_state["view"] == "search")
         self.render()
 
     # ───────────────────────── global key + mousewheel (from demo) ─────────────────────────
@@ -573,7 +798,7 @@ class WindowPreviewApp(tk.Tk):
                 img = Image.open(io.BytesIO(data))
                 m = self.s.hover_preview_max_dim
                 if img.width > m or img.height > m:
-                    img.window_capture((m, m), Image.LANCZOS)
+                    img.thumbnail((m, m), Image.LANCZOS)
                 photo = ImageTk.PhotoImage(img)
             except Exception:                              # noqa: BLE001
                 return
@@ -616,8 +841,7 @@ class WindowPreviewApp(tk.Tk):
     # ───────────────────────── auto-refresh + close ─────────────────────────
     def _schedule_auto_refresh(self):
         def tick():
-            if self.view_state["view"] == "search":
-                self.render()
+            self.render()
             self._refresh_after = self.after(self.s.grid_auto_refresh_s * 1000, tick)
         self._refresh_after = self.after(self.s.grid_auto_refresh_s * 1000, tick)
 

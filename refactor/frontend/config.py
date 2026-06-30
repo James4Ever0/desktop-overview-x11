@@ -43,15 +43,27 @@ class FrontendSettings:
     request_timeout_s: float = 5.0
     request_worker_threads: int = 4
     search_debounce_ms: int = 200
-    grid_auto_refresh_s: int = 10          # 0 = off
+    grid_auto_refresh_s: int = 2           # 0 = off
     grid_columns: int | None = None        # None = auto-fit width
     window_capture_display_dim: int = 240
     hover_preview_delay_ms: int = 400
     hover_preview_max_dim: int = 900
     history_stack_depth: int = 20
+    show_back_button: bool = False       # 08 §5: navigation history button
     theme: dict = field(default_factory=lambda: dict(DEFAULT_THEME))
     font_family: str = "TkDefaultFont"
     font_size: int = 10
+    filter_no_vdesktop: bool = True       # hide windows without vdesktop in search/timeline
+    hide_self: bool = True                # hide the GUI's own window from results
+    hide_self_method: str = "id"          # "id" (x_window_id) or "title_prefix"
+
+    def __post_init__(self) -> None:
+        env_refresh = os.environ.get("DESKTOP_OVERVIEW_REFRESH_INTERVAL_S")
+        if env_refresh:
+            try:
+                self.grid_auto_refresh_s = int(env_refresh)
+            except ValueError:
+                pass
 
     def with_overrides(self, **kw) -> "FrontendSettings":
         return replace(self, **kw)

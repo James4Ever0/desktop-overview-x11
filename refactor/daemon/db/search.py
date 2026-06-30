@@ -32,15 +32,17 @@ _WINDOW_COLS = """
   w.x_window_id      AS x_window_id,
   w.wm_class         AS wm_class,
   w.alive            AS alive,
-  w.last_seen        AS last_seen,
   w.session_key      AS session_key,
+  (SELECT COALESCE(MAX(fe.focused_at), 0) FROM focus_event fe
+     WHERE fe.window_uid = w.window_uid)                              AS last_access,
   (SELECT th.title FROM title_history th WHERE th.window_uid = w.window_uid
      ORDER BY th.changed_at DESC, th.id DESC LIMIT 1)            AS current_title,
   (SELECT fe.vdesktop_index FROM focus_event fe WHERE fe.window_uid = w.window_uid
      ORDER BY fe.focused_at DESC, fe.id DESC LIMIT 1)            AS vdesktop_index,
   (SELECT fe.vdesktop_name FROM focus_event fe WHERE fe.window_uid = w.window_uid
      ORDER BY fe.focused_at DESC, fe.id DESC LIMIT 1)            AS vdesktop_name,
-  (SELECT tl.rel_path FROM window_capture_latest tl WHERE tl.window_uid = w.window_uid) AS window_capture_rel
+  (SELECT tl.rel_path FROM window_capture_latest tl WHERE tl.window_uid = w.window_uid) AS window_capture_rel,
+  (SELECT CAST(tl.captured_at AS INTEGER) FROM window_capture_latest tl WHERE tl.window_uid = w.window_uid) AS window_capture_ts
 """
 
 _SNIPPET = "snippet({fts}, 0, '<mark>', '</mark>', '…', 12)"
@@ -70,29 +72,47 @@ def assemble_window(row, current_session_key: str | None) -> dict:
                      if vidx is not None or row["vdesktop_name"] is not None else None),
         "alive": alive,
         "jumpable": alive and same_session,
-        "last_access": row["last_seen"],
+        "last_access": row["last_access"],
         "window_capture_url": (f"/windows/{uid}/window_capture/latest" if row["window_capture_rel"] else None),
+        "window_capture_ts": row["window_capture_ts"],
         "hits": [],
     }
 
 
 # ───────────────────────── GET /windows (no FTS) ─────────────────────────
+def _window_sort_col(sort: str) -> str:
+    """Map public sort key to a SQL column/expression on the window table."""
+    if sort == "title":
+        return "LOWER(current_title)"
+    if sort == "window_id":
+        return "w.window_uid"
+    return "last_access"  # last_access default, derived from focus_event.focused_at
+
+
 async def list_windows(store, *, alive="both", sort="last_access", order="desc",
-                       limit=200, offset=0, current_session_key=None) -> list[dict]:
+                       limit=200, offset=0, current_session_key=None,
+                       title_denylist=None) -> list[dict]:
     where = _alive_sql(alive)
-    sort_col = "current_title" if sort == "title" else "w.last_seen"
+    sort_col = _window_sort_col(sort)
     direction = "ASC" if order == "asc" else "DESC"
+    # secondary key keeps ordering stable when primary key ties
+    secondary = "w.window_uid ASC"
     sql = (f"SELECT {_WINDOW_COLS} FROM window w "
            + (f"WHERE {where} " if where else "")
-           + f"ORDER BY {sort_col} {direction} LIMIT ? OFFSET ?")
+           + f"ORDER BY {sort_col} {direction}, {secondary} LIMIT ? OFFSET ?")
     rows = await store.fetchall(sql, (limit, offset))
-    return [assemble_window(r, current_session_key) for r in rows]
+    results = [assemble_window(r, current_session_key) for r in rows]
+    if title_denylist:
+        denied = set(title_denylist)
+        results = [r for r in results if r.get("current_title") not in denied]
+    return results
 
 
 # ───────────────────────── GET /search (FTS) ─────────────────────────
 async def search(store, *, q=None, window_uid=None, fields=None, alive="both",
-                 t_from=None, t_to=None, sort="last_access", hits="hit_only",
-                 limit=100, offset=0, current_session_key=None) -> list[dict]:
+                 t_from=None, t_to=None, sort="last_access", order="desc", hits="hit_only",
+                 limit=100, offset=0, current_session_key=None,
+                 title_denylist=None) -> list[dict]:
     """The core multi-field search (07 §4).
 
     ``q`` empty + ``window_uid`` set → scope-only "show this window's fields"
@@ -133,12 +153,18 @@ async def search(store, *, q=None, window_uid=None, fields=None, alive="both",
         obj["_recency"] = agg["max_ts"]
         results.append(obj)
 
+    reverse = order != "asc"
     if sort == "relevance":
         results.sort(key=lambda o: (o["_rank"] if o["_rank"] is not None else 1e9))
     elif sort == "recency":
-        results.sort(key=lambda o: (o["_recency"] or 0), reverse=True)
+        results.sort(key=lambda o: (o["_recency"] or 0), reverse=reverse)
+    elif sort == "title":
+        results.sort(key=lambda o: (o["current_title"] or "").lower(), reverse=reverse)
+    elif sort == "window_id":
+        results.sort(key=lambda o: o["window_uid"], reverse=reverse)
     else:  # last_access (default)
-        results.sort(key=lambda o: (o["last_access"] or 0), reverse=True)
+        results.sort(key=lambda o: (o["last_access"] or 0, o["window_uid"]),
+                     reverse=reverse)
 
     page = results[offset:offset + limit]
     for o in page:
@@ -146,6 +172,9 @@ async def search(store, *, q=None, window_uid=None, fields=None, alive="both",
         o.pop("_recency", None)
         if hits == "all":
             o["hit_fields"] = sorted({h["field"] for h in o["hits"]})
+    if title_denylist:
+        denied = set(title_denylist)
+        page = [o for o in page if o.get("current_title") not in denied]
     return page
 
 
@@ -243,8 +272,9 @@ async def _recent_events(store, uid, recent) -> list[dict]:
 
 
 # ───────────────────────── GET /timeline ─────────────────────────
-async def timeline(store, *, t_from=None, t_to=None, window_uid=None,
-                   current_session_key=None) -> list[dict]:
+async def timeline(store, *, t_from=None, t_to=None, window_uid=None, sort="last_access",
+                   order="desc", current_session_key=None,
+                   title_denylist=None) -> list[dict]:
     """Windows active in [from,to] with their focus spans + title history (07 §3, 08 §3)."""
     where, params = [], []
     if window_uid is not None:
@@ -289,8 +319,25 @@ async def timeline(store, *, t_from=None, t_to=None, window_uid=None,
             f"SELECT {_WINDOW_COLS} FROM window w WHERE w.window_uid = ?", (uid,))
         if meta is not None:
             m = assemble_window(meta, current_session_key)
+            lane["x_window_id"] = m["x_window_id"]
             lane["wm_class"] = m["wm_class"]
             lane["current_title"] = m["current_title"]
             lane["alive"] = m["alive"]
             lane["jumpable"] = m["jumpable"]
-    return list(lanes.values())
+
+    out = list(lanes.values())
+    reverse = order != "asc"
+    if sort == "title":
+        out.sort(key=lambda l: (l.get("current_title") or "").lower(), reverse=reverse)
+    elif sort == "window_id":
+        out.sort(key=lambda l: l["window_uid"], reverse=reverse)
+    else:  # last_access: latest focus span per lane, ties by uid for stability
+        def _lane_last_access(lane):
+            spans = lane.get("focus_spans") or []
+            ts = max((s.get("focused_at") or 0 for s in spans), default=0)
+            return ts, lane["window_uid"]
+        out.sort(key=_lane_last_access, reverse=reverse)
+    if title_denylist:
+        denied = set(title_denylist)
+        out = [l for l in out if l.get("current_title") not in denied]
+    return out

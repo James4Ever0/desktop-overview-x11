@@ -11,8 +11,11 @@ with desktop index+name without touching live X state (03 §2).
 from __future__ import annotations
 
 import hashlib
+import logging
 
 from .collectors import clipboard, selection
+
+log = logging.getLogger("dovw.handlers")
 
 
 class EventHandlers:
@@ -25,12 +28,18 @@ class EventHandlers:
         self.vdesktop_index: int | None = None
         self.vdesktop_name: str | None = None
         self.desktop_names: list[str] = []
-        # hook the keyboard aggregator sets later (flush on focus/title change)
-        self.on_focus_change = None     # async callable(window_uid) | None
-        self.on_title_change = None     # async callable(window_uid) | None
+        # hook the keyboard aggregator + capture scheduler set later (flush on focus/title change)
+        self._focus_hooks: list = []     # async callable(window_uid)
+        self._title_hooks: list = []     # async callable(window_uid)
         # clipboard dedup + PRIMARY Strategy C state (03 §3-4)
         self._last_clip_hash: str | None = None
         self.sel_strategy = selection.SelectionStrategyC()
+        self._denied_xids: set[int] = set()
+
+    def _denied_title(self, title: str | None) -> bool:
+        if not title:
+            return False
+        return title in self.s.window_title_denylist
 
     def register_all(self, runtime) -> None:
         runtime.register("window_list", self.handle_window_list)
@@ -38,6 +47,12 @@ class EventHandlers:
         runtime.register("title", self.handle_title)
         runtime.register("vdesktop_current", self.handle_vdesktop_current)
         runtime.register("vdesktop_meta", self.handle_vdesktop_meta)
+
+    def add_focus_hook(self, fn) -> None:
+        self._focus_hooks.append(fn)
+
+    def add_title_hook(self, fn) -> None:
+        self._title_hooks.append(fn)
 
     def register_io(self, runtime) -> None:
         """Register the executor-backed clipboard/selection/paste handlers (03 §3-5)."""
@@ -49,36 +64,53 @@ class EventHandlers:
     # ───────────────────────── window lifecycle (02 §3) ─────────────────────────
     async def handle_window_list(self, ev) -> None:
         ts = ev.get("ts")
-        for xid in ev.get("added", []):
+        added, gone = ev.get("added", []), ev.get("gone", [])
+        log.debug("window_list: added=%d gone=%d", len(added), len(gone))
+        for xid in added:
+            if int(xid) in self._denied_xids:
+                continue
             await self.reg.ensure_window(int(xid), None, ts)
-        for xid in ev.get("gone", []):
+        for xid in gone:
             await self.reg.mark_dead(int(xid), ts)
 
     # ───────────────────────── focus (02 §4-5, 03 §1) ─────────────────────────
     async def handle_focus(self, ev) -> None:
         xid = int(ev["x_window_id"])
         ts = ev.get("ts")
+        title = ev.get("title")
+        if int(xid) in self._denied_xids or self._denied_title(title):
+            log.debug("focus denied for x=0x%08x title=%r", xid, title)
+            return
         uid = await self.reg.ensure_window(xid, None, ts)
         self.reg.set_focus(uid)
         await self.reg.bump_last_seen(uid, ts)
+        log.debug("focus window_uid=%d x=0x%08x title=%s vdesktop=%s",
+                  uid, xid, title, self.vdesktop_name)
         self.store.enqueue(
             "INSERT INTO focus_event(window_uid, vdesktop_index, vdesktop_name, focused_at)"
             " VALUES(?,?,?,?)", (uid, self.vdesktop_index, self.vdesktop_name, ts))
-        if self.on_focus_change is not None:
-            await self.on_focus_change(uid)
+        for hook in self._focus_hooks:
+            await hook(uid)
 
     # ───────────────────────── title history (03 §1) ─────────────────────────
     async def handle_title(self, ev) -> None:
         xid = int(ev["x_window_id"])
         ts = ev.get("ts")
         new = ev.get("new")
+        if not new:
+            return
+        if self._denied_title(new):
+            self._denied_xids.add(int(xid))
+            log.debug("title denied for x=0x%08x title=%r", xid, new)
+            return
         uid = await self.reg.ensure_window(xid, None, ts)
         await self.reg.bump_last_seen(uid, ts)
+        log.debug("title window_uid=%d x=0x%08x new=%s", uid, xid, new)
         self.store.enqueue(
             "INSERT INTO title_history(window_uid, title, changed_at) VALUES(?,?,?)",
             (uid, new, ts))
-        if self.on_title_change is not None:
-            await self.on_title_change(uid)
+        for hook in self._title_hooks:
+            await hook(uid)
 
     # ───────────────────────── virtual desktop (03 §2) ─────────────────────────
     async def handle_vdesktop_current(self, ev) -> None:
@@ -105,12 +137,14 @@ class EventHandlers:
         sel = ev.get("selection", "CLIPBOARD")
         targets = await self.rt.run_in_executor(clipboard.get_targets, sel)
         if not targets:
+            log.debug("clipboard write: no targets (empty)")
             return
         kind = clipboard.classify(targets)
         uid = self.reg.current_focus_window_uid
 
         # PASSWORD: store the fact + redaction marker, never read the content (03 §3).
         if kind == "PASSWORD":
+            log.info("clipboard PASSWORD redacted for window_uid=%s", uid)
             self.store.enqueue(
                 "INSERT INTO clipboard_event(window_uid, kind, text, image_rel,"
                 " n_chars, n_bytes, created_at) VALUES(?,?,?,?,?,?,?)",
@@ -121,12 +155,14 @@ class EventHandlers:
             clipboard.read_content_bytes, sel, kind, targets)
         h = hashlib.md5(raw).hexdigest()
         if self._last_clip_hash == h:        # dedup (owner re-assertion / same copy)
+            log.debug("clipboard write: dedup (same hash)")
             return
         self._last_clip_hash = h
 
         text = image_rel = None
         n_chars = 0
         n_bytes = len(raw)
+        log.debug("clipboard write: kind=%s bytes=%d window_uid=%s", kind, n_bytes, uid)
         if kind in ("TEXT", "HTML", "FILES", "OTHER"):
             text = raw.decode("utf-8", "replace") if raw else ""
             n_chars = len(text)
@@ -149,6 +185,8 @@ class EventHandlers:
         seg = self.sel_strategy.feed(text, ev.get("ts"))
         if seg is None:
             return
+        log.debug("selection owner: stored segment chars=%d window_uid=%s",
+                  seg["chars"], self.reg.current_focus_window_uid)
         uid = self.reg.current_focus_window_uid
         self.store.enqueue(
             "INSERT INTO selection_event(window_uid, text, n_chars, created_at)"
@@ -158,6 +196,8 @@ class EventHandlers:
     async def handle_read_event(self, ev) -> None:
         uid = self.reg.current_focus_window_uid
         text = None
+        log.debug("read_event: selection=%s gesture=%s window_uid=%s",
+                  ev.get("selection"), ev.get("gesture"), uid)
         if self.s.read_event_capture_content:
             if ev.get("selection") == "primary":
                 text, _ = await self.rt.run_in_executor(selection.read_primary_text)

@@ -204,9 +204,17 @@ Actions (POST): `/window_captures/refresh`, `/control/keyboard`, `/windows/{uid}
 
 ## Tests
 
-Each build step has a headless test (no live X needed):
+Each build step has a headless test (no live X needed). Run them one by one, or use
+the wrapper that applies a per-module timeout via GNU coreutils `timeout`:
 
 ```bash
+# run all tests with the default 120 s per-module deadline
+./run-tests.sh
+
+# override the deadline
+TEST_TIMEOUT=60 ./run-tests.sh
+
+# run a single module manually
 python -m tests.test_db
 python -m tests.test_identity_windows
 python -m tests.test_runtime

@@ -29,6 +29,7 @@ class WindowOut(BaseModel):
     jumpable: bool
     last_access: float | None = None
     window_capture_url: str | None = None
+    window_capture_ts: int | None = None
     hits: list[Hit] = []
     hit_fields: list[str] | None = None
 
@@ -58,6 +59,7 @@ class FocusSpan(BaseModel):
 
 class TimelineLane(BaseModel):
     window_uid: int
+    x_window_id: str | None = None
     wm_class: str | None = None
     current_title: str | None = None
     alive: bool | None = None

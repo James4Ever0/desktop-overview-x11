@@ -14,6 +14,10 @@ reconstruct string from backspace (deletion)
 
 set global keyboard shortcut to switch to previous window? bring back the main window selector ui interface? or something else?
 
+global shortcut to toggle the gui view via shortcut? (hide, show up)
+
+this is frontend specific, will integrate with pynput listener, shall be optional and can be set via config (customize key combinations)
+
 ---
 
 make keyboard chunk flushing with threshold of 3 (greater than three chars.), otherwise won't getting into the buffer or db. strip the chunk before checking the threshold. update config files, docs, plans etc
@@ -21,3 +25,44 @@ make keyboard chunk flushing with threshold of 3 (greater than three chars.), ot
 ---
 
 do not include the frontend window id, which is automatically filtered by frontend? or by some special window title filter rule? like matching "Desktop Overview UI"
+
+---
+
+also will the window capture task saturated? can we put those tasks into a fixed length pool and execute them randomly, when the     
+  pool is full drop one unscheduled task then continue execution? want the scheduler to immediately decide to drop task or not on       
+  queue, by checking available task running seats.
+
+---
+
+design logo for this "Desktop Overview"
+
+---
+
+a bug shows up, always some window popping up unconditionally while using this software, do not know what is that thing. if do not run the daemon or do not run the frontend will i still see the flashing thing? do i need to use obs studio to capture that moment or track for x11 event logs with timestamps, so that when a window pops up and vanishes i can get the source of the issuer? what kind of event lisner or script shall i prepare? can i get the issuer's command line, process name, binary path, window title? is it caused by window backgroud capture? will it happens if i capture a window across another virtual desktop id?
+
+---
+
+on thumbnail window image hover, shall enable key event listening for forward & backward arrow keys, to query for previous capture and next capture, also display the captured time. also the window title might change during forward & backward movement since title is asslciated with the capture image at the captured time. is there database record or table for that?
+
+---
+
+still no update for frontend search result display from windows focus event or window title change event. is backend not working or frontend not working? i mean it is just a simple fetch api collecting from shared buffer from backend, which buffer is updated incrementally during event listening, and getting it for all windows shall be instant.
+
+---
+
+do not flash the hover window when doing refresh in search window. refresh the hover image preview inplace if the window is not closed or new image available. unless the window is closed, do not close and start a new hover window.
+
+
+---
+
+default to hide self in frontend ui.
+
+---
+
+store a some kind of "heart beat" data into the database, check for current alive window id, store the window id along with boot id into database, for future "usage rate" calculation, every x seconds.
+
+first calculate usage rate per window by: last 10m usage rate, last 5m usage rate, last 30m usage rate, and so on.
+
+add option to sort windows by "opening time in last 10 minutes" mixed with last focused time. design algo for that. mixed sorting, priority = opening_time_last_10_minutes / factor * last_focus_time_to_now
+
+analyse my formula, i want those recently viewed being prioritized, while leaving else behind, like those briefly browsed in last 10 minutes with 1 second or something. ignore those or put them back. think about the formula.

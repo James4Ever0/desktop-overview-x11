@@ -15,11 +15,14 @@ Three identity layers (02 §1):
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import subprocess
 import time
 import uuid
 from dataclasses import dataclass
+
+log = logging.getLogger("dovw.identity")
 
 
 class IdentityError(Exception):
@@ -108,6 +111,7 @@ def resolve_identity() -> Identity:
         boot_epoch: int | None = get_boot_time()
     except IdentityError:
         boot_epoch = None
+        log.warning("could not read boot time from /proc/stat")
 
     session_start = ""
     user_name = os.environ.get("USER", "")
@@ -117,11 +121,13 @@ def resolve_identity() -> Identity:
         session_start = get_session_start_time(sid)
         user_name = get_session_user_name(sid) or user_name
         uid = get_session_user_uid(sid) or uid
-    except IdentityError:
+    except IdentityError as exc:
+        log.warning("logind unavailable (%s); falling back to env vars", exc)
         # No logind: fall back so session_key is still stable within this boot.
         session_start = session_start or (str(boot_epoch) if boot_epoch else "unknown")
 
     session_key = hashlib.md5(f"{boot_id}:{session_start}".encode("utf-8")).hexdigest()
+    log.info("identity: session_key=%s user=%s boot_id=%s", session_key, user_name, boot_id)
     return Identity(
         boot_id=boot_id,
         boot_epoch=boot_epoch,

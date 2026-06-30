@@ -48,8 +48,8 @@ async def part_a():
     h = EventHandlers(store, reg, s)
 
     flushed = []
-    h.on_focus_change = lambda uid: flushed.append(("focus", uid)) or _noop()
-    h.on_title_change = lambda uid: flushed.append(("title", uid)) or _noop()
+    h.add_focus_hook(lambda uid: flushed.append(("focus", uid)) or _noop())
+    h.add_title_hook(lambda uid: flushed.append(("title", uid)) or _noop())
 
     rt = Runtime(store, s)
     h.register_all(rt)
@@ -63,6 +63,9 @@ async def part_a():
     emit({"kind": "vdesktop_current", "index": 1, "name": "Code", "ts": 1.1})
     # window appears, gets focus, title changes
     emit({"kind": "window_list", "added": [0x111], "gone": [], "ts": 2.0})
+    # the collector now emits the initial title it reads in watch(); simulate it
+    emit({"kind": "title", "x_window_id": 0x111, "old": None,
+          "new": "draft", "ts": 2.05})
     emit({"kind": "focus", "x_window_id": 0x111, "title": "draft", "ts": 2.1})
     emit({"kind": "title", "x_window_id": 0x111, "old": "draft",
           "new": "draft — invoice", "ts": 2.2})
@@ -84,7 +87,8 @@ async def part_a():
 
     th = await store.fetchall(
         "SELECT title FROM title_history WHERE window_uid=? ORDER BY changed_at", (uid,))
-    check("title history appended", len(th) == 1 and th[0][0] == "draft — invoice")
+    check("title history seeds initial + records change",
+          len(th) == 2 and th[0][0] == "draft" and th[1][0] == "draft — invoice")
 
     ti = await store.fetchall("SELECT rowid FROM fts_title WHERE fts_title MATCH 'invoice'")
     check("title is FTS-searchable", len(ti) == 1)

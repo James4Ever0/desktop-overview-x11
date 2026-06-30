@@ -92,10 +92,13 @@ async def run(settings: Settings) -> None:
         vdesktop_provider=lambda: (handlers.vdesktop_index, handlers.vdesktop_name))
     aggregator.register(runtime)
     # keyboard segment cuts on focus/title change (04 §3)
-    handlers.on_focus_change = aggregator.on_focus_change
-    handlers.on_title_change = aggregator.on_title_change
+    handlers.add_focus_hook(aggregator.on_focus_change)
+    handlers.add_title_hook(aggregator.on_title_change)
 
     window_captures = WindowCaptureScheduler(runtime, store, registry, settings, ident.daemon_boot_id)
+    # immediate capture on focus/title change (config: capture_on_focus / capture_on_title)
+    handlers.add_focus_hook(window_captures.on_focus_change)
+    handlers.add_title_hook(window_captures.on_title_change)
 
     ctx = DaemonContext(store=store, registry=registry, settings=settings,
                         runtime=runtime, identity=ident, window_captures=window_captures,

@@ -16,10 +16,13 @@ content-stability lockout).  Split like the clipboard collector:
 from __future__ import annotations
 
 import hashlib
+import logging
 import subprocess
 import time
 
 from Xlib.ext import xfixes
+
+log = logging.getLogger("dovw.selection")
 
 # Strategy C tunables (demo §config)
 ENQUEUE_THRESHOLD_S = 0.25        # gap must exceed this to enqueue
@@ -139,6 +142,7 @@ class PrimarySelectionCollector:
     def on_selection_owner(self, ev) -> bool:
         if getattr(ev, "selection", None) != self.A_PRIMARY:
             return False
+        log.debug("selection owner (PRIMARY) changed")
         self.emit({"kind": "selection_owner", "selection": "PRIMARY",
                    "ts": time.time()})
         return True

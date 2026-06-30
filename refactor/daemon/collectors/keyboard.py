@@ -23,9 +23,12 @@ aggregator (``daemon/aggregator.py``) is backend-agnostic:
 """
 from __future__ import annotations
 
+import logging
 import time
 
 from Xlib import X, XK
+
+log = logging.getLogger("dovw.keyboard")
 
 
 # modifiers whose presence means "this is a shortcut chord, not typed text" (04 §1)
@@ -76,6 +79,7 @@ class KeyboardCollector:
 
         # Backspace is an edit, not a char (04 §4) — index 0, no shift needed.
         if self.local_dpy.keycode_to_keysym(event.detail, 0) == XK.XK_BackSpace:
+            log.debug("kbd backspace")
             self.emit({"kind": "kbd_char", "backspace": True, "ts": time.time()})
             return
 
@@ -87,4 +91,5 @@ class KeyboardCollector:
         # Caps Lock affects letters independently of Shift.
         if state & X.LockMask and ch.isalpha():
             ch = ch.swapcase()
+        log.debug("kbd char=%r", ch)
         self.emit({"kind": "kbd_char", "char": ch, "ts": time.time()})

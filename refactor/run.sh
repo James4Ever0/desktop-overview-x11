@@ -39,7 +39,7 @@ if [[ -S "$SOCK" ]]; then
     echo "[run.sh] reusing daemon already listening on $SOCK"
 else
     echo "[run.sh] starting daemon…"
-    "$PYTHON" -u -m daemon "$@" &
+    "$PYTHON" -u -m daemon --log-level debug "$@" &
     DAEMON_PID=$!
     # wait up to ~10s for the socket to appear
     for _ in $(seq 1 50); do
@@ -51,4 +51,4 @@ else
 fi
 
 echo "[run.sh] launching UI…"
-"$PYTHON" -u -m frontend
+"$PYTHON" -u -m frontend --log-level debug

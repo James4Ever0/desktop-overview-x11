@@ -15,11 +15,14 @@ slow query can never stall the writer.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections import namedtuple
 from pathlib import Path
 
 import aiosqlite
+
+log = logging.getLogger("dovw.store")
 
 WriteOp = namedtuple("WriteOp", "sql params")
 
@@ -39,6 +42,7 @@ class Store:
     # ───────────────────────── lifecycle ─────────────────────────
     async def open(self) -> None:
         self.s.data_dir.mkdir(parents=True, exist_ok=True)
+        log.info("opening db at %s", self.s.db_path)
         self._writer = await aiosqlite.connect(self.s.db_path)
         await self._apply_pragmas(self._writer, writer=True)
         await self._init_schema(self._writer)
@@ -47,6 +51,8 @@ class Store:
         self._reader.row_factory = aiosqlite.Row
         await self._apply_pragmas(self._reader, writer=False)
         await self._reader.execute("PRAGMA query_only=ON;")
+        log.info("db open with writer=%s reader=%s",
+                 self._writer is not None, self._reader is not None)
 
     async def _apply_pragmas(self, db: aiosqlite.Connection, *, writer: bool) -> None:
         await db.execute(f"PRAGMA journal_mode={self.s.sqlite_journal_mode};")
@@ -65,6 +71,7 @@ class Store:
         await db.commit()
 
     async def close(self) -> None:
+        log.info("closing db")
         try:
             await self.flush()
         finally:
@@ -72,6 +79,7 @@ class Store:
                 await self._writer.close()
             if self._reader:
                 await self._reader.close()
+        log.info("db closed")
 
     # ───────────────────────── writes ─────────────────────────
     async def execute(self, sql: str, params=()) -> int:
@@ -87,6 +95,7 @@ class Store:
             self._wq.put_nowait(WriteOp(sql, params))
         except asyncio.QueueFull:
             self._dropped += 1   # 01 §2: never block the producer
+            log.warning("write queue full; dropped=%d", self._dropped)
 
     async def _drain(self, max_n: int, max_wait: float) -> list[WriteOp]:
         batch = [await self._wq.get()]            # block for the first
@@ -103,6 +112,7 @@ class Store:
 
     async def writer_loop(self, stop: asyncio.Event) -> None:
         """Drain → executemany grouped by identical SQL → commit. Runs until stop."""
+        log.debug("writer_loop started")
         while not stop.is_set():
             try:
                 batch = await asyncio.wait_for(
@@ -112,10 +122,12 @@ class Store:
             except asyncio.TimeoutError:
                 continue
             await self._commit_batch(batch)
+        log.debug("writer_loop stopped")
 
     async def _commit_batch(self, batch: list[WriteOp]) -> None:
         if not batch:
             return
+        log.debug("committing batch of %d writes", len(batch))
         async with self._writer_lock:
             # group consecutive ops with identical SQL → one executemany
             i = 0
@@ -132,9 +144,10 @@ class Store:
                     else:
                         await self._writer.executemany(sql, params)
                 except Exception as exc:   # 01 §7: quarantine, don't crash the writer
-                    print(f"[store] write failed ({exc}); sql={sql[:60]!r}")
+                    log.warning("write failed (sql=%s): %s", sql[:80], exc)
                 i = j
             await self._writer.commit()
+        log.debug("batch committed")
 
     async def flush(self) -> None:
         """Drain everything still queued and commit (shutdown / tests)."""
