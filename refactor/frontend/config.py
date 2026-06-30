@@ -53,7 +53,7 @@ class FrontendSettings:
     theme: dict = field(default_factory=lambda: dict(DEFAULT_THEME))
     font_family: str = "TkDefaultFont"
     font_size: int = 10
-    filter_no_vdesktop: bool = True       # hide windows without vdesktop in search/timeline
+    filter_no_vdesktop: bool = False       # hide windows without vdesktop in search/timeline
     hide_self: bool = True                # hide the GUI's own window from results
     hide_self_method: str = "id"          # "id" (x_window_id) or "title_prefix"
 

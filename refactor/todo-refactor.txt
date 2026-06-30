@@ -65,4 +65,22 @@ first calculate usage rate per window by: last 10m usage rate, last 5m usage rat
 
 add option to sort windows by "opening time in last 10 minutes" mixed with last focused time. design algo for that. mixed sorting, priority = opening_time_last_10_minutes / factor * last_focus_time_to_now
 
-analyse my formula, i want those recently viewed being prioritized, while leaving else behind, like those briefly browsed in last 10 minutes with 1 second or something. ignore those or put them back. think about the formula.
+analyse my formula, i want those recently viewed being prioritized, while leaving else behind, like those briefly browsed in last 10 minutes with 1 second or something. ignore those or put them back. think about the formula. could use all values like last_10m_usage, last_5m_usage, last_1m_usage etc. most important could be last_1m_usage? last_1m could flucturate so much. 
+
+or shall we take a different approach, how many keystrokes given to a focused window last x minutes?
+
+give a simple & effective algorithm which might cover all edge cases.
+
+give a chance to "last 1d" or "usage total time since boot"?
+
+also do you count screen lock as "idle" instead of some window in foreground, focused? do not include those idle time per window id.
+
+---
+
+can you first probe for window minimize state, skip those window minimized (do not capture screenshot for those) when processing that chunk of background windows, to prevent issues of "ghosting" windows? (might be the cause)
+
+do a small experiment elsewhere first.
+
+---
+
+keyboard chunk storing is not working properly. shall push with current focused window id, along with current boot id, and those ids shall be obtainable instantly and correctly across the daemon api, stored as some ephermal class attribute.

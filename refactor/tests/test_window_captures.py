@@ -35,7 +35,7 @@ def check(name, cond):
 
 
 # ── stub the blocking X ops ──
-_WINDOWS = [("0x111", "Firefox — inbox"), ("0x222", "Konsole"), ("0x333", "VS Code")]
+_WINDOWS = [("0x111", 0, "Firefox — inbox"), ("0x222", 0, "Konsole"), ("0x333", 1, "VS Code")]
 capture.get_window_list = lambda: list(_WINDOWS)
 capture.get_active_window_id = lambda: capture.normalize_win_id("0x111")
 capture.get_app_name = lambda wid: "app"
@@ -59,7 +59,7 @@ async def main():
 
     # full_sweep filters out windows with no vdesktop unless filter_no_vdesktop=False;
     # seed focus events so the synthetic windows are capturable.
-    for xid, _title in _WINDOWS:
+    for xid, _desktop, _title in _WINDOWS:
         uid = await reg.ensure_window(capture.normalize_win_id(xid), "app", 1.0)
         await store.execute(
             "INSERT INTO focus_event(window_uid, vdesktop_index, vdesktop_name, focused_at)"

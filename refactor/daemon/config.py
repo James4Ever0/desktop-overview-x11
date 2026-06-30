@@ -67,12 +67,13 @@ class Settings:
     filter_no_vdesktop: bool = True       # skip windows without a vdesktop
     capture_on_focus: bool = True         # capture on focus change
     capture_on_title: bool = True         # capture on focused-window title change
+    window_alive_grace_s: float = 5.0     # seconds a window can be missing before marked dead
 
     # --- §3b title denylist ---
     window_title_denylist: tuple[str, ...] = (
         "Desktop Overview — search",
         "Desktop Overview — timeline",
-        "Desktop - Plasma",
+        "Desktop — Plasma",
     )
 
     # --- §4 storage, db & search ---

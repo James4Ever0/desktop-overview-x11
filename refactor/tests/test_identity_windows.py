@@ -50,6 +50,8 @@ async def main():
         (ident.daemon_boot_id, ident.boot_id, ident.session_key,
          ident.user_name, ident.uid, 1751200000.0))
     reg = WindowRegistry(store, ident.session_key, run_id)
+    # tests assume immediate dead-marking; disable the runtime grace period
+    reg._alive_grace_s = 0.0
 
     now = 1751200000.0
     uid1 = await reg.ensure_window(0x3a00003, "firefox", now)

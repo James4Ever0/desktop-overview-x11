@@ -23,6 +23,7 @@ import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
 from tkinter import font as tkfont
 from tkinter import ttk
+import functools
 
 from PIL import Image, ImageTk
 
@@ -101,7 +102,7 @@ class WindowPreviewApp(tk.Tk):
             "sort": "last_access",
             "order": "desc",         # asc | desc
             "selected_window_uid": None,
-            "filter_no_vdesktop": True,
+            "filter_no_vdesktop": False,
             "hide_self": self.s.hide_self,
         }
         # identify our own X window for the hide-self filter (Tk-only, no Xlib)
@@ -123,7 +124,9 @@ class WindowPreviewApp(tk.Tk):
 
         # hover preview state (lifted from the demo)
         self._preview_tip = None
-        self._hover_target = None
+        self._preview_title_label = None
+        self._preview_image_label = None
+        self._hover_uid = None
         self._still_since = 0.0
         self._last_pointer = (-1, -1)
 
@@ -331,12 +334,15 @@ class WindowPreviewApp(tk.Tk):
         def worker():
             try:
                 res = fn(*args)
-                self.after(0, lambda: on_done(res, None))
+                # self.after(0, lambda: on_done(res, None))
+                self.after(0, functools.partial(on_done, res, None))
             except DaemonUnavailable as exc:
-                self.after(0, lambda: on_done(None, exc))
+                # self.after(0, lambda: on_done(None, exc))
+                self.after(0, functools.partial(on_done, None, exc))
             except Exception as exc:                       # noqa: BLE001
                 log.warning("api call failed: %s", exc)
-                self.after(0, lambda: on_done(None, exc))
+                # self.after(0, lambda: on_done(None, exc))
+                self.after(0, functools.partial(on_done, None, exc))
         self.pool.submit(worker)
 
     def _show_banner(self, msg: str):
@@ -416,7 +422,7 @@ class WindowPreviewApp(tk.Tk):
         elif alive_mode == "dead":
             lanes = [l for l in lanes if not l.alive]
         removed_alive = n_before - len(lanes)
-        if self.view_state.get("filter_no_vdesktop", True):
+        if self.view_state.get("filter_no_vdesktop", False):
             lanes = [l for l in lanes if _lane_has_vdesktop(l)]
         removed = n_before - len(lanes)
         if removed:
@@ -452,7 +458,7 @@ class WindowPreviewApp(tk.Tk):
 
     def _filter_vdesktop(self, windows: list[Window]) -> list[Window]:
         """Filter out windows with no virtual-desktop association when enabled."""
-        if not self.view_state.get("filter_no_vdesktop", True):
+        if not self.view_state.get("filter_no_vdesktop", False):
             return windows
         out = [w for w in windows if w.vdesktop is not None and w.vdesktop.index is not None]
         if len(out) < len(windows):
@@ -464,12 +470,17 @@ class WindowPreviewApp(tk.Tk):
 
         To avoid visual shuffling on every refresh, existing tiles are only
         re-gridded when the desired UID order actually changes.  Content is still
-        updated every render.
+        updated every render.  The hover preview is closed only if its window
+        disappears; otherwise its image is refreshed in place.
         """
-        self._destroy_tip()
         seen = {w.window_uid for w in windows}
         order_uids = tuple(w.window_uid for w in windows)
         reorder = order_uids != self._last_order_uids
+
+        # Close hover preview only if the hovered window is no longer in results.
+        if self._hover_uid is not None and self._hover_uid not in seen:
+            self._destroy_tip()
+            self._hover_uid = None
 
         for uid in list(self.tiles):
             if uid not in seen:
@@ -492,6 +503,8 @@ class WindowPreviewApp(tk.Tk):
                     self._preview_cache.pop(w.window_uid, None)
                     tile.pop("capture_ts", None)
                     self._load_window_capture(tile, w)
+                    if self._hover_uid == w.window_uid:
+                        self._update_preview_image(w)
 
         if reorder and windows:
             cols = self.s.grid_columns or max(1, self.canvas.winfo_width() // (self.s.window_capture_display_dim + 20) or 4)
@@ -711,7 +724,7 @@ class WindowPreviewApp(tk.Tk):
             v.set(f in self.view_state.get("fields", ALL_FIELDS))
         self.alive_var.set(self.view_state.get("alive", "only"))
         self.hits_var.set(self.view_state.get("hits", "hit_only"))
-        self.filter_no_vdesktop_var.set(self.view_state.get("filter_no_vdesktop", True))
+        self.filter_no_vdesktop_var.set(self.view_state.get("filter_no_vdesktop", False))
         self.sort_var.set(self.view_state.get("sort", "last_access"))
         self.order_var.set(self.view_state.get("order", "desc"))
         self.hide_self_var.set(self.view_state.get("hide_self", self.s.hide_self))
@@ -736,7 +749,7 @@ class WindowPreviewApp(tk.Tk):
     def on_global_key(self, event):
         if self._preview_tip is not None:
             self._destroy_tip()
-        self._hover_target = None
+        self._hover_uid = None
         if event.widget is self.search_entry:
             return
         if event.char and len(event.char) == 1 and (event.char.isprintable() or event.char == " "):
@@ -763,11 +776,14 @@ class WindowPreviewApp(tk.Tk):
             if moved:
                 if self._preview_tip is not None:
                     self._destroy_tip()
-                self._hover_target = self._tile_under_pointer(px, py)
+                tile = self._tile_under_pointer(px, py)
+                self._hover_uid = tile["win"].window_uid if tile else None
                 self._still_since = time.perf_counter()
-            elif (self._hover_target is not None and self._preview_tip is None
+            elif (self._hover_uid is not None and self._preview_tip is None
                   and time.perf_counter() - self._still_since >= self.s.hover_preview_delay_ms / 1000):
-                self._show_preview(self._hover_target, px, py)
+                tile = self.tiles.get(self._hover_uid)
+                if tile is not None:
+                    self._show_preview(tile, px, py)
         except Exception as exc:                           # noqa: BLE001
             log.debug("hover poll: %s", exc)
         finally:
@@ -815,14 +831,61 @@ class WindowPreviewApp(tk.Tk):
         title = w.current_title or ""
         if w.wm_class:
             title = f"[{w.wm_class}] {title}"
-        tk.Label(tip, text=title, anchor="w", justify="left", bg=self.theme["tiptitle_bg"],
-                 fg=self.theme["tiptitle_fg"], font=self.title_font, padx=8, pady=4,
-                 wraplength=photo.width()).pack(fill=tk.X, padx=1, pady=(1, 0))
+        title_lbl = tk.Label(tip, text=title, anchor="w", justify="left",
+                             bg=self.theme["tiptitle_bg"], fg=self.theme["tiptitle_fg"],
+                             font=self.title_font, padx=8, pady=4, wraplength=photo.width())
+        title_lbl.pack(fill=tk.X, padx=1, pady=(1, 0))
         lbl = tk.Label(tip, image=photo, bg=self.theme["tip_bg"], borderwidth=0)
         lbl.image = photo
         lbl.pack(padx=1, pady=(0, 1))
-        tip.update_idletasks()
-        tw, th = tip.winfo_reqwidth(), tip.winfo_reqheight()
+        self._preview_tip = tip
+        self._preview_title_label = title_lbl
+        self._preview_image_label = lbl
+        self._hover_uid = w.window_uid
+        self._position_preview_tip()
+
+    def _update_preview_image(self, w: Window):
+        """Refresh the currently-open hover preview with a new capture/title, in place."""
+        if self._preview_tip is None or self._hover_uid != w.window_uid:
+            return
+        if w.window_capture_url is None:
+            self._destroy_tip()
+            return
+
+        def fetch():
+            return self.api.get_bytes(w.window_capture_url)
+
+        def done(data, err):
+            if self._preview_tip is None or self._hover_uid != w.window_uid:
+                return
+            if not data:
+                return
+            try:
+                img = Image.open(io.BytesIO(data))
+                m = self.s.hover_preview_max_dim
+                if img.width > m or img.height > m:
+                    img.thumbnail((m, m), Image.LANCZOS)
+                photo = ImageTk.PhotoImage(img)
+            except Exception:                           # noqa: BLE001
+                return
+            self._preview_cache[w.window_uid] = photo
+            self._preview_image_label.configure(image=photo)
+            self._preview_image_label.image = photo
+            title = w.current_title or ""
+            if w.wm_class:
+                title = f"[{w.wm_class}] {title}"
+            self._preview_title_label.configure(text=title)
+            self._position_preview_tip()
+
+        self._submit(fetch, done)
+
+    def _position_preview_tip(self):
+        """Reposition the hover Toplevel based on the last known pointer location."""
+        if self._preview_tip is None:
+            return
+        px, py = self._last_pointer
+        self._preview_tip.update_idletasks()
+        tw, th = self._preview_tip.winfo_reqwidth(), self._preview_tip.winfo_reqheight()
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         x = px + 24
         if x + tw > sw:
@@ -830,13 +893,14 @@ class WindowPreviewApp(tk.Tk):
         if x < 0:
             x = max(0, (sw - tw) // 2)
         y = max(0, min(py - th // 2, sh - th))
-        tip.geometry("+%d+%d" % (int(x), int(y)))
-        self._preview_tip = tip
+        self._preview_tip.geometry("+%d+%d" % (int(x), int(y)))
 
     def _destroy_tip(self):
         if self._preview_tip is not None:
             self._preview_tip.destroy()
             self._preview_tip = None
+        self._preview_title_label = None
+        self._preview_image_label = None
 
     # ───────────────────────── auto-refresh + close ─────────────────────────
     def _schedule_auto_refresh(self):

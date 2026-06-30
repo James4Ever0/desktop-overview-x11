@@ -31,10 +31,9 @@ def parse_args(argv=None) -> FrontendSettings:
                    help="auto-refresh interval in seconds (0 = off, default 2)")
     p.add_argument("--show-back-button", action="store_true",
                    help="show the Back navigation button (hidden by default)")
-    p.add_argument("--hide-self", dest="hide_self", action="store_true",
+    p.add_argument("--hide-self", dest="hide_self", action=argparse.BooleanOptionalAction,
+                   default=None,
                    help="hide the GUI's own window from results (default: on)")
-    p.add_argument("--no-hide-self", dest="hide_self", action="store_false",
-                   help="show the GUI's own window in results")
     p.add_argument("--hide-self-method", choices=["id", "title_prefix"], default="id",
                    help="how to identify the GUI window: id (default) or title_prefix")
     p.add_argument("--log-level", default="info",
@@ -54,7 +53,8 @@ def parse_args(argv=None) -> FrontendSettings:
         over["grid_auto_refresh_s"] = args.refresh_interval
     if args.show_back_button:
         over["show_back_button"] = True
-    over["hide_self"] = args.hide_self
+    if args.hide_self is not None:
+        over["hide_self"] = args.hide_self
     if args.hide_self_method:
         over["hide_self_method"] = args.hide_self_method
     s = s.with_overrides(**over) if over else s

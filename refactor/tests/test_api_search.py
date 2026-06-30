@@ -44,15 +44,15 @@ async def _seed(store):
     rid = await store.execute(
         "INSERT INTO daemon_run(daemon_boot_id, session_key, started_at) VALUES('b','sess',1.0)")
 
-    async def win(xid, sess, alive, last_seen, wm):
+    async def win(xid, sess, alive, last_seen, wm, vidx=None, vname=None):
         return await store.execute(
             "INSERT INTO window(session_key, first_daemon_run_id, last_daemon_run_id,"
-            " x_window_id, wm_class, first_seen, last_seen, alive) VALUES(?,?,?,?,?,?,?,?)",
-            (sess, rid, rid, xid, wm, 1.0, last_seen, alive))
+            " x_window_id, wm_class, vdesktop_index, vdesktop_name, first_seen, last_seen, alive) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (sess, rid, rid, xid, wm, vidx, vname, 1.0, last_seen, alive))
 
-    a = await win(0xABCDE, "sess", 1, 300.0, "firefox")    # alive, this session → jumpable
-    b = await win(0xBBBBB, "sess", 0, 200.0, "code")        # dead
-    c = await win(0xCCCCC, "other", 1, 250.0, "mail")       # different session
+    a = await win(0xABCDE, "sess", 1, 300.0, "firefox", 1, "Web")    # alive, this session → jumpable
+    b = await win(0xBBBBB, "sess", 0, 200.0, "code", 1, "Web")        # dead
+    c = await win(0xCCCCC, "other", 1, 250.0, "mail", 1, "Web")       # different session
     for uid, title, t in [(a, "Inbox — invoice 2026", 110.0),
                           (b, "draft document", 120.0),
                           (c, "mail client", 130.0)]:
@@ -244,7 +244,7 @@ async def test_api(store, a, b, c):
               r.json()["reason"] == "different-session")
 
         # activate alive window: monkeypatch capture (no live X in CI)
-        capture_mod.get_window_list = lambda: [("0x000abcde", "Inbox")]
+        capture_mod.get_window_list = lambda: [("0x000abcde", 0, "Inbox")]
         capture_mod.activate_window = lambda wid: True
         r = await cli.post(f"/windows/{a}/activate")
         check("activate live window -> ok", r.json()["ok"] is True and r.json()["reason"] == "ok")

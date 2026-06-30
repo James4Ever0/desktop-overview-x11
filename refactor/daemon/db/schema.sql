@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS window (
   last_daemon_run_id  INTEGER REFERENCES daemon_run(id),
   x_window_id         INTEGER NOT NULL,      -- raw 0x.. id as decimal
   wm_class            TEXT,                  -- app name (xprop WM_CLASS)
+  vdesktop_index      INTEGER,               -- current virtual desktop (cached)
+  vdesktop_name       TEXT,                  -- current virtual desktop name (cached)
   first_seen          REAL NOT NULL,
   last_seen           REAL NOT NULL,         -- "last access time" (sort key)
   closed_at           REAL,

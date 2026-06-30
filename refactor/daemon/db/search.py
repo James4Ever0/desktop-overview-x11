@@ -33,14 +33,12 @@ _WINDOW_COLS = """
   w.wm_class         AS wm_class,
   w.alive            AS alive,
   w.session_key      AS session_key,
+  w.vdesktop_index   AS vdesktop_index,
+  w.vdesktop_name    AS vdesktop_name,
   (SELECT COALESCE(MAX(fe.focused_at), 0) FROM focus_event fe
      WHERE fe.window_uid = w.window_uid)                              AS last_access,
   (SELECT th.title FROM title_history th WHERE th.window_uid = w.window_uid
      ORDER BY th.changed_at DESC, th.id DESC LIMIT 1)            AS current_title,
-  (SELECT fe.vdesktop_index FROM focus_event fe WHERE fe.window_uid = w.window_uid
-     ORDER BY fe.focused_at DESC, fe.id DESC LIMIT 1)            AS vdesktop_index,
-  (SELECT fe.vdesktop_name FROM focus_event fe WHERE fe.window_uid = w.window_uid
-     ORDER BY fe.focused_at DESC, fe.id DESC LIMIT 1)            AS vdesktop_name,
   (SELECT tl.rel_path FROM window_capture_latest tl WHERE tl.window_uid = w.window_uid) AS window_capture_rel,
   (SELECT CAST(tl.captured_at AS INTEGER) FROM window_capture_latest tl WHERE tl.window_uid = w.window_uid) AS window_capture_ts
 """

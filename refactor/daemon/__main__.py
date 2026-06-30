@@ -21,6 +21,7 @@ import logging
 import threading
 import time
 
+from . import capture
 from .aggregator import KeyboardAggregator
 from .api.app import DaemonContext
 from .api.server import ApiServer
@@ -130,6 +131,28 @@ async def run(settings: Settings) -> None:
     tA.start()
     tB.start()
     log.info("collector threads started (xpump, xrecord)")
+
+    # One-time seed from wmctrl -l: _NET_CLIENT_LIST events can miss windows that
+    # are already open when the pump attaches or that the WM omits transiently.
+    # Ensuring them here guarantees every real client has an alive row at startup.
+    try:
+        wmctrl_windows = await runtime.run_in_executor(capture.get_window_list)
+        now = time.time()
+        seeded = 0
+        for wid_hex, desktop, title in wmctrl_windows:
+            xid = capture.normalize_win_id(wid_hex)
+            if xid is None:
+                continue
+            await registry.ensure_window(xid, None, now, vdesktop_index=desktop)
+            seeded += 1
+        log.info("wmctrl seed: ensured %d window(s)", seeded)
+
+        names = await runtime.run_in_executor(capture.get_desktop_names)
+        if names:
+            handlers.desktop_names = names
+            log.info("wmctrl seed: %d desktop name(s)", len(names))
+    except Exception as exc:                                       # noqa: BLE001
+        log.warning("wmctrl seed failed: %s", exc)
 
     # ── loop tasks: window_captures, idle flush, API ──────────────────────────────
     async def _window_capture_task():

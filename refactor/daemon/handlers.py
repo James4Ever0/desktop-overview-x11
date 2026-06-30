@@ -84,6 +84,7 @@ class EventHandlers:
         uid = await self.reg.ensure_window(xid, None, ts)
         self.reg.set_focus(uid)
         await self.reg.bump_last_seen(uid, ts)
+        await self.reg.set_vdesktop(uid, self.vdesktop_index, self.vdesktop_name)
         log.debug("focus window_uid=%d x=0x%08x title=%s vdesktop=%s",
                   uid, xid, title, self.vdesktop_name)
         self.store.enqueue(

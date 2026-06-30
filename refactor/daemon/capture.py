@@ -20,8 +20,13 @@ from PIL import Image
 log = logging.getLogger("dovw.capture")
 
 
-def get_window_list() -> list[tuple[str, str]]:
-    """``wmctrl -l`` → [(win_id_hex, title)].  Empty list on any failure."""
+def get_window_list() -> list[tuple[str, int, str]]:
+    """``wmctrl -l`` → [(win_id_hex, desktop_index, title)].
+
+    Windows with a negative desktop index (sticky / "on all desktops") are
+    discarded — they do not belong to a real virtual desktop.
+    Empty list on any failure.
+    """
     try:
         proc = subprocess.run(["wmctrl", "-l"], capture_output=True, text=True, timeout=4)
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
@@ -36,7 +41,13 @@ def get_window_list() -> list[tuple[str, str]]:
             continue
         parts = line.strip().split(maxsplit=3)
         if len(parts) >= 4:
-            windows.append((parts[0], parts[3]))   # (0x03a00003, title)
+            try:
+                desktop = int(parts[1])
+            except ValueError:
+                continue
+            if desktop < 0:
+                continue
+            windows.append((parts[0], desktop, parts[3]))   # (0x03a00003, 0, title)
     return windows
 
 
@@ -105,6 +116,33 @@ def activate_window(win_id: str) -> bool:
         log.warning("activate_window failed: %s", exc)
         return False
     return proc.returncode == 0
+
+
+def get_desktop_names() -> list[str]:
+    """``wmctrl -d`` → [name_for_index_0, name_for_index_1, ...]. Empty list on failure."""
+    try:
+        proc = subprocess.run(["wmctrl", "-d"], capture_output=True, text=True, timeout=4)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        log.warning("wmctrl -d unavailable: %s", exc)
+        return []
+    if proc.returncode != 0:
+        log.warning("wmctrl -d exited %d: %s", proc.returncode, (proc.stderr or "").strip())
+        return []
+    names = []
+    for line in proc.stdout.strip().split("\n"):
+        if not line:
+            continue
+        parts = line.strip().split(maxsplit=5)
+        if len(parts) >= 6:
+            names.append(parts[5])
+        elif len(parts) >= 1:
+            try:
+                idx = int(parts[0])
+            except ValueError:
+                continue
+            while len(names) <= idx:
+                names.append(f"Desktop {len(names) + 1}")
+    return names
 
 
 def normalize_win_id(win_id) -> int | None:

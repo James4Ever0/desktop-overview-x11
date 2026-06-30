@@ -80,7 +80,7 @@ class WindowCaptureScheduler:
         windows = await self.rt.run_in_executor(capture.get_window_list)
         await self._reconcile(windows, now)
         n = 0
-        for wid_hex, title in windows:
+        for wid_hex, _desktop, title in windows:
             if await self._capture_and_save(wid_hex, title, is_focused=False, now=now):
                 n += 1
         log.info("full sweep captured %d/%d windows", n, len(windows))
@@ -91,7 +91,7 @@ class WindowCaptureScheduler:
         await self._reconcile(windows, now)
         if not windows:
             return 0
-        title_by_id = {w: t for w, t in windows}
+        title_by_id = {w: t for w, _d, t in windows}
         current = set(title_by_id)
 
         active_int = await self.rt.run_in_executor(capture.get_active_window_id)
@@ -150,9 +150,8 @@ class WindowCaptureScheduler:
         uid = await self.reg.ensure_window(xid, wm or None, now)
         if self.s.filter_no_vdesktop:
             vrow = await self.store.fetchone(
-                "SELECT 1 FROM focus_event WHERE window_uid=? AND vdesktop_index IS NOT NULL"
-                " LIMIT 1", (uid,))
-            if vrow is None:
+                "SELECT vdesktop_index FROM window WHERE window_uid=? LIMIT 1", (uid,))
+            if vrow is None or vrow[0] is None:
                 return False
         img = await self.rt.run_in_executor(
             capture.capture_window, wid_hex, title, self.s.window_capture_max_dim)
@@ -176,10 +175,14 @@ class WindowCaptureScheduler:
         return True
 
     async def _reconcile(self, windows, now: float) -> None:
-        ids = {capture.normalize_win_id(w) for w, _ in windows}
+        ids = {capture.normalize_win_id(w) for w, _d, _t in windows}
         ids.discard(None)
-        wm_of = {capture.normalize_win_id(w): None for w, _ in windows}
-        await self.reg.reconcile(ids, wm_class_of=lambda x: wm_of.get(x), now=now)
+        vdidx_of = {capture.normalize_win_id(w): d for w, d, _t in windows}
+        await self.reg.reconcile(
+            ids,
+            wm_class_of=lambda x: None,
+            vdesktop_provider=lambda x: vdidx_of.get(x),
+            now=now)
 
     # ───────────────────────── GC (05 §4) ─────────────────────────
     async def _gc_window(self, uid: int) -> None:

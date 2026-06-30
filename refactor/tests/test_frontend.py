@@ -54,14 +54,14 @@ async def _seed(store):
     rid = await store.execute(
         "INSERT INTO daemon_run(daemon_boot_id, session_key, started_at) VALUES('b','sess',1.0)")
 
-    async def win(xid, sess, alive, last_seen, wm):
+    async def win(xid, sess, alive, last_seen, wm, vidx=None, vname=None):
         return await store.execute(
             "INSERT INTO window(session_key, first_daemon_run_id, last_daemon_run_id,"
-            " x_window_id, wm_class, first_seen, last_seen, alive) VALUES(?,?,?,?,?,?,?,?)",
-            (sess, rid, rid, xid, wm, 1.0, last_seen, alive))
+            " x_window_id, wm_class, vdesktop_index, vdesktop_name, first_seen, last_seen, alive) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (sess, rid, rid, xid, wm, vidx, vname, 1.0, last_seen, alive))
 
-    a = await win(0xABCDE, "sess", 1, 300.0, "firefox")
-    b = await win(0xBBBBB, "sess", 0, 200.0, "code")
+    a = await win(0xABCDE, "sess", 1, 300.0, "firefox", 1, "Web")
+    b = await win(0xBBBBB, "sess", 0, 200.0, "code", 1, "Web")
     for uid, title, t in [(a, "Inbox — invoice 2026", 110.0), (b, "draft document", 120.0)]:
         await store.execute(
             "INSERT INTO title_history(window_uid, title, changed_at) VALUES(?,?,?)", (uid, title, t))
@@ -93,6 +93,11 @@ def test_parse_args():
     check("--columns honored", s3.grid_columns == 5)
     check("--socket honored", str(s3.socket_path) == "/x/y.sock")
     check("log level stashed for setup_logging", getattr(s3, "_log_level", None) == "info")
+    check("hide_self defaults to True", s.hide_self is True)
+    s_off = parse_args(["--no-hide-self"])
+    check("--no-hide-self turns hide_self off", s_off.hide_self is False)
+    s_on = parse_args(["--hide-self"])
+    check("--hide-self keeps hide_self on", s_on.hide_self is True)
 
 
 def _client_checks(uds: str, a: int, b: int):
@@ -123,7 +128,7 @@ def _client_checks(uds: str, a: int, b: int):
         check("client.timeline returns lanes", {l.window_uid for l in lanes} == {a, b})
 
         # activate (monkeypatch desktop side effects on the daemon side)
-        capture_mod.get_window_list = lambda: [("0x000abcde", "Inbox")]
+        capture_mod.get_window_list = lambda: [("0x000abcde", 0, "Inbox")]
         capture_mod.activate_window = lambda wid: True
         check("client.activate alive window -> ok", cli.activate(a).get("ok") is True)
         check("client.activate dead window -> reason dead", cli.activate(b).get("reason") == "dead")

@@ -97,7 +97,12 @@ def check_dependencies():
 
 # ---------------------------- 窗口操作函数 / Window ops ----------------------------
 def get_window_list():
-    """通过 wmctrl -l 获取窗口列表，返回 [(id, title), ...]"""
+    """通过 wmctrl -l 获取窗口列表，返回 [(id, title), ...]
+
+    wmctrl -l 列格式：id desktop host title。
+    忽略 desktop 列小于 0 的窗口（通常是粘滞/所有桌面的窗口，如 -1），
+    不将其纳入预览列表。
+    """
     cmd = ['wmctrl', '-l']
     log.info("Running: %s", " ".join(cmd))
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -110,16 +115,28 @@ def get_window_list():
 
     output = proc.stdout
     windows = []
+    skipped = 0
     for line in output.strip().split('\n'):
         if not line:
             continue
         parts = line.strip().split(maxsplit=3)
         if len(parts) >= 4:
             win_id = parts[0]          # 如 0x03a00003
+            desktop_str = parts[1]     # 虚拟桌面索引
             title = parts[3]           # 窗口标题
+            try:
+                desktop_id = int(desktop_str)
+            except ValueError:
+                desktop_id = None
+            if desktop_id is not None and desktop_id < 0:
+                skipped += 1
+                log.debug("  skipping %s (desktop_id=%d, sticky/all-desktops)",
+                          win_id, desktop_id)
+                continue
             windows.append((win_id, title))
 
-    log.info("Found %d window(s).", len(windows))
+    log.info("Found %d window(s), skipped %d with desktop_id < 0.",
+             len(windows), skipped)
     for win_id, title in windows:
         log.debug("  window %s -> %s", win_id, title)
     return windows

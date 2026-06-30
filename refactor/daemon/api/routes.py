@@ -28,6 +28,46 @@ def _fields(fields: str | None) -> list[str]:
     return [f.strip() for f in fields.split(",") if f.strip() in search.FIELDS]
 
 
+def _desktop_name(ctx: DaemonContext, idx: int | None, stored: str | None = None) -> str | None:
+    """Resolve a virtual-desktop name from live state, falling back to a generic label.
+
+    Stored names are only trusted when present; if missing we re-derive from the
+    handler's current desktop list (kept fresh by vdesktop_meta events) or wmctrl -d.
+    """
+    if idx is None:
+        return None
+    if stored:
+        return stored
+    names = ctx.handlers.desktop_names if ctx.handlers else []
+    if 0 <= idx < len(names):
+        return names[idx]
+    # last resort: blocking wmctrl -d (only run if no runtime, i.e. tests)
+    if ctx.runtime is None:
+        names = capture.get_desktop_names()
+        if 0 <= idx < len(names):
+            return names[idx]
+    return f"Desktop {idx + 1}"
+
+
+def _enrich_window_vdesktops(ctx: DaemonContext, windows: list[dict]) -> list[dict]:
+    for w in windows:
+        vd = w.get("vdesktop")
+        if vd and vd.get("index") is not None and not vd.get("name"):
+            vd["name"] = _desktop_name(ctx, vd["index"], vd.get("name"))
+    return windows
+
+
+def _enrich_timeline_vdesktops(ctx: DaemonContext, lanes: list[dict]) -> list[dict]:
+    for lane in lanes:
+        vd = lane.get("vdesktop")
+        if vd and vd.get("index") is not None and not vd.get("name"):
+            vd["name"] = _desktop_name(ctx, vd["index"], vd.get("name"))
+        for span in lane.get("focus_spans", []):
+            if span.get("vdesktop_index") is not None and not span.get("vdesktop_name"):
+                span["vdesktop_name"] = _desktop_name(ctx, span["vdesktop_index"], span.get("vdesktop_name"))
+    return lanes
+
+
 # ───────────────────────── windows ─────────────────────────
 @router.get("/windows", response_model=list[models.WindowOut])
 async def get_windows(
@@ -39,10 +79,11 @@ async def get_windows(
     offset: int = Query(0, ge=0),
 ):
     log.debug("GET /windows sort=%s order=%s alive=%s limit=%d", sort, order, alive, limit)
-    return await search.list_windows(
+    results = await search.list_windows(
         ctx.store, alive=alive, sort=sort, order=order, limit=limit, offset=offset,
         current_session_key=ctx.session_key,
         title_denylist=ctx.settings.window_title_denylist)
+    return _enrich_window_vdesktops(ctx, results)
 
 
 @router.get("/windows/{uid}", response_model=models.WindowDetail)
@@ -50,7 +91,7 @@ async def get_window(uid: int, ctx: DaemonContext = Depends(get_ctx)):
     detail = await search.window_detail(ctx.store, uid, current_session_key=ctx.session_key)
     if detail is None:
         raise HTTPException(status_code=404, detail="unknown window")
-    return detail
+    return _enrich_window_vdesktops(ctx, [detail])[0]
 
 
 @router.get("/windows/{uid}/window_capture/latest")
@@ -117,11 +158,12 @@ async def get_history(
 async def _do_search(ctx, q, window_uid, fields, alive, sort, order, hits, t_from=None, t_to=None):
     s = ctx.settings
     limit = min(s.search_default_limit, s.search_max_limit)
-    return await search.search(
+    results = await search.search(
         ctx.store, q=q, window_uid=window_uid, fields=_fields(fields), alive=alive,
         t_from=t_from, t_to=t_to, sort=sort, order=order, hits=hits, limit=limit,
         current_session_key=ctx.session_key,
         title_denylist=s.window_title_denylist)
+    return _enrich_window_vdesktops(ctx, results)
 
 
 # ───────────────────────── timeline ─────────────────────────
@@ -135,10 +177,11 @@ async def get_timeline(
     t_to: float | None = Query(None, alias="to"),
 ):
     log.debug("GET /timeline window_uid=%s sort=%s order=%s", window_uid, sort, order)
-    return await search.timeline(
+    lanes = await search.timeline(
         ctx.store, t_from=t_from, t_to=t_to, window_uid=window_uid,
         sort=sort, order=order, current_session_key=ctx.session_key,
         title_denylist=ctx.settings.window_title_denylist)
+    return _enrich_timeline_vdesktops(ctx, lanes)
 
 
 # ───────────────────────── vdesktops ─────────────────────────
@@ -214,7 +257,7 @@ async def activate_window(uid: int, ctx: DaemonContext = Depends(get_ctx)):
     x_id = int(row["x_window_id"])
     # re-verify it's still in the live client list before acting (02 §6)
     windows = await _run(ctx, capture.get_window_list)
-    live_ids = {capture.normalize_win_id(w) for w, _ in windows}
+    live_ids = {capture.normalize_win_id(w) for w, _d, _t in windows}
     if x_id not in live_ids:
         return models.ActivateOut(ok=False, reason="vanished")
 

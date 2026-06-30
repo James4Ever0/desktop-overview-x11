@@ -95,3 +95,15 @@ add button to "hide self", first get current window id in gui init, then set the
 also even for the "self" window you did not get the title. 0x0a40003e  0     N/A Desktop Overview — search which is output from wmctrl -l. why you obtain no title for this window? this will not going to make prefix based filtering works.
 
 also want to hide a window with title called "Desktop - Plasma". so can you make it into a list in frontend config or backend config something, filtering those out, if any window has title exactly matching those things, refuse to track events, return results in api and so on. like "Desktop Overview - search" and "Desktop Overview - timeline"
+
+---
+
+some windows are ghosted during frontend or backend update. i do not know why. all windows are accessible through wmctrl -l when daemon init its operation. do not know why frontend seems not showing anything and some window disappeared for no reason. but when i focus on that window manually, it will show up once again.
+
+---
+
+add an icon entry to kubuntu taskbar entry, on the right side, with few options, interface shortcuts, and window briefings (like how many windows alive in this desktop)
+
+---
+
+the flashing could be of claude code background shell running. kill them all and it might be fine?

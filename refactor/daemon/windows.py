@@ -29,18 +29,27 @@ class WindowRegistry:
         self._alive: dict[int, int] = {}
         # attribution pointer, kept hot by the focus collector (02 §5)
         self.current_focus_window_uid: int | None = None
+        # grace-period tracking: x_window_id -> first timestamp it was seen missing
+        self._missing_since: dict[int, float] = {}
+        self._alive_grace_s = (store.s.window_alive_grace_s
+                               if hasattr(store.s, "window_alive_grace_s") else 5.0)
 
     # ───────────────────────── mint / reuse ─────────────────────────
     async def ensure_window(self, x_window_id: int, wm_class: str | None = None,
-                            now: float | None = None) -> int:
+                            now: float | None = None,
+                            vdesktop_index: int | None = None,
+                            vdesktop_name: str | None = None) -> int:
         """Return the window_uid for an x_window_id, minting one if needed.
 
         Reuses the open row in this session (survives daemon restart); a reused
         X id whose previous row was already closed yields a *new* window_uid.
+        Optionally seeds/caches the virtual desktop.
         """
         now = time.time() if now is None else now
         uid = self._alive.get(x_window_id)
         if uid is not None:
+            if vdesktop_index is not None or vdesktop_name is not None:
+                await self.set_vdesktop(uid, vdesktop_index, vdesktop_name)
             return uid
 
         row = await self.store.fetchone(
@@ -53,20 +62,32 @@ class WindowRegistry:
             uid = row[0]
             self._alive[x_window_id] = uid
             await self.store.execute(
-                "UPDATE window SET last_seen=?, last_daemon_run_id=? WHERE window_uid=?",
+                "UPDATE window SET last_seen=?, last_daemon_run_id=? "
+                "WHERE window_uid=?",
                 (now, self.daemon_run_id, uid),
             )
+            if vdesktop_index is not None or vdesktop_name is not None:
+                await self.set_vdesktop(uid, vdesktop_index, vdesktop_name)
             return uid
 
         uid = await self.store.execute(
             "INSERT INTO window(session_key, first_daemon_run_id, last_daemon_run_id, "
-            "x_window_id, wm_class, first_seen, last_seen, alive) VALUES(?,?,?,?,?,?,?,1)",
+            "x_window_id, wm_class, vdesktop_index, vdesktop_name, first_seen, last_seen, alive) "
+            "VALUES(?,?,?,?,?,?,?,?,?,1)",
             (self.session_key, self.daemon_run_id, self.daemon_run_id,
-             x_window_id, wm_class, now, now),
+             x_window_id, wm_class, vdesktop_index, vdesktop_name, now, now),
         )
         self._alive[x_window_id] = uid
         log.debug("minted window_uid=%d x=0x%08x wm_class=%s", uid, x_window_id, wm_class)
         return uid
+
+    async def set_vdesktop(self, window_uid: int,
+                           vdesktop_index: int | None,
+                           vdesktop_name: str | None) -> None:
+        """Cache the current virtual desktop on the window row."""
+        await self.store.execute(
+            "UPDATE window SET vdesktop_index=?, vdesktop_name=? WHERE window_uid=?",
+            (vdesktop_index, vdesktop_name, window_uid))
 
     # ───────────────────────── liveness ─────────────────────────
     async def mark_dead(self, x_window_id: int, now: float | None = None) -> None:
@@ -84,12 +105,15 @@ class WindowRegistry:
             self.current_focus_window_uid = None
 
     async def reconcile(self, current_ids, wm_class_of=None,
+                        vdesktop_provider=None,
                         now: float | None = None) -> None:
         """Sync registry to the live _NET_CLIENT_LIST (startup + each tick, 02 §3).
 
         - ids present now but with no open row → mint (and record WM_CLASS).
-        - rows alive=1 in this session but no longer present → mark dead.
+        - rows alive=1 in this session but no longer present → mark dead only
+          after a short grace period, so transient X list omissions don't ghost.
         ``wm_class_of`` (optional) maps x_window_id → WM_CLASS string.
+        ``vdesktop_provider`` (optional) maps x_window_id → desktop index int.
         """
         now = time.time() if now is None else now
         current = set(current_ids)
@@ -101,15 +125,27 @@ class WindowRegistry:
         db_alive = {r[0]: r[1] for r in rows}
         self._alive = {xid: uid for xid, uid in db_alive.items() if xid in current}
 
-        # closed while we were down (or since last tick)
-        for xid in set(db_alive) - current:
-            await self.mark_dead(xid, now)
+        # windows missing from this sweep
+        missing = set(db_alive) - current
+        for xid in list(missing):
+            first_missing = self._missing_since.setdefault(xid, now)
+            if now - first_missing >= self._alive_grace_s:
+                await self.mark_dead(xid, now)
+                self._missing_since.pop(xid, None)
+
+        # came back or still present: clear any pending grace
+        for xid in current:
+            if xid in self._missing_since:
+                log.debug("window 0x%08x reappeared, grace cleared", xid)
+                self._missing_since.pop(xid, None)
 
         # appeared (or never recorded)
         for xid in current:
             wm = wm_class_of(xid) if wm_class_of else None
-            await self.ensure_window(xid, wm, now)
-        log.debug("reconcile done: %d alive, %d current", len(self._alive), len(current))
+            vdx = vdesktop_provider(xid) if vdesktop_provider else None
+            await self.ensure_window(xid, wm, now, vdesktop_index=vdx)
+        log.debug("reconcile done: %d alive, %d current, %d missing",
+                  len(self._alive), len(current), len(missing))
 
     # ───────────────────────── activity ─────────────────────────
     async def bump_last_seen(self, window_uid: int | None, now: float | None = None) -> None:
