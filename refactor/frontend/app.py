@@ -49,17 +49,59 @@ def _fmt_last_access(ts: float | None) -> str:
     dt = datetime.datetime.fromtimestamp(ts)
     now = datetime.datetime.now()
     if dt.date() == now.date():
-        return f"last: {dt.strftime('%H:%M')}"
+        return f"last: {dt.strftime('%a %H:%M')}"
     if dt.year == now.year:
-        return f"last: {dt.strftime('%b %d %H:%M')}"
-    return f"last: {dt.strftime('%Y-%m-%d %H:%M')}"
+        return f"last: {dt.strftime('%a %d %b %H:%M')}"
+    return f"last: {dt.strftime('%a %d %b %Y %H:%M')}"
 
 
-ALL_FIELDS = ["title", "clipboard", "selection", "keyboard"]
+def _fmt_duration(minutes: float | None) -> str:
+    """Convert minutes into 'X d X h X m', dropping zero units except minutes."""
+    if minutes is None or minutes <= 0:
+        return "0 m"
+    total = int(round(minutes))
+    days, rem = divmod(total, 1440)
+    hours, mins = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days} d")
+    if hours:
+        parts.append(f"{hours} h")
+    parts.append(f"{mins} m")
+    return " ".join(parts)
+
+
+def _fmt_usage(w: Window) -> str:
+    """Compact active-minutes + focus-score label."""
+    vals = [getattr(w, label, None) for label in ("usage_5m", "usage_10m", "usage_30m")]
+    total = getattr(w, "usage_total", None)
+    score = getattr(w, "focus_score", None)
+    if all(v is None for v in vals) and total is None and score is None:
+        return "use: —"
+    parts = []
+    for label, v in zip(("5m", "10m", "30m"), vals):
+        if v is None:
+            parts.append(f"{label}:—")
+        else:
+            parts.append(f"{label}:{v:.1f}")
+    if total is not None:
+        parts.append(f"tot:{_fmt_duration(total)}")
+    line = "use: " + " ".join(parts)
+    if score is not None:
+        line += f" | score:{score:.2f}"
+    return line
+
+
+ALL_FIELDS = ["title", "app_name", "clipboard", "selection", "keyboard"]
 SORT_OPTIONS = [
     ("last access", "last_access"),
+    ("focus score", "focus_score"),
     ("title", "title"),
     ("window id", "window_id"),
+    ("5m usage", "usage_5m"),
+    ("10m usage", "usage_10m"),
+    ("30m usage", "usage_30m"),
+    ("total usage", "usage_total"),
 ]
 SORT_LABELS = {v: k for k, v in SORT_OPTIONS}
 HOVER_POLL_MS = 120
@@ -216,14 +258,11 @@ class WindowPreviewApp(tk.Tk):
             log.debug("self x_window_id=%s title=%r", self._self_xid, self.title())
 
     def _is_self(self, w) -> bool:
-        """True if the given Window/TimelineLane is this GUI's own window."""
+        """True if the given Window/TimelineLane is this GUI's own alive window."""
         if not self.view_state.get("hide_self", True):
             return False
-        method = self.s.hide_self_method
-        if method == "title_prefix":
-            title = getattr(w, "current_title", None) or ""
-            return title.startswith(self._self_title_prefix)
-        # method == "id"
+        if not getattr(w, "alive", False):
+            return False
         xid = getattr(w, "x_window_id", None)
         if xid and self._self_xid and xid.lower() == self._self_xid.lower():
             return True
@@ -380,14 +419,17 @@ class WindowPreviewApp(tk.Tk):
         self.status_var.set("loading…")
         q = st["q"].strip() or None
         scope = st["selected_window_uid"]
+        self_xid = self._self_xid if st.get("hide_self") else None
         log.debug("render_search q=%r scope=%s t_from=%s t_to=%s", q, scope, st["from"], st["to"])
 
         def call():
             if q is None and scope is None and st["from"] is None and st["to"] is None:
-                return self.api.windows(sort=st["sort"], order=st["order"], alive=st["alive"])
+                return self.api.windows(sort=st["sort"], order=st["order"], alive=st["alive"],
+                                        self_xid=self_xid)
             return self.api.search(q=q, window_uid=scope, fields=st["fields"],
                                    alive=st["alive"], sort=st["sort"], order=st["order"],
-                                   hits=st["hits"], t_from=st["from"], t_to=st["to"])
+                                   hits=st["hits"], t_from=st["from"], t_to=st["to"],
+                                   self_xid=self_xid)
         self._submit(call, self._on_search_results)
 
     def _on_search_results(self, windows, err):
@@ -404,11 +446,13 @@ class WindowPreviewApp(tk.Tk):
     def _render_timeline(self):
         st = self.view_state
         self.status_var.set("loading timeline…")
+        self_xid = self._self_xid if st.get("hide_self") else None
 
         def call():
             return self.api.timeline(window_uid=st["selected_window_uid"],
                                      sort=st["sort"], order=st["order"],
-                                     t_from=st["from"], t_to=st["to"])
+                                     t_from=st["from"], t_to=st["to"],
+                                     self_xid=self_xid)
         self._submit(call, self._on_timeline_results)
 
     def _on_timeline_results(self, lanes, err):
@@ -532,6 +576,8 @@ class WindowPreviewApp(tk.Tk):
         title_label.pack(anchor="w")
         access_label = ttk.Label(frame, style="Muted.TLabel")
         access_label.pack(anchor="w")
+        usage_label = ttk.Label(frame, style="Muted.TLabel")
+        usage_label.pack(anchor="w")
         badge_label = ttk.Label(frame, style="Muted.TLabel")
         badge_label.pack(anchor="w")
         status_label = ttk.Label(frame, style="Tile.TLabel")
@@ -541,8 +587,9 @@ class WindowPreviewApp(tk.Tk):
         hits_box.tag_configure("mark", background=c["mark_bg"])
         hits_box.tag_configure("field", foreground=c["accent"])
 
-        tile = {"frame": frame, "img_label": img_label, "app_label": app_label,
-                "title_label": title_label, "access_label": access_label,
+        tile = {"frame": frame, "img_label": img_label,
+                "app_label": app_label, "title_label": title_label,
+                "access_label": access_label, "usage_label": usage_label,
                 "badge_label": badge_label, "status_label": status_label,
                 "hits_box": hits_box, "win": w}
 
@@ -559,10 +606,11 @@ class WindowPreviewApp(tk.Tk):
 
     def _update_tile(self, tile: dict, w: Window):
         tile["win"] = w
-        tile["app_label"].configure(text=w.wm_class or "")
+        tile["app_label"].configure(text=w.app_name or w.wm_class or "")
         title = w.current_title or "(no title)"
         tile["title_label"].configure(text=(title[:48] + "…") if len(title) > 48 else title)
         tile["access_label"].configure(text=_fmt_last_access(w.last_access))
+        tile["usage_label"].configure(text=_fmt_usage(w))
         tile["badge_label"].configure(text=w.desktop_badge)
         if w.alive and w.jumpable:
             tile["status_label"].configure(text="● accessible", style="Alive.Tile.TLabel")
@@ -828,9 +876,7 @@ class WindowPreviewApp(tk.Tk):
             tip.attributes("-topmost", True)
         except tk.TclError:
             pass
-        title = w.current_title or ""
-        if w.wm_class:
-            title = f"[{w.wm_class}] {title}"
+        title = w.display_label
         title_lbl = tk.Label(tip, text=title, anchor="w", justify="left",
                              bg=self.theme["tiptitle_bg"], fg=self.theme["tiptitle_fg"],
                              font=self.title_font, padx=8, pady=4, wraplength=photo.width())
@@ -871,10 +917,7 @@ class WindowPreviewApp(tk.Tk):
             self._preview_cache[w.window_uid] = photo
             self._preview_image_label.configure(image=photo)
             self._preview_image_label.image = photo
-            title = w.current_title or ""
-            if w.wm_class:
-                title = f"[{w.wm_class}] {title}"
-            self._preview_title_label.configure(text=title)
+            self._preview_title_label.configure(text=w.display_label)
             self._position_preview_tip()
 
         self._submit(fetch, done)

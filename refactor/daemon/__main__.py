@@ -29,6 +29,7 @@ from .collectors import xpump, xrecord
 from .config import Settings
 from .db.store import Store
 from .handlers import EventHandlers
+from .heartbeat import HeartbeatRecorder
 from .identity import resolve_identity
 from .log import setup_logging
 from .runtime import Runtime
@@ -90,7 +91,8 @@ async def run(settings: Settings) -> None:
 
     aggregator = KeyboardAggregator(
         store, registry, settings,
-        vdesktop_provider=lambda: (handlers.vdesktop_index, handlers.vdesktop_name))
+        vdesktop_provider=lambda: (handlers.vdesktop_index, handlers.vdesktop_name),
+        title_provider=lambda: handlers.current_focus_title)
     aggregator.register(runtime)
     # keyboard segment cuts on focus/title change (04 §3)
     handlers.add_focus_hook(aggregator.on_focus_change)
@@ -100,6 +102,8 @@ async def run(settings: Settings) -> None:
     # immediate capture on focus/title change (config: capture_on_focus / capture_on_title)
     handlers.add_focus_hook(window_captures.on_focus_change)
     handlers.add_title_hook(window_captures.on_title_change)
+
+    heartbeat = HeartbeatRecorder(store, registry, settings, ident.daemon_boot_id)
 
     ctx = DaemonContext(store=store, registry=registry, settings=settings,
                         runtime=runtime, identity=ident, window_captures=window_captures,
@@ -160,6 +164,7 @@ async def run(settings: Settings) -> None:
         await window_captures.run(stop, time.time)
 
     runtime.add_task(_window_capture_task(), name="window_captures")
+    runtime.add_task(heartbeat.run(stop, time.time), name="heartbeat")
     runtime.add_task(aggregator.idle_loop(stop, time.time), name="kbd_idle")
     api_task = asyncio.create_task(api.serve(stop), name="api")
 

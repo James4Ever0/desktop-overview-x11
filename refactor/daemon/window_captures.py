@@ -148,6 +148,7 @@ class WindowCaptureScheduler:
             return False
         wm = await self.rt.run_in_executor(capture.get_app_name, wid_hex)
         uid = await self.reg.ensure_window(xid, wm or None, now)
+        await self.reg.set_app_name(uid, wm or None, now)
         if self.s.filter_no_vdesktop:
             vrow = await self.store.fetchone(
                 "SELECT vdesktop_index FROM window WHERE window_uid=? LIMIT 1", (uid,))

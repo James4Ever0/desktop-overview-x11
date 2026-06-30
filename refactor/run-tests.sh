@@ -28,6 +28,7 @@ TESTS=(
     tests.test_window_captures
     tests.test_keyboard_aggregator
     tests.test_api_search
+    tests.test_heartbeat
     tests.test_frontend
 )
 

@@ -42,9 +42,10 @@ async def main():
     rows = await store.fetchall(
         "SELECT name FROM sqlite_master WHERE type IN ('table','view') ORDER BY name")
     names = {r[0] for r in rows}
-    for t in ("window", "title_history", "kbd_segment", "clipboard_event",
-              "selection_event", "read_event", "window_capture", "fts_kbd",
-              "fts_title", "window_capture_latest", "daemon_run", "meta"):
+    for t in ("window", "title_history", "app_name_history", "kbd_segment", "clipboard_event",
+              "selection_event", "read_event", "window_capture", "window_heartbeat",
+              "fts_kbd", "fts_title", "fts_appname",
+              "window_capture_latest", "daemon_run", "meta"):
         check(f"object exists: {t}", t in names)
     check("schema_version recorded",
           (await store.fetchone("SELECT value FROM meta WHERE key='schema_version'"))[0] == "1")

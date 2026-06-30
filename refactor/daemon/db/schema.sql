@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS window (
   first_daemon_run_id INTEGER REFERENCES daemon_run(id),
   last_daemon_run_id  INTEGER REFERENCES daemon_run(id),
   x_window_id         INTEGER NOT NULL,      -- raw 0x.. id as decimal
-  wm_class            TEXT,                  -- app name (xprop WM_CLASS)
+  wm_class            TEXT,                  -- app name (xprop WM_CLASS instance, lowercase)
+  app_name            TEXT,                  -- alias/wider process name for display/search
   vdesktop_index      INTEGER,               -- current virtual desktop (cached)
   vdesktop_name       TEXT,                  -- current virtual desktop name (cached)
   first_seen          REAL NOT NULL,
@@ -35,7 +36,7 @@ CREATE INDEX IF NOT EXISTS ix_window_lastseen ON window(last_seen DESC);
 CREATE INDEX IF NOT EXISTS ix_window_session  ON window(session_key, x_window_id);
 CREATE INDEX IF NOT EXISTS ix_window_alive    ON window(alive);
 
--- ────────────────────────────── title / focus / desktop (06 §2) ──────────────
+-- ────────────────────────────── title / focus / desktop / app_name (06 §2) ───
 CREATE TABLE IF NOT EXISTS title_history (
   id          INTEGER PRIMARY KEY,
   window_uid  INTEGER NOT NULL REFERENCES window(window_uid),
@@ -43,6 +44,14 @@ CREATE TABLE IF NOT EXISTS title_history (
   changed_at  REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_title_window ON title_history(window_uid, changed_at);
+
+CREATE TABLE IF NOT EXISTS app_name_history (    -- process/app name for display + search
+  id          INTEGER PRIMARY KEY,
+  window_uid  INTEGER NOT NULL REFERENCES window(window_uid),
+  app_name    TEXT,
+  changed_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_app_name_window ON app_name_history(window_uid, changed_at);
 
 CREATE TABLE IF NOT EXISTS focus_event (         -- one row per focus gain
   id             INTEGER PRIMARY KEY,
@@ -60,6 +69,20 @@ CREATE TABLE IF NOT EXISTS vdesktop_state (      -- desktop rename/count history
   count      INTEGER,
   changed_at REAL NOT NULL
 );
+
+-- ────────────────────────────── heartbeat / usage rate ─────────────────────────
+-- One row per focused-window snapshot (daemon heartbeat).  Used to compute
+-- focused active-minutes per window (usage_5m/10m/30m).
+CREATE TABLE IF NOT EXISTS window_heartbeat (
+  id             INTEGER PRIMARY KEY,
+  daemon_boot_id TEXT NOT NULL,         -- which daemon run produced the beat
+  window_uid     INTEGER REFERENCES window(window_uid),
+  x_window_id    INTEGER NOT NULL,
+  ts             REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_heartbeat_window ON window_heartbeat(window_uid, ts);
+CREATE INDEX IF NOT EXISTS ix_heartbeat_boot   ON window_heartbeat(daemon_boot_id, ts);
+CREATE INDEX IF NOT EXISTS ix_heartbeat_ts     ON window_heartbeat(ts);
 
 -- ────────────────────────────── clipboard / selection / read (06 §3) ─────────
 CREATE TABLE IF NOT EXISTS clipboard_event (     -- a COPY (CLIPBOARD owner change)
@@ -132,6 +155,8 @@ CREATE VIEW IF NOT EXISTS window_capture_latest AS
 -- highlight/snippet). So fts_title's column is `title`, the others are `text`.
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_title USING fts5(
   title, content='title_history', content_rowid='id', tokenize='{tokenizer}');
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_appname USING fts5(
+  app_name, content='app_name_history', content_rowid='id', tokenize='{tokenizer}');
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_clip USING fts5(
   text, content='clipboard_event', content_rowid='id', tokenize='{tokenizer}');
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_sel USING fts5(
@@ -149,6 +174,18 @@ END;
 CREATE TRIGGER IF NOT EXISTS title_au AFTER UPDATE ON title_history BEGIN
   INSERT INTO fts_title(fts_title, rowid, title) VALUES('delete', old.id, old.title);
   INSERT INTO fts_title(rowid, title) VALUES (new.id, new.title);
+END;
+
+-- app_name_history → fts_appname (column is `app_name`, matching the source column)
+CREATE TRIGGER IF NOT EXISTS app_name_ai AFTER INSERT ON app_name_history BEGIN
+  INSERT INTO fts_appname(rowid, app_name) VALUES (new.id, new.app_name);
+END;
+CREATE TRIGGER IF NOT EXISTS app_name_ad AFTER DELETE ON app_name_history BEGIN
+  INSERT INTO fts_appname(fts_appname, rowid, app_name) VALUES('delete', old.id, old.app_name);
+END;
+CREATE TRIGGER IF NOT EXISTS app_name_au AFTER UPDATE ON app_name_history BEGIN
+  INSERT INTO fts_appname(fts_appname, rowid, app_name) VALUES('delete', old.id, old.app_name);
+  INSERT INTO fts_appname(rowid, app_name) VALUES (new.id, new.app_name);
 END;
 
 -- clipboard_event → fts_clip

@@ -29,12 +29,14 @@ log = logging.getLogger("dovw.aggregator")
 
 
 class KeyboardAggregator:
-    def __init__(self, store, registry, settings, vdesktop_provider=None):
+    def __init__(self, store, registry, settings, vdesktop_provider=None, title_provider=None):
         self.store = store
         self.reg = registry
         self.s = settings
         # () -> (vdesktop_index, vdesktop_name); snapshotted per segment for context
         self._vdesktop = vdesktop_provider or (lambda: (None, None))
+        # () -> current focused window title (for denylist filtering)
+        self._title = title_provider or (lambda: None)
         self._open = None        # {"window_uid","buf","started_at","last_key_at","vidx","vname"}
         self._lock = asyncio.Lock()
 
@@ -57,6 +59,14 @@ class KeyboardAggregator:
             if ch is None:
                 return
             focus_uid = self.reg.current_focus_window_uid
+            if self._denied_title():
+                log.debug("kbd_char dropped: focused window title is denied")
+                return
+            if focus_uid is None:
+                # No attributable window (e.g. focus landed on a denied window).
+                # Flush any previous segment and drop this keystroke.
+                await self._flush_locked("focus_change")
+                return
             if self._open is None or self._open["window_uid"] != focus_uid:
                 await self._flush_locked("focus_change")
                 vidx, vname = self._vdesktop()
@@ -64,6 +74,12 @@ class KeyboardAggregator:
                               "last_key_at": ts, "vidx": vidx, "vname": vname}
             self._open["buf"].append(ch)
             self._open["last_key_at"] = ts
+
+    def _denied_title(self) -> bool:
+        title = self._title()
+        if not title:
+            return False
+        return title in self.s.window_title_denylist
 
     # ───────────────────────── flush triggers (04 §3) ─────────────────────────
     async def on_focus_change(self, _window_uid=None) -> None:

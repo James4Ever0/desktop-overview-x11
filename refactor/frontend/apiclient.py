@@ -42,6 +42,7 @@ class Window:
     window_uid: int
     x_window_id: str
     wm_class: str | None
+    app_name: str | None
     current_title: str | None
     vdesktop: VDesktop | None
     alive: bool
@@ -49,7 +50,20 @@ class Window:
     last_access: float | None
     window_capture_url: str | None
     window_capture_ts: int | None
+    usage_5m: float | None = None
+    usage_10m: float | None = None
+    usage_30m: float | None = None
+    usage_total: float | None = None
+    focus_score: float | None = None
     hits: list[Hit] = field(default_factory=list)
+
+    @property
+    def display_label(self) -> str:
+        """Label text combining app name and title (mirrors reference_v2 hover)."""
+        title = self.current_title or "(no title)"
+        if self.app_name:
+            return f"[{self.app_name}] {title}"
+        return title
 
     @property
     def desktop_badge(self) -> str:
@@ -63,11 +77,16 @@ class Window:
         vd = d.get("vdesktop")
         return cls(
             window_uid=d["window_uid"], x_window_id=d.get("x_window_id", ""),
-            wm_class=d.get("wm_class"), current_title=d.get("current_title"),
+            wm_class=d.get("wm_class"), app_name=d.get("app_name"),
+            current_title=d.get("current_title"),
             vdesktop=(VDesktop(vd.get("index"), vd.get("name")) if vd else None),
             alive=bool(d.get("alive")), jumpable=bool(d.get("jumpable")),
-            last_access=d.get("last_access"), window_capture_url=d.get("window_capture_url"),
+            last_access=d.get("last_access"),
+            window_capture_url=d.get("window_capture_url"),
             window_capture_ts=d.get("window_capture_ts"),
+            usage_5m=d.get("usage_5m"), usage_10m=d.get("usage_10m"), usage_30m=d.get("usage_30m"),
+            usage_total=d.get("usage_total"),
+            focus_score=d.get("focus_score"),
             hits=[Hit(h["field"], h.get("excerpt")) for h in d.get("hits", [])],
         )
 
@@ -77,19 +96,29 @@ class TimelineLane:
     window_uid: int
     x_window_id: str | None
     wm_class: str | None
+    app_name: str | None
     current_title: str | None
     alive: bool | None
     jumpable: bool | None
     focus_spans: list[dict]
     titles: list[dict]
+    usage_5m: float | None = None
+    usage_10m: float | None = None
+    usage_30m: float | None = None
+    usage_total: float | None = None
+    focus_score: float | None = None
 
     @classmethod
     def from_json(cls, d: dict) -> "TimelineLane":
         return cls(
             window_uid=d["window_uid"], x_window_id=d.get("x_window_id"),
-            wm_class=d.get("wm_class"), current_title=d.get("current_title"),
+            wm_class=d.get("wm_class"), app_name=d.get("app_name"),
+            current_title=d.get("current_title"),
             alive=d.get("alive"), jumpable=d.get("jumpable"),
-            focus_spans=d.get("focus_spans", []), titles=d.get("titles", []))
+            focus_spans=d.get("focus_spans", []), titles=d.get("titles", []),
+            usage_5m=d.get("usage_5m"), usage_10m=d.get("usage_10m"), usage_30m=d.get("usage_30m"),
+            usage_total=d.get("usage_total"),
+            focus_score=d.get("focus_score"))
 
 
 class ApiClient:
@@ -140,17 +169,19 @@ class ApiClient:
             return None
 
     # ───────────────────────── endpoints (08 §2-5) ─────────────────────────
-    def windows(self, *, sort="last_access", order="desc", alive="both") -> list[Window]:
+    def windows(self, *, sort="last_access", order="desc", alive="both", self_xid=None) -> list[Window]:
         log.debug("api windows sort=%s order=%s alive=%s", sort, order, alive)
-        data = self._get("/windows", sort=sort, order=order, alive=alive)
+        data = self._get("/windows", sort=sort, order=order, alive=alive, self_xid=self_xid)
         return [Window.from_json(d) for d in data]
 
     def search(self, *, q=None, window_uid=None, fields=None, alive="both",
-               sort="last_access", order="desc", hits="hit_only", t_from=None, t_to=None) -> list[Window]:
+               sort="last_access", order="desc", hits="hit_only", t_from=None, t_to=None,
+               self_xid=None) -> list[Window]:
         path = "/history" if (t_from is not None or t_to is not None) else "/search"
         log.debug("api search q=%s window_uid=%s fields=%s sort=%s order=%s",
                   q, window_uid, fields, sort, order)
-        params = dict(q=q, window_uid=window_uid, alive=alive, sort=sort, order=order, hits=hits)
+        params = dict(q=q, window_uid=window_uid, alive=alive, sort=sort, order=order, hits=hits,
+                      self_xid=self_xid)
         if fields:
             params["fields"] = ",".join(fields)
         if t_from is not None:
@@ -163,8 +194,8 @@ class ApiClient:
         return self._get(f"/windows/{uid}")
 
     def timeline(self, *, window_uid=None, sort="last_access", order="desc",
-                 t_from=None, t_to=None) -> list[TimelineLane]:
-        params = dict(window_uid=window_uid, sort=sort, order=order)
+                 t_from=None, t_to=None, self_xid=None) -> list[TimelineLane]:
+        params = dict(window_uid=window_uid, sort=sort, order=order, self_xid=self_xid)
         if t_from is not None:
             params["from"] = t_from
         if t_to is not None:

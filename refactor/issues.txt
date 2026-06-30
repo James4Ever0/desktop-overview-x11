@@ -107,3 +107,27 @@ add an icon entry to kubuntu taskbar entry, on the right side, with few options,
 ---
 
 the flashing could be of claude code background shell running. kill them all and it might be fine?
+
+---
+
+do not capture keyboard events if the focused window has a title equals to one of the forbidden names. do not collect any key at that time.
+
+---
+
+always fix the grid to 4 columns. do not make the window resizable 
+
+---
+
+display a placeholder image or text like [no preview] in window thumbnail instead of not putting any image there.
+
+---
+
+in full text search engine, can we treat the query and tokenize the query in the way used for document processing? for example even the db contains the string ssh-keygen i cannot query ssh-keygen directly instead i must use ssh keygen to query it. so how to fix? use whole word matching along with full text search or use the same tokenizer to transform ssh-keygen into ssh keygen? what is the standard way of doing it?
+
+---
+
+can you also display the keyboard captured chunk timestamp in the "hover" or detail view of the window metadata enrichment section?
+
+---
+
+still cannot get the "hide self" working. the window capture still appears in the bottom of the list with process name tk and title "(no title)" which is strange. you shall capture the title no matter it is containing forbidden title or not. you just exclude it in results everywhere, from backend to frontend.

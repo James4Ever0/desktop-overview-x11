@@ -309,10 +309,39 @@ async def test_paste():
     await store.close()
 
 
+async def test_title_denylist():
+    print("[aggregator] title denylist")
+    s = Settings()
+    store, reg, rt = await _new_runtime(s)
+    uid = await reg.ensure_window(0xBAD, "app", 10.0)
+    forbidden = "Desktop Overview — search"
+
+    agg = KeyboardAggregator(store, reg, s, title_provider=lambda: forbidden)
+    reg.set_focus(uid)
+    for i, ch in enumerate("secret"):
+        await agg.on_char({"kind": "kbd_char", "char": ch, "ts": 500.0 + i})
+    await agg.flush("idle")
+    await store.flush()
+    n = await store.fetchone("SELECT COUNT(*) FROM kbd_segment WHERE window_uid=?", (uid,))
+    check("keys dropped when focused title is denied", n[0] == 0)
+
+    agg2 = KeyboardAggregator(store, reg, s, title_provider=lambda: "Allowed Window")
+    reg.set_focus(uid)
+    for i, ch in enumerate("open"):
+        await agg2.on_char({"kind": "kbd_char", "char": ch, "ts": 600.0 + i})
+    await agg2.flush("idle")
+    await store.flush()
+    row = await store.fetchone("SELECT text FROM kbd_segment WHERE window_uid=?", (uid,))
+    check("keys stored when focused title is allowed", row is not None and row[0] == "open")
+
+    await store.close()
+
+
 async def main():
     test_keyboard_decode()
     await test_aggregator()
     await test_threshold()
+    await test_title_denylist()
     await test_clipboard()
     await test_selection()
     await test_paste()

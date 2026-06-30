@@ -34,12 +34,9 @@ class EventHandlers:
         # clipboard dedup + PRIMARY Strategy C state (03 §3-4)
         self._last_clip_hash: str | None = None
         self.sel_strategy = selection.SelectionStrategyC()
-        self._denied_xids: set[int] = set()
-
-    def _denied_title(self, title: str | None) -> bool:
-        if not title:
-            return False
-        return title in self.s.window_title_denylist
+        # current focused window title/xid for keyboard denylist filtering
+        self.current_focus_title: str | None = None
+        self.current_focus_xid: int | None = None
 
     def register_all(self, runtime) -> None:
         runtime.register("window_list", self.handle_window_list)
@@ -67,8 +64,6 @@ class EventHandlers:
         added, gone = ev.get("added", []), ev.get("gone", [])
         log.debug("window_list: added=%d gone=%d", len(added), len(gone))
         for xid in added:
-            if int(xid) in self._denied_xids:
-                continue
             await self.reg.ensure_window(int(xid), None, ts)
         for xid in gone:
             await self.reg.mark_dead(int(xid), ts)
@@ -78,10 +73,9 @@ class EventHandlers:
         xid = int(ev["x_window_id"])
         ts = ev.get("ts")
         title = ev.get("title")
-        if int(xid) in self._denied_xids or self._denied_title(title):
-            log.debug("focus denied for x=0x%08x title=%r", xid, title)
-            return
         uid = await self.reg.ensure_window(xid, None, ts)
+        self.current_focus_xid = int(xid)
+        self.current_focus_title = title
         self.reg.set_focus(uid)
         await self.reg.bump_last_seen(uid, ts)
         await self.reg.set_vdesktop(uid, self.vdesktop_index, self.vdesktop_name)
@@ -100,10 +94,8 @@ class EventHandlers:
         new = ev.get("new")
         if not new:
             return
-        if self._denied_title(new):
-            self._denied_xids.add(int(xid))
-            log.debug("title denied for x=0x%08x title=%r", xid, new)
-            return
+        if xid == self.current_focus_xid:
+            self.current_focus_title = new
         uid = await self.reg.ensure_window(xid, None, ts)
         await self.reg.bump_last_seen(uid, ts)
         log.debug("title window_uid=%d x=0x%08x new=%s", uid, xid, new)

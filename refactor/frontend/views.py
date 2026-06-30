@@ -56,7 +56,8 @@ def _render_lane(app, parent, lane, row, t_min, span, width, theme):
     frame.grid(row=row, column=0, sticky="ew", padx=PAD, pady=2)
 
     title = lane.current_title or "(no title)"
-    label = f"{lane.wm_class or '?'} — {title}"
+    app = lane.app_name or lane.wm_class or "?"
+    label = f"{app} — {title}"
     if len(label) > 40:
         label = label[:40] + "…"
     accessible = bool(lane.alive) and bool(lane.jumpable)

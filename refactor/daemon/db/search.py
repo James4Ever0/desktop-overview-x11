@@ -15,12 +15,18 @@ so ``snippet(fts_X, 0, …)`` is correct for all of them.
 """
 from __future__ import annotations
 
+import time
+
+from ..config import Settings
+from ..heartbeat import USAGE_INTERVALS_S, usage_rates
+
 FIELDS = {
     # field name : (fts table, content table, ts column on the content table)
-    "title":     ("fts_title", "title_history",   "changed_at"),
-    "clipboard": ("fts_clip",  "clipboard_event", "created_at"),
-    "selection": ("fts_sel",   "selection_event", "created_at"),
-    "keyboard":  ("fts_kbd",   "kbd_segment",      "started_at"),
+    "title":     ("fts_title",    "title_history",    "changed_at"),
+    "app_name":  ("fts_appname",  "app_name_history", "changed_at"),
+    "clipboard": ("fts_clip",     "clipboard_event",  "created_at"),
+    "selection": ("fts_sel",      "selection_event",  "created_at"),
+    "keyboard":  ("fts_kbd",      "kbd_segment",       "started_at"),
 }
 ALL_FIELDS = tuple(FIELDS)
 
@@ -31,6 +37,7 @@ _WINDOW_COLS = """
   w.window_uid       AS window_uid,
   w.x_window_id      AS x_window_id,
   w.wm_class         AS wm_class,
+  w.app_name         AS app_name,
   w.alive            AS alive,
   w.session_key      AS session_key,
   w.vdesktop_index   AS vdesktop_index,
@@ -55,6 +62,28 @@ def _alive_sql(alive: str, col: str = "w.alive") -> str:
     return ""   # both
 
 
+def _xid_int(xid) -> int | None:
+    """Normalize a hex/int x_window_id to int."""
+    if xid is None:
+        return None
+    try:
+        if isinstance(xid, str):
+            return int(xid, 0)
+        return int(xid)
+    except (ValueError, TypeError):
+        return None
+
+
+def _filter_self(items: list[dict], self_xid) -> list[dict]:
+    """Drop alive windows whose x_window_id matches the caller's own X id."""
+    if self_xid is None:
+        return items
+    target = _xid_int(self_xid)
+    if target is None:
+        return items
+    return [o for o in items if not (o.get("alive") and _xid_int(o.get("x_window_id")) == target)]
+
+
 def assemble_window(row, current_session_key: str | None) -> dict:
     """Turn a ``_WINDOW_COLS`` row into the ready-to-render window object (07 §3)."""
     uid = row["window_uid"]
@@ -65,6 +94,7 @@ def assemble_window(row, current_session_key: str | None) -> dict:
         "window_uid": uid,
         "x_window_id": f"0x{int(row['x_window_id']):08x}",
         "wm_class": row["wm_class"],
+        "app_name": row["app_name"],
         "current_title": row["current_title"],
         "vdesktop": ({"index": vidx, "name": row["vdesktop_name"]}
                      if vidx is not None or row["vdesktop_name"] is not None else None),
@@ -75,6 +105,51 @@ def assemble_window(row, current_session_key: str | None) -> dict:
         "window_capture_ts": row["window_capture_ts"],
         "hits": [],
     }
+
+
+async def _enrich_usage(store, items: list[dict], key: str = "window_uid", now=None) -> None:
+    """Attach usage_5m/10m/30m active-minute fields to a list of window/lane dicts."""
+    if not items:
+        return
+    rates = await usage_rates(store, [o[key] for o in items], now=now)
+    for o in items:
+        o.update(rates.get(o[key], {label: 0.0 for label in USAGE_INTERVALS_S}))
+
+
+def _focus_score(usage_5m, usage_10m, usage_30m, last_access, now: float, s: Settings) -> float:
+    """Blend recent focused usage and recency into a single ranking score."""
+    if not last_access:
+        return 0.0
+    recency_min = (now - last_access) / 60.0
+    recency = 1.0 / (1.0 + recency_min)   # avoids division by zero; 1.0 when just focused
+
+    total_usage_w = s.focus_score_w5 + s.focus_score_w10 + s.focus_score_w30
+    if total_usage_w <= 0:
+        usage = 0.0
+    else:
+        usage = (
+            s.focus_score_w5  * (usage_5m  or 0) / 5.0 +
+            s.focus_score_w10 * (usage_10m or 0) / 10.0 +
+            s.focus_score_w30 * (usage_30m or 0) / 30.0
+        ) / total_usage_w
+
+    total_mix = s.focus_score_usage_weight + s.focus_score_recency_weight
+    if total_mix <= 0:
+        return 0.0
+    score = (s.focus_score_usage_weight * usage + s.focus_score_recency_weight * recency) / total_mix
+    return round(score, 4)
+
+
+async def _enrich_focus_score(store, items: list[dict], now=None) -> None:
+    """Attach focus_score to a list of window/lane dicts after usage is present."""
+    if not items:
+        return
+    now = time.time() if now is None else now
+    s = store.s
+    for o in items:
+        o["focus_score"] = _focus_score(
+            o.get("usage_5m"), o.get("usage_10m"), o.get("usage_30m"),
+            o.get("last_access"), now, s)
 
 
 # ───────────────────────── GET /windows (no FTS) ─────────────────────────
@@ -89,8 +164,32 @@ def _window_sort_col(sort: str) -> str:
 
 async def list_windows(store, *, alive="both", sort="last_access", order="desc",
                        limit=200, offset=0, current_session_key=None,
-                       title_denylist=None) -> list[dict]:
+                       title_denylist=None, self_xid=None) -> list[dict]:
     where = _alive_sql(alive)
+    now = time.time()
+
+    def _filter_denied(results):
+        if not title_denylist:
+            return results
+        denied = set(title_denylist)
+        return [r for r in results if r.get("current_title") not in denied]
+
+    if sort == "focus_score" or sort.startswith("usage_"):
+        # focus_score and usage sorts depend on enriched values, so sort globally in Python.
+        sql = f"SELECT {_WINDOW_COLS} FROM window w " + (f"WHERE {where} " if where else "")
+        rows = await store.fetchall(sql)
+        results = [assemble_window(r, current_session_key) for r in rows]
+        results = _filter_denied(results)
+        results = _filter_self(results, self_xid)
+        await _enrich_usage(store, results, now=now)
+        await _enrich_focus_score(store, results, now=now)
+        reverse = order != "asc"
+        if sort == "focus_score":
+            results.sort(key=lambda o: (o["focus_score"], o["window_uid"]), reverse=reverse)
+        else:
+            results.sort(key=lambda o: (o.get(sort) or 0, o["window_uid"]), reverse=reverse)
+        return results[offset:offset + limit]
+
     sort_col = _window_sort_col(sort)
     direction = "ASC" if order == "asc" else "DESC"
     # secondary key keeps ordering stable when primary key ties
@@ -100,9 +199,10 @@ async def list_windows(store, *, alive="both", sort="last_access", order="desc",
            + f"ORDER BY {sort_col} {direction}, {secondary} LIMIT ? OFFSET ?")
     rows = await store.fetchall(sql, (limit, offset))
     results = [assemble_window(r, current_session_key) for r in rows]
-    if title_denylist:
-        denied = set(title_denylist)
-        results = [r for r in results if r.get("current_title") not in denied]
+    results = _filter_denied(results)
+    results = _filter_self(results, self_xid)
+    await _enrich_usage(store, results, now=now)
+    await _enrich_focus_score(store, results, now=now)
     return results
 
 
@@ -110,7 +210,7 @@ async def list_windows(store, *, alive="both", sort="last_access", order="desc",
 async def search(store, *, q=None, window_uid=None, fields=None, alive="both",
                  t_from=None, t_to=None, sort="last_access", order="desc", hits="hit_only",
                  limit=100, offset=0, current_session_key=None,
-                 title_denylist=None) -> list[dict]:
+                 title_denylist=None, self_xid=None) -> list[dict]:
     """The core multi-field search (07 §4).
 
     ``q`` empty + ``window_uid`` set → scope-only "show this window's fields"
@@ -151,6 +251,10 @@ async def search(store, *, q=None, window_uid=None, fields=None, alive="both",
         obj["_recency"] = agg["max_ts"]
         results.append(obj)
 
+    now = time.time()
+    await _enrich_usage(store, results, now=now)
+    await _enrich_focus_score(store, results, now=now)
+
     reverse = order != "asc"
     if sort == "relevance":
         results.sort(key=lambda o: (o["_rank"] if o["_rank"] is not None else 1e9))
@@ -160,6 +264,10 @@ async def search(store, *, q=None, window_uid=None, fields=None, alive="both",
         results.sort(key=lambda o: (o["current_title"] or "").lower(), reverse=reverse)
     elif sort == "window_id":
         results.sort(key=lambda o: o["window_uid"], reverse=reverse)
+    elif sort == "focus_score":
+        results.sort(key=lambda o: (o.get("focus_score") or 0, o["window_uid"]), reverse=reverse)
+    elif sort.startswith("usage_"):
+        results.sort(key=lambda o: (o.get(sort) or 0, o["window_uid"]), reverse=reverse)
     else:  # last_access (default)
         results.sort(key=lambda o: (o["last_access"] or 0, o["window_uid"]),
                      reverse=reverse)
@@ -173,6 +281,7 @@ async def search(store, *, q=None, window_uid=None, fields=None, alive="both",
     if title_denylist:
         denied = set(title_denylist)
         page = [o for o in page if o.get("current_title") not in denied]
+    page = _filter_self(page, self_xid)
     return page
 
 
@@ -211,7 +320,7 @@ async def _scope_collect(store, fields, window_uid, *, per_field) -> dict:
     per_uid: dict[int, dict] = {}
     for field in fields:
         _fts, content, ts_col = FIELDS[field]
-        text_col = "title" if field == "title" else "text"
+        text_col = "title" if field == "title" else ("app_name" if field == "app_name" else "text")
         sql = (f"SELECT {text_col} AS excerpt, {ts_col} AS ts FROM {content} "
                f"WHERE window_uid = ? AND {text_col} IS NOT NULL "
                f"ORDER BY {ts_col} DESC LIMIT ?")
@@ -242,6 +351,8 @@ async def window_detail(store, uid: int, current_session_key=None,
     if row is None:
         return None
     obj = assemble_window(row, current_session_key)
+    await _enrich_usage(store, [obj])
+    await _enrich_focus_score(store, [obj])
     titles = await store.fetchall(
         "SELECT title, changed_at FROM title_history WHERE window_uid = ? "
         "ORDER BY changed_at DESC, id DESC LIMIT ?", (uid, recent))
@@ -272,7 +383,7 @@ async def _recent_events(store, uid, recent) -> list[dict]:
 # ───────────────────────── GET /timeline ─────────────────────────
 async def timeline(store, *, t_from=None, t_to=None, window_uid=None, sort="last_access",
                    order="desc", current_session_key=None,
-                   title_denylist=None) -> list[dict]:
+                   title_denylist=None, self_xid=None) -> list[dict]:
     """Windows active in [from,to] with their focus spans + title history (07 §3, 08 §3)."""
     where, params = [], []
     if window_uid is not None:
@@ -319,9 +430,11 @@ async def timeline(store, *, t_from=None, t_to=None, window_uid=None, sort="last
             m = assemble_window(meta, current_session_key)
             lane["x_window_id"] = m["x_window_id"]
             lane["wm_class"] = m["wm_class"]
+            lane["app_name"] = m["app_name"]
             lane["current_title"] = m["current_title"]
             lane["alive"] = m["alive"]
             lane["jumpable"] = m["jumpable"]
+            lane["last_access"] = m["last_access"]
 
     out = list(lanes.values())
     reverse = order != "asc"
@@ -329,6 +442,11 @@ async def timeline(store, *, t_from=None, t_to=None, window_uid=None, sort="last
         out.sort(key=lambda l: (l.get("current_title") or "").lower(), reverse=reverse)
     elif sort == "window_id":
         out.sort(key=lambda l: l["window_uid"], reverse=reverse)
+    elif sort == "focus_score":
+        # focus_score needs usage; compute below and re-sort.
+        pass
+    elif sort.startswith("usage_"):
+        pass
     else:  # last_access: latest focus span per lane, ties by uid for stability
         def _lane_last_access(lane):
             spans = lane.get("focus_spans") or []
@@ -338,4 +456,12 @@ async def timeline(store, *, t_from=None, t_to=None, window_uid=None, sort="last
     if title_denylist:
         denied = set(title_denylist)
         out = [l for l in out if l.get("current_title") not in denied]
+    out = _filter_self(out, self_xid)
+    now = time.time()
+    await _enrich_usage(store, out, key="window_uid", now=now)
+    await _enrich_focus_score(store, out, now=now)
+    if sort == "focus_score":
+        out.sort(key=lambda l: (l.get("focus_score") or 0, l["window_uid"]), reverse=reverse)
+    elif sort.startswith("usage_"):
+        out.sort(key=lambda l: (l.get(sort) or 0, l["window_uid"]), reverse=reverse)
     return out

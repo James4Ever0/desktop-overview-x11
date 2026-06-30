@@ -84,3 +84,7 @@ do a small experiment elsewhere first.
 ---
 
 keyboard chunk storing is not working properly. shall push with current focused window id, along with current boot id, and those ids shall be obtainable instantly and correctly across the daemon api, stored as some ephermal class attribute.
+
+---
+
+put the focus score along with the total time usage to a new line.

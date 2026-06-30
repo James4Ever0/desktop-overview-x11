@@ -23,11 +23,17 @@ class WindowOut(BaseModel):
     window_uid: int
     x_window_id: str
     wm_class: str | None = None
+    app_name: str | None = None
     current_title: str | None = None
     vdesktop: VDesktopRef | None = None
     alive: bool
     jumpable: bool
     last_access: float | None = None
+    usage_5m: float | None = None
+    usage_10m: float | None = None
+    usage_30m: float | None = None
+    usage_total: float | None = None
+    focus_score: float | None = None
     window_capture_url: str | None = None
     window_capture_ts: int | None = None
     hits: list[Hit] = []
@@ -61,9 +67,15 @@ class TimelineLane(BaseModel):
     window_uid: int
     x_window_id: str | None = None
     wm_class: str | None = None
+    app_name: str | None = None
     current_title: str | None = None
     alive: bool | None = None
     jumpable: bool | None = None
+    usage_5m: float | None = None
+    usage_10m: float | None = None
+    usage_30m: float | None = None
+    usage_total: float | None = None
+    focus_score: float | None = None
     focus_spans: list[FocusSpan] = []
     titles: list[TitleChange] = []
 

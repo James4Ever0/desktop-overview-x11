@@ -34,6 +34,17 @@ class WindowRegistry:
         self._alive_grace_s = (store.s.window_alive_grace_s
                                if hasattr(store.s, "window_alive_grace_s") else 5.0)
 
+    def alive_items(self) -> list[tuple[int, int]]:
+        """Return [(x_window_id, window_uid)] for windows currently believed alive."""
+        return list(self._alive.items())
+
+    def xid_for_uid(self, window_uid: int) -> int | None:
+        """Reverse-lookup the live X id for a given window_uid, if known."""
+        for xid, uid in self._alive.items():
+            if uid == window_uid:
+                return xid
+        return None
+
     # ───────────────────────── mint / reuse ─────────────────────────
     async def ensure_window(self, x_window_id: int, wm_class: str | None = None,
                             now: float | None = None,
@@ -88,6 +99,27 @@ class WindowRegistry:
         await self.store.execute(
             "UPDATE window SET vdesktop_index=?, vdesktop_name=? WHERE window_uid=?",
             (vdesktop_index, vdesktop_name, window_uid))
+
+    async def set_app_name(self, window_uid: int, app_name: str | None,
+                           now: float | None = None) -> None:
+        """Cache the app/process name on the window row and record history for search.
+
+        Only writes a new app_name_history row when the value actually changes,
+        so repeated captures of the same window don't spam the FTS table.
+        """
+        now = time.time() if now is None else now
+        row = await self.store.fetchone(
+            "SELECT app_name FROM window WHERE window_uid=?", (window_uid,))
+        if row is None:
+            return
+        if row[0] == app_name:
+            return
+        await self.store.execute(
+            "UPDATE window SET app_name=? WHERE window_uid=?",
+            (app_name, window_uid))
+        self.store.enqueue(
+            "INSERT INTO app_name_history(window_uid, app_name, changed_at) VALUES(?,?,?)",
+            (window_uid, app_name, now))
 
     # ───────────────────────── liveness ─────────────────────────
     async def mark_dead(self, x_window_id: int, now: float | None = None) -> None:

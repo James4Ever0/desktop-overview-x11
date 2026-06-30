@@ -13,6 +13,7 @@ import asyncio
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 _TMP = tempfile.mkdtemp(prefix="dovw-test-api-")
@@ -44,15 +45,20 @@ async def _seed(store):
     rid = await store.execute(
         "INSERT INTO daemon_run(daemon_boot_id, session_key, started_at) VALUES('b','sess',1.0)")
 
-    async def win(xid, sess, alive, last_seen, wm, vidx=None, vname=None):
-        return await store.execute(
+    async def win(xid, sess, alive, last_seen, wm, vidx=None, vname=None, app_name=None):
+        uid = await store.execute(
             "INSERT INTO window(session_key, first_daemon_run_id, last_daemon_run_id,"
-            " x_window_id, wm_class, vdesktop_index, vdesktop_name, first_seen, last_seen, alive) VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (sess, rid, rid, xid, wm, vidx, vname, 1.0, last_seen, alive))
+            " x_window_id, wm_class, app_name, vdesktop_index, vdesktop_name, first_seen, last_seen, alive) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (sess, rid, rid, xid, wm, app_name, vidx, vname, 1.0, last_seen, alive))
+        if app_name:
+            await store.execute(
+                "INSERT INTO app_name_history(window_uid, app_name, changed_at) VALUES(?,?,?)",
+                (uid, app_name, last_seen))
+        return uid
 
-    a = await win(0xABCDE, "sess", 1, 300.0, "firefox", 1, "Web")    # alive, this session → jumpable
-    b = await win(0xBBBBB, "sess", 0, 200.0, "code", 1, "Web")        # dead
-    c = await win(0xCCCCC, "other", 1, 250.0, "mail", 1, "Web")       # different session
+    a = await win(0xABCDE, "sess", 1, 300.0, "firefox", 1, "Web", "firefox")    # alive, this session → jumpable
+    b = await win(0xBBBBB, "sess", 0, 200.0, "code", 1, "Web", "code")        # dead
+    c = await win(0xCCCCC, "other", 1, 250.0, "mail", 1, "Web", "mail")       # different session
     for uid, title, t in [(a, "Inbox — invoice 2026", 110.0),
                           (b, "draft document", 120.0),
                           (c, "mail client", 130.0)]:
@@ -101,6 +107,12 @@ async def test_search_pipeline(store, a, b, c):
     check("assembled current title", ra["current_title"] == "Inbox — invoice 2026")
     check("assembled vdesktop", ra["vdesktop"]["name"] == "Web")
     check("window_capture_url present", ra["window_capture_url"] == f"/windows/{a}/window_capture/latest")
+    check("assembled app_name", ra["app_name"] == "firefox")
+
+    # app_name field search
+    app_only = await search.search(store, q="firefox", fields=["app_name"],
+                                   current_session_key="sess")
+    check("fields=app_name finds window a", {r["window_uid"] for r in app_only} == {a})
 
     # field subset
     only_kbd = await search.search(store, q="invoice", fields=["keyboard"],
@@ -163,6 +175,7 @@ async def test_list_and_timeline(store, a, b, c):
     check("timeline has a lane per focused window", {a, b, c} <= set(lanes))
     check("lane carries focus spans", len(lanes[a]["focus_spans"]) == 1)
     check("lane carries title history", lanes[a]["titles"][0]["title"] == "Inbox — invoice 2026")
+    check("lane carries app_name", lanes[a].get("app_name") == "firefox")
     tl_one = await search.timeline(store, window_uid=a, current_session_key="sess")
     check("timeline window_uid scopes to one lane", [l["window_uid"] for l in tl_one] == [a])
 
@@ -253,6 +266,60 @@ async def test_api(store, a, b, c):
         check("activate vanished window -> reason vanished", r.json()["reason"] == "vanished")
 
 
+async def test_focus_score_and_usage(store, a, b, c):
+    print("[search] focus_score + usage sorts")
+    # Use a large heartbeat interval so a handful of rows produce whole minutes.
+    store.s.heartbeat_interval_s = 60.0
+    now = 2000.0
+    original_time = search.time.time
+    search.time.time = lambda: now
+    try:
+        # five focused minutes for window a within the last 5 min
+        for offset in (30, 90, 150, 210, 270):
+            await store.execute(
+                "INSERT INTO window_heartbeat(daemon_boot_id, window_uid, x_window_id, ts)"
+                " VALUES(?,?,?,?)", ("b", a, 0xABCDE, now - offset))
+        # one focused minute for window b (counts in 10m/30m, not 5m)
+        await store.execute(
+            "INSERT INTO window_heartbeat(daemon_boot_id, window_uid, x_window_id, ts)"
+            " VALUES(?,?,?,?)", ("b", b, 0xBBBBB, now - 400))
+
+        # recency: a is most recent, then b, then c
+        for uid, t in [(a, now - 10), (b, now - 60), (c, now - 120)]:
+            await store.execute(
+                "INSERT INTO focus_event(window_uid, vdesktop_index, vdesktop_name, focused_at)"
+                " VALUES(?,?,?,?)", (uid, 1, "Web", t))
+
+        wins = await search.list_windows(store, current_session_key="sess")
+        by_uid = {w["window_uid"]: w for w in wins}
+        check("window a has 5m usage 5.0", by_uid[a].get("usage_5m") == 5.0)
+        check("window a has total usage 5.0", by_uid[a].get("usage_total") == 5.0)
+        check("window b has 5m usage 0.0", by_uid[b].get("usage_5m") == 0.0)
+        check("window b has total usage 1.0", by_uid[b].get("usage_total") == 1.0)
+
+        by_fs = await search.list_windows(store, sort="focus_score", order="desc",
+                                          current_session_key="sess")
+        check("focus_score desc order", [w["window_uid"] for w in by_fs[:3]] == [a, b, c])
+        by_fs_asc = await search.list_windows(store, sort="focus_score", order="asc",
+                                              current_session_key="sess")
+        check("focus_score asc order", [w["window_uid"] for w in by_fs_asc[:3]] == [c, b, a])
+
+        by_tot = await search.list_windows(store, sort="usage_total", order="desc",
+                                           current_session_key="sess")
+        check("usage_total desc order", [w["window_uid"] for w in by_tot[:3]] == [a, b, c])
+
+        srch = await search.search(store, q="invoice", sort="focus_score", order="desc",
+                                   current_session_key="sess")
+        check("search sort=focus_score desc", [w["window_uid"] for w in srch] == [a, b])
+
+        tl = await search.timeline(store, sort="focus_score", order="desc",
+                                   current_session_key="sess")
+        check("timeline sort=focus_score desc",
+              [l["window_uid"] for l in tl[:3]] == [a, b, c])
+    finally:
+        search.time.time = original_time
+
+
 async def main():
     s = Settings()
     store = Store(s)
@@ -260,6 +327,7 @@ async def main():
     a, b, c = await _seed(store)
     await test_search_pipeline(store, a, b, c)
     await test_list_and_timeline(store, a, b, c)
+    await test_focus_score_and_usage(store, a, b, c)
     await test_api(store, a, b, c)
     await store.close()
     print(f"\n{'ALL PASS' if _fails == 0 else str(_fails) + ' FAILED'}  (temp dir {_TMP})")

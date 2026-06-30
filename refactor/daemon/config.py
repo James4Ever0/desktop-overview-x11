@@ -76,6 +76,16 @@ class Settings:
         "Desktop — Plasma",
     )
 
+    # --- §3c heartbeat / usage rate ---
+    heartbeat_interval_s: float = 10.0     # record focused-window snapshot every N seconds
+
+    # --- §3d focus score ---
+    focus_score_w5: float = 0.5
+    focus_score_w10: float = 0.3
+    focus_score_w30: float = 0.2
+    focus_score_usage_weight: float = 0.6
+    focus_score_recency_weight: float = 0.4
+
     # --- §4 storage, db & search ---
     write_queue_max_n: int = 200
     write_queue_max_wait_s: float = 0.05   # batch window: lower = fresher, higher = fewer fsyncs
