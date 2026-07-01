@@ -112,6 +112,7 @@ class TimelineView:
     ARROW_SHIFT_STEP_PX = 100
     MAX_EVENTS_IN_HOVER = 20
     HOVER_MAX_LINES = 14
+    STICKY_MARGIN = LANE_H // 4
 
     def __init__(self, parent, app, theme, api, *, scale=None, indicator_time=None):
         self.app = app
@@ -164,7 +165,17 @@ class TimelineView:
                                       highlightthickness=0, height=SCALE_H)
         self.canvas = tk.Canvas(self.frame, bg=self.theme["tile_bg"], highlightthickness=0)
         self.vbar = ttk.Scrollbar(self.frame, orient=tk.VERTICAL, command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=self.vbar.set)
+        self.canvas.configure(yscrollcommand=self._on_canvas_scroll)
+
+        # sticky indicator for the active lane when it is scrolled off-screen
+        self._sticky_frame = tk.Frame(self.canvas, bg=self.theme["tile_bg"],
+                                      highlightthickness=1,
+                                      highlightbackground=self.theme["indicator"])
+        self._sticky_text = tk.Label(self._sticky_frame, text="", bg=self.theme["tile_bg"],
+                                     fg=self.theme["fg"], anchor="w",
+                                     font=("TkDefaultFont", 9))
+        self._sticky_text.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        self._sticky_frame.place_forget()
 
         self.scale_canvas.grid(row=0, column=0, columnspan=2, sticky="ew")
         self.canvas.grid(row=1, column=0, sticky="nsew")
@@ -376,6 +387,50 @@ class TimelineView:
         if self.range_callback:
             self.range_callback(*self._visible_time_range())
 
+    def _on_canvas_scroll(self, *args):
+        """Forward vertical scroll to the scrollbar and update the sticky hit indicator."""
+        self.vbar.set(*args)
+        self._update_sticky()
+
+    def _update_sticky(self):
+        """Show a sticky label at the top/bottom of the lane viewport when the active lane is off-screen."""
+        if self._active_lane is None or not self.lanes:
+            self._sticky_frame.place_forget()
+            return
+        try:
+            idx = self.lanes.index(self._active_lane)
+        except ValueError:
+            self._sticky_frame.place_forget()
+            return
+
+        lane_top = PAD + idx * (LANE_H + PAD)
+        lane_center = lane_top + LANE_H / 2
+        vis_top = self.canvas.canvasy(0)
+        vis_bottom = self.canvas.canvasy(self.canvas.winfo_height())
+        M = self.STICKY_MARGIN
+
+        if lane_center < vis_top + M:
+            pos = "top"
+        elif lane_center > vis_bottom - M:
+            pos = "bottom"
+        else:
+            self._sticky_frame.place_forget()
+            return
+
+        lane = self._active_lane
+        label = f"{lane.app_name or lane.wm_class or '?'} — {lane.current_title or '(no title)'}"
+        self._sticky_text.configure(text=label[:80])
+
+        base_x = self._x_offset()
+        width = max(1, self.canvas.winfo_width() - base_x)
+        self._sticky_frame.configure(width=width)
+
+        if pos == "top":
+            self._sticky_frame.place(x=base_x, y=0, anchor="nw", width=width)
+        else:
+            self._sticky_frame.place(x=base_x, y=self.canvas.winfo_height(), anchor="sw", width=width)
+        self._sticky_frame.lift()
+
     # ───────────────────────── rendering ─────────────────────────
     def _on_configure(self, _event=None):
         self._draw()
@@ -399,6 +454,7 @@ class TimelineView:
         self.scale_canvas.configure(scrollregion=(0, 0, virtual_w, SCALE_H))
         self.canvas.configure(scrollregion=(0, 0, virtual_w, lanes_h))
         self._notify_range()
+        self._update_sticky()
 
     def _draw_scale(self):
         t0, t1 = self._visible_time_range()

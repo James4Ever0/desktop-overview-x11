@@ -147,3 +147,7 @@ can we make the substring matching search mechanism be like: first do a full sea
 ---
 
 improve image compression rate of screenshots
+
+---
+
+display help question mark button on the top right corner, to display all operation hints, including those shift to move to hover window, knob meanings, timeline navigations. next to refresh button

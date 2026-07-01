@@ -110,3 +110,7 @@ what about the default behavior when initializing timeline view for the first ti
 effect on timeline red line hit:
 
 if the hit item is above the visible lanes, sticky to the visible lane area on top. if the hit item is below the visible lanes, sticky on bottom. if the hit item is visible in the area do not do sticky things.
+
+---
+
+still not being to fix the ui, make it non-resizable by default.
