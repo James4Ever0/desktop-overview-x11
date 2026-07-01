@@ -150,6 +150,7 @@ def _palette(theme: dict) -> dict:
         "event_clipboard": theme.get("event_clipboard", "#ffcc00"),
         "event_selection": theme.get("event_selection", "#ffcc00"),
         "event_keyboard": theme.get("event_keyboard", "#2a5a8a"),
+        "active_lane_bg": theme.get("active_lane_bg", "#331111"),
         "canvas_bg": theme["bg"], "entry_bg": theme["tile_bg"], "entry_fg": theme["fg"],
         "select_bg": theme["accent"], "tip_border": theme["accent"],
         "tip_bg": theme["bg"], "tiptitle_bg": theme["tile_bg"], "tiptitle_fg": theme["fg"],
@@ -166,6 +167,7 @@ class WindowPreviewApp(tk.Tk):
         self.theme = _palette(settings.theme)
         self.title("Desktop Overview — search")
         self.geometry(APP_GEOMETRY)
+        self.resizable(self.s.resizable, self.s.resizable)
 
         self._setup_fonts()
         self._apply_theme()
@@ -397,6 +399,11 @@ class WindowPreviewApp(tk.Tk):
         self.search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4, ipady=6)
         self.search_entry.bind("<KeyRelease>", self.on_search_key)
         self.search_entry.bind("<Control-a>", self._select_all)
+
+        # non-editable timeline viewable range label, shown in place of the search box
+        self._timeline_range_var = tk.StringVar(value="")
+        self._timeline_range_lbl = ttk.Label(
+            bar, textvariable=self._timeline_range_var, font=self.search_font)
 
         self.refresh_btn = ttk.Button(bar, text="Refresh", command=self.on_refresh)
         self.refresh_btn.pack(side=tk.RIGHT, padx=4)
@@ -693,6 +700,10 @@ class WindowPreviewApp(tk.Tk):
         if view is not None:
             view.scale_callback = self._on_timeline_scale
             view.indicator_callback = self._on_timeline_indicator
+            view.range_callback = self._on_timeline_range
+
+    def _on_timeline_range(self, t0: float, t1: float):
+        self._timeline_range_var.set(f"{_fmt_ts(t0)}  →  {_fmt_ts(t1)}")
 
     def _on_timeline_scale(self, scale: float):
         self.view_state["t_scale"] = scale
@@ -1056,6 +1067,7 @@ class WindowPreviewApp(tk.Tk):
                 cb.pack(side=tk.LEFT, padx=2)
             self._hits_cb.pack(side=tk.LEFT, padx=(8, 2))
             self.scope_label.pack(side=tk.LEFT, padx=8)
+            self._timeline_range_lbl.pack_forget()
             for w in self._timeline_filters:
                 w.pack_forget()
         else:
@@ -1066,6 +1078,7 @@ class WindowPreviewApp(tk.Tk):
                 cb.pack_forget()
             self._hits_cb.pack_forget()
             self.scope_label.pack_forget()
+            self._timeline_range_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
             for w in self._timeline_filters:
                 w.pack(side=tk.LEFT, padx=2)
 
@@ -1148,7 +1161,9 @@ class WindowPreviewApp(tk.Tk):
                 log.debug("image hover Right arrow recognised -> next capture")
                 self._navigate_preview(-1)  # next (newer) capture
                 return "break"
-        if event.char and len(event.char) == 1 and (event.char.isprintable() or event.char == " "):
+        if (self.view_state.get("view") == "search"
+                and event.char and len(event.char) == 1
+                and (event.char.isprintable() or event.char == " ")):
             self.search_entry.focus_set()
             self.search_entry.insert(tk.INSERT, event.char)
             self.on_search_key(event)

@@ -25,7 +25,6 @@ BAR_H = 18
 PAD = 6
 SCALE_H = 30
 
-
 def render_timeline(app, lanes: list, parent=None) -> TimelineView | None:
     """Render or refresh the interactive timeline view inside ``app.timeline_frame``."""
     parent = parent or getattr(app, "inner_frame", None)
@@ -66,6 +65,42 @@ def _truncate(text: str | None, n: int = 120) -> str:
     return text if len(text) <= n else text[:n].rstrip() + "…"
 
 
+def _fmt_minutes(minutes: float | None) -> str:
+    """Convert minutes into 'X d X h X m', dropping zero units except minutes."""
+    if minutes is None or minutes <= 0:
+        return "0 m"
+    total = int(round(minutes))
+    days, rem = divmod(total, 1440)
+    hours, mins = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days} d")
+    if hours:
+        parts.append(f"{hours} h")
+    parts.append(f"{mins} m")
+    return " ".join(parts)
+
+
+def _fmt_usage_lane(lane) -> str:
+    """Compact usage line for a timeline lane (5m/10m/30m/1d + total + focus score)."""
+    labels = ("5m", "10m", "30m", "1d")
+    vals = [getattr(lane, f"usage_{lbl}", None) for lbl in labels]
+    if all(v is None for v in vals):
+        base = ""
+    else:
+        base = " ".join(f"{lbl}:{v if v is not None else '—'}" for lbl, v in zip(labels, vals))
+    total = getattr(lane, "usage_total", None)
+    score = getattr(lane, "focus_score", None)
+    parts = []
+    if base:
+        parts.append(base)
+    if total is not None:
+        parts.append(f"tot:{_fmt_minutes(total)}")
+    if score is not None:
+        parts.append(f"score:{score:.2f}")
+    return "  |  ".join(parts)
+
+
 class TimelineView:
     """Interactive timeline: zoom, pan, red indicator, focus-span hover detail."""
 
@@ -94,8 +129,11 @@ class TimelineView:
         self._span_items: dict[int, tuple[int, int]] = {}
         self._label_items: dict[int, int] = {}
         self._indicator_id: int | None = None
+        self._indicator_id_scale: int | None = None
         self._indicator_text_id: int | None = None
         self._indicator_text_bg_id: int | None = None
+        self._active_span: dict | None = None
+        self._active_lane = None
         self._drag_mode: str | None = None
         self._pan_start_x = 0.0
         self._pan_start_time = 0.0
@@ -111,6 +149,7 @@ class TimelineView:
 
         self.scale_callback = None
         self.indicator_callback = None
+        self.range_callback = None
 
         self._build_widgets()
         self._bind_events()
@@ -120,14 +159,56 @@ class TimelineView:
         self.frame = ttk.Frame(self.parent, style="Tile.TFrame")
         self.frame.grid(row=0, column=0, sticky="nsew")
 
+        # top scale strip stays fixed; lanes canvas scrolls vertically underneath
+        self.scale_canvas = tk.Canvas(self.frame, bg=self.theme["tile_bg"],
+                                      highlightthickness=0, height=SCALE_H)
         self.canvas = tk.Canvas(self.frame, bg=self.theme["tile_bg"], highlightthickness=0)
         self.vbar = ttk.Scrollbar(self.frame, orient=tk.VERTICAL, command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=self.vbar.set)
 
-        self.canvas.grid(row=0, column=0, sticky="nsew")
-        self.vbar.grid(row=0, column=1, sticky="ns")
-        self.frame.rowconfigure(0, weight=1)
+        self.scale_canvas.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self.canvas.grid(row=1, column=0, sticky="nsew")
+        self.vbar.grid(row=1, column=1, sticky="ns")
+
+        # white 1 px split line between the lanes and the sticky details panel
+        self.sep_line = tk.Frame(self.frame, bg="#ffffff", height=1)
+        self.sep_line.grid(row=2, column=0, columnspan=2, sticky="ew")
+
+        # bottom details panel: 1/4 of vertical space, lanes get the other 3/4
+        self.details_frame = ttk.Frame(self.frame, style="Tile.TFrame")
+        self.details_frame.grid(row=3, column=0, columnspan=2, sticky="nsew")
+        self.details_text = tk.Text(self.details_frame, wrap="word", bd=0, height=1,
+                                    bg=self.theme["tile_bg"], fg=self.theme["fg"],
+                                    highlightthickness=0, padx=8, pady=6,
+                                    font=("TkDefaultFont", 9))
+        self.details_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.details_text.tag_configure("header", foreground=self.theme["accent"], font=("TkDefaultFont", 9, "bold"))
+        self.details_text.tag_configure("time", foreground=self.theme["muted"])
+        self.details_text.tag_configure("field", foreground=self.theme["accent"])
+        self.details_text.tag_configure("mark", background=self.theme["mark_bg"])
+        self.details_scroll = ttk.Scrollbar(self.details_frame, orient=tk.VERTICAL,
+                                            command=self.details_text.yview)
+        self.details_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.details_text.configure(yscrollcommand=self.details_scroll.set)
+        self._bind_text_scroll(self.details_text)
+
+        self.frame.rowconfigure(1, weight=3)
+        self.frame.rowconfigure(3, weight=1)
         self.frame.columnconfigure(0, weight=1)
+
+    def _bind_text_scroll(self, text: tk.Text):
+        """Bind wheel events on a disabled/small Text so it scrolls itself."""
+        def _scroll(event):
+            if event.num == 4:
+                text.yview_scroll(-1, "units")
+            elif event.num == 5:
+                text.yview_scroll(1, "units")
+            elif event.delta:
+                text.yview_scroll(-1 if event.delta > 0 else 1, "units")
+            return "break"
+        text.bind("<MouseWheel>", _scroll)
+        text.bind("<Button-4>", _scroll)
+        text.bind("<Button-5>", _scroll)
 
     def _bind_events(self):
         self.canvas.bind("<Configure>", self._on_configure)
@@ -148,6 +229,15 @@ class TimelineView:
         self.canvas.bind("<Down>", self._on_down)
         self.canvas.bind("<Enter>", lambda _e: self.canvas.focus_set())
 
+        # the fixed scale strip should also drive zoom / indicator placement
+        self.scale_canvas.bind("<MouseWheel>", self._on_wheel)
+        self.scale_canvas.bind("<Button-4>", self._on_wheel)
+        self.scale_canvas.bind("<Button-5>", self._on_wheel)
+        self.scale_canvas.bind("<Button-1>", self._on_press)
+        self.scale_canvas.bind("<B1-Motion>", self._on_drag)
+        self.scale_canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.scale_canvas.bind("<Enter>", lambda _e: self.canvas.focus_set())
+
     # ───────────────────────── public state ─────────────────────────
     def set_lanes(self, lanes: list):
         self._cancel_hover()
@@ -158,7 +248,9 @@ class TimelineView:
         self.indicator_time = max(self.t_min, min(self.indicator_time, self.t_max))
 
         if not self.lanes:
+            self.scale_canvas.delete("all")
             self.canvas.delete("all")
+            self._notify_range()
             return
 
         # First load: current time at the right edge, fixed initial zoom.
@@ -280,22 +372,33 @@ class TimelineView:
         w = self._canvas_width()
         return self._t_of(0), self._t_of(w)
 
+    def _notify_range(self):
+        if self.range_callback:
+            self.range_callback(*self._visible_time_range())
+
     # ───────────────────────── rendering ─────────────────────────
     def _on_configure(self, _event=None):
         self._draw()
 
     def _draw(self):
+        self.scale_canvas.delete("all")
         self.canvas.delete("all")
         self._span_items.clear()
         self._label_items.clear()
+        old_span, old_lane = self._active_span, self._active_lane
+        self._active_span, self._active_lane = self._span_at_indicator()
+        if self._active_key(self._active_span, self._active_lane) != self._active_key(old_span, old_lane):
+            self._update_details_panel()
         if not self.lanes:
             return
         self._draw_scale()
         self._draw_lanes()
         self._draw_indicator()
         virtual_w = self._x_offset() + (self.t_max - self.t_min) / self.scale + PAD
-        virtual_h = SCALE_H + len(self.lanes) * (LANE_H + PAD) + PAD
-        self.canvas.configure(scrollregion=(0, 0, virtual_w, virtual_h))
+        lanes_h = len(self.lanes) * (LANE_H + PAD) + PAD
+        self.scale_canvas.configure(scrollregion=(0, 0, virtual_w, SCALE_H))
+        self.canvas.configure(scrollregion=(0, 0, virtual_w, lanes_h))
+        self._notify_range()
 
     def _draw_scale(self):
         t0, t1 = self._visible_time_range()
@@ -308,7 +411,7 @@ class TimelineView:
         while t <= t1:
             x = self._x_of(t)
             if x >= x_left - 1:
-                self.canvas.create_line(x, SCALE_H - 8, x, SCALE_H, fill=self.theme["muted"])
+                self.scale_canvas.create_line(x, SCALE_H - 8, x, SCALE_H, fill=self.theme["muted"])
             t += minor
 
         # major ticks + labels
@@ -316,17 +419,24 @@ class TimelineView:
         while t <= t1:
             x = self._x_of(t)
             if x >= x_left - 1:
-                self.canvas.create_line(x, 0, x, SCALE_H, fill=self.theme["fg"])
+                self.scale_canvas.create_line(x, 0, x, SCALE_H, fill=self.theme["fg"])
                 label = self._scale_label(t, major)
-                self.canvas.create_text(x + 4, 2, text=label, anchor="nw",
+                self.scale_canvas.create_text(x + 4, 2, text=label, anchor="nw",
                                         fill=self.theme["fg"])
             t += major
 
         # baseline under the scale
-        self.canvas.create_line(x_left, SCALE_H,
+        self.scale_canvas.create_line(x_left, SCALE_H,
                                 max(x_left, self._x_offset() + (self.t_max - self.t_min) / self.scale + PAD),
                                 SCALE_H,
                                 fill=self.theme["tile_border"])
+
+        # hit/miss badge in the leftmost blank space
+        hit = self._active_span is not None
+        self.scale_canvas.create_text(PAD, 2,
+                                      text="hit" if hit else "miss",
+                                      anchor="nw",
+                                      fill=self.theme["indicator"] if hit else self.theme["muted"])
 
     def _pick_step(self, min_px: int) -> float:
         candidates = [
@@ -350,12 +460,12 @@ class TimelineView:
         return dt.strftime("%b %Y")
 
     def _draw_lanes(self):
-        y = SCALE_H + PAD
+        y = PAD
         for i, lane in enumerate(self.lanes):
-            self._draw_lane(i, lane, y)
+            self._draw_lane(i, lane, y, active=(lane is self._active_lane))
             y += LANE_H + PAD
 
-    def _draw_lane(self, idx: int, lane, y: int):
+    def _draw_lane(self, idx: int, lane, y: int, active: bool = False):
         x_left = self._x_offset()
 
         # lane separator / axis
@@ -407,50 +517,62 @@ class TimelineView:
             self.canvas.create_line(x, y0, x, y1, fill=color, width=2)
 
         # solid background for the label column, on top of any bars/ticks
-        self.canvas.create_rectangle(0, y, x_left, y + LANE_H,
-                                     fill=self.theme["tile_bg"], outline="",
-                                     tags=("mask",), state=tk.DISABLED)
+        label_bg = self.theme["active_lane_bg"] if active else self.theme["tile_bg"]
+        mask_id = self.canvas.create_rectangle(0, y, x_left, y + LANE_H,
+                                               fill=label_bg, outline="",
+                                               tags=("mask", "lane_label"), state=tk.DISABLED)
+        self._label_items[mask_id] = idx
 
-        # window title text on top of everything
+        # window title text on top of everything; highlight if this lane is active
         label = f"{lane.app_name or lane.wm_class or '?'} — {lane.current_title or '(no title)'}"
-        colour = self.theme["alive"] if lane.alive and lane.jumpable else self.theme["dead"]
+        if active:
+            colour = "#ffffff"
+            font = ("TkDefaultFont", 9, "bold")
+        else:
+            colour = self.theme["alive"] if lane.alive and lane.jumpable else self.theme["dead"]
+            font = ("TkDefaultFont", 9)
         label_id = self.canvas.create_text(PAD, y + LANE_H // 2, text=label[:48], anchor="w",
-                                fill=colour, width=LABEL_W - PAD, tags=("lane_label",))
+                                fill=colour, font=font, width=LABEL_W - PAD, tags=("lane_label",))
         self._label_items[label_id] = idx
-        log.debug("drew lane %d label_id=%s text=%r", idx, label_id, label[:48])
+        log.debug("drew lane %d label_id=%s text=%r active=%s", idx, label_id, label[:48], active)
 
     def _draw_indicator(self):
         self._delete_indicator()
         x_left = self._x_offset()
         x = max(x_left, self._x_of(self.indicator_time))
-        y1 = SCALE_H
-        y2 = SCALE_H + len(self.lanes) * (LANE_H + PAD) + PAD
+        lanes_h = len(self.lanes) * (LANE_H + PAD) + PAD
         self._indicator_id = self.canvas.create_line(
-            x, y1, x, y2, fill=self.theme["indicator"], width=1,
+            x, 0, x, lanes_h, fill=self.theme["indicator"], width=1,
+            dash=(4, 4), tags=("indicator",))
+        self._indicator_id_scale = self.scale_canvas.create_line(
+            x, 0, x, SCALE_H, fill=self.theme["indicator"], width=1,
             dash=(4, 4), tags=("indicator",))
         if x >= x_left:
             text = _fmt_ts(self.indicator_time)
             tx = x - 4
-            ty = 2
-            self._indicator_text_id = self.canvas.create_text(
-                tx, ty, text=text, anchor="ne",
+            self._indicator_text_id = self.scale_canvas.create_text(
+                tx, 2, text=text, anchor="ne",
                 fill=self.theme["indicator"], tags=("indicator",))
-            self.canvas.update_idletasks()
-            bbox = self.canvas.bbox(self._indicator_text_id)
+            self.scale_canvas.update_idletasks()
+            bbox = self.scale_canvas.bbox(self._indicator_text_id)
             if bbox:
                 pad = 2
-                self._indicator_text_bg_id = self.canvas.create_rectangle(
+                self._indicator_text_bg_id = self.scale_canvas.create_rectangle(
                     bbox[0] - pad, bbox[1] - pad,
                     bbox[2] + pad, bbox[3] + pad,
                     fill=self.theme["bg"], outline="#ffffff", width=1,
                     tags=("indicator",))
-                self.canvas.lower(self._indicator_text_bg_id, self._indicator_text_id)
+                self.scale_canvas.lower(self._indicator_text_bg_id, self._indicator_text_id)
 
     def _delete_indicator(self):
-        for attr in ("_indicator_id", "_indicator_text_id", "_indicator_text_bg_id"):
+        items = ((self.canvas, "_indicator_id"),
+                 (self.scale_canvas, "_indicator_id_scale"),
+                 (self.scale_canvas, "_indicator_text_id"),
+                 (self.scale_canvas, "_indicator_text_bg_id"))
+        for canvas, attr in items:
             item = getattr(self, attr, None)
             if item is not None:
-                self.canvas.delete(item)
+                canvas.delete(item)
                 setattr(self, attr, None)
 
     def _update_indicator(self):
@@ -460,25 +582,122 @@ class TimelineView:
             coords = self.canvas.coords(self._indicator_id)
             if len(coords) == 4:
                 self.canvas.coords(self._indicator_id, x, coords[1], x, coords[3])
+        if self._indicator_id_scale is not None:
+            coords = self.scale_canvas.coords(self._indicator_id_scale)
+            if len(coords) == 4:
+                self.scale_canvas.coords(self._indicator_id_scale, x, coords[1], x, coords[3])
         if self._indicator_text_id is not None:
             tx = x - 4
-            self.canvas.coords(self._indicator_text_id, tx, 2)
-            self.canvas.itemconfigure(self._indicator_text_id, text=_fmt_ts(self.indicator_time))
-            self.canvas.update_idletasks()
-            bbox = self.canvas.bbox(self._indicator_text_id)
+            self.scale_canvas.coords(self._indicator_text_id, tx, 2)
+            self.scale_canvas.itemconfigure(self._indicator_text_id, text=_fmt_ts(self.indicator_time))
+            self.scale_canvas.update_idletasks()
+            bbox = self.scale_canvas.bbox(self._indicator_text_id)
             if bbox:
                 pad = 2
                 if self._indicator_text_bg_id is None:
-                    self._indicator_text_bg_id = self.canvas.create_rectangle(
+                    self._indicator_text_bg_id = self.scale_canvas.create_rectangle(
                         bbox[0] - pad, bbox[1] - pad,
                         bbox[2] + pad, bbox[3] + pad,
                         fill=self.theme["bg"], outline="#ffffff", width=1,
                         tags=("indicator",))
-                    self.canvas.lower(self._indicator_text_bg_id, self._indicator_text_id)
+                    self.scale_canvas.lower(self._indicator_text_bg_id, self._indicator_text_id)
                 else:
-                    self.canvas.coords(self._indicator_text_bg_id,
+                    self.scale_canvas.coords(self._indicator_text_bg_id,
                                        bbox[0] - pad, bbox[1] - pad,
                                        bbox[2] + pad, bbox[3] + pad)
+        # Red line may have moved into/out of a focus span; refresh details + highlight only when the active span changes.
+        old_key = self._active_key(self._active_span, self._active_lane)
+        new_span, new_lane = self._span_at_indicator()
+        new_key = self._active_key(new_span, new_lane)
+        self._active_span, self._active_lane = new_span, new_lane
+        if new_key != old_key:
+            self._update_details_panel()
+            self._draw()
+
+    def _active_key(self, span, lane):
+        """Stable value-based key for the currently highlighted focus span/lane."""
+        if span is None or lane is None:
+            return None
+        return (getattr(lane, "window_uid", None), span.get("focused_at"), span.get("ended_at"))
+
+    def _span_at_indicator(self):
+        """Return the focus span (and its lane) that contains the red-line time, if any."""
+        for lane in self.lanes:
+            for sp in lane.focus_spans:
+                start = sp.get("focused_at")
+                end = sp.get("ended_at")
+                if start is None:
+                    continue
+                if end is None:
+                    end = start
+                if start <= self.indicator_time <= end:
+                    return sp, lane
+        return None, None
+
+    def _update_details_panel(self):
+        """Fill the sticky bottom panel with details for the active focus span."""
+        top = self.details_text.yview()[0]
+        self.details_text.configure(state="normal")
+        self.details_text.delete("1.0", tk.END)
+        span, lane = self._active_span, self._active_lane
+        if span is None or lane is None:
+            self.details_text.insert(tk.END, "No focused window event at the red line.", "time")
+        else:
+            self._fill_details(span, lane)
+        self.details_text.configure(state="disabled")
+        self.details_text.yview_moveto(top)
+
+    def _fill_details(self, span: dict, lane):
+        box = self.details_text
+        start = span.get("focused_at")
+        end = span.get("ended_at") or start
+        app = lane.app_name or lane.wm_class or "?"
+        title = lane.current_title or "(no title)"
+        box.insert(tk.END, f"{app} — {title}\n", "header")
+
+        status = "accessible" if lane.alive and lane.jumpable else ("dead" if not lane.alive else "other session")
+        box.insert(tk.END, f"status: {status}\n")
+
+        vd_index = span.get("vdesktop_index")
+        vd_name = span.get("vdesktop_name")
+        if vd_index is not None:
+            box.insert(tk.END, f"desktop: [{vd_index}: {vd_name or '?'}]\n")
+
+        box.insert(tk.END, "focus span: ", "field")
+        box.insert(tk.END, f"{_fmt_ts(start)}  →  {_fmt_ts(end)}")
+        if start is not None and end is not None:
+            box.insert(tk.END, f"  ({_fmt_minutes((end - start) / 60.0)})\n")
+        else:
+            box.insert(tk.END, "\n")
+
+        usage = _fmt_usage_lane(lane)
+        if usage:
+            box.insert(tk.END, f"{usage}\n")
+
+        def in_span(ts: float | None) -> bool:
+            return ts is not None and start is not None and end is not None and start <= ts <= end
+
+        # Title changes within the span
+        titles = [t for t in lane.titles if in_span(t.get("changed_at"))]
+        if titles:
+            box.insert(tk.END, "\nTitle changes\n", "header")
+            for t in titles[:20]:
+                box.insert(tk.END, f"[{_fmt_ts(t.get('changed_at'))}] ", "time")
+                box.insert(tk.END, f"{_truncate(t.get('title') or '')}\n")
+
+        # Grouped instantaneous events within the span
+        for typ, label in (("keyboard", "Keyboard events"),
+                           ("clipboard", "Clipboard events"),
+                           ("selection", "Selection events")):
+            evs = [e for e in lane.events if e.type == typ and in_span(e.ts)]
+            if evs:
+                box.insert(tk.END, f"\n{label}\n", "header")
+                for e in evs[:20]:
+                    box.insert(tk.END, f"[{_fmt_ts(e.ts)}] ", "time")
+                    if e.kind:
+                        box.insert(tk.END, f"{e.kind}: ", "field")
+                    body = _truncate(e.text or "") or "—"
+                    box.insert(tk.END, f"{body}\n")
 
     # ───────────────────────── zoom / pan ─────────────────────────
     def _zoom_to(self, new_scale: float, centre_t: float):

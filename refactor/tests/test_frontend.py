@@ -98,6 +98,11 @@ def test_parse_args():
     check("--no-hide-self turns hide_self off", s_off.hide_self is False)
     s_on = parse_args(["--hide-self"])
     check("--hide-self keeps hide_self on", s_on.hide_self is True)
+    check("resizable defaults to True", s.resizable is True)
+    s_nr = parse_args(["--no-resizable"])
+    check("--no-resizable disables resizing", s_nr.resizable is False)
+    s_r = parse_args(["--resizable"])
+    check("--resizable keeps resizing on", s_r.resizable is True)
 
 
 def _client_checks(uds: str, a: int, b: int):

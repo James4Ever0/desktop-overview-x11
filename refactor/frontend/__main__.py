@@ -36,6 +36,9 @@ def parse_args(argv=None) -> FrontendSettings:
                    help="hide the GUI's own window from results (default: on)")
     p.add_argument("--hide-self-method", choices=["id", "title_prefix"], default="id",
                    help="how to identify the GUI window: id (default) or title_prefix")
+    p.add_argument("--resizable", dest="resizable", action=argparse.BooleanOptionalAction,
+                   default=None,
+                   help="allow the main window to be resized (default: on)")
     p.add_argument("--log-level", default="info",
                    choices=["debug", "info", "warning", "error"])
     args = p.parse_args(argv)
@@ -57,6 +60,8 @@ def parse_args(argv=None) -> FrontendSettings:
         over["hide_self"] = args.hide_self
     if args.hide_self_method:
         over["hide_self_method"] = args.hide_self_method
+    if args.resizable is not None:
+        over["resizable"] = args.resizable
     s = s.with_overrides(**over) if over else s
     s._log_level = args.log_level   # type: ignore[attr-defined]
     return s

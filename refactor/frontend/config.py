@@ -37,6 +37,7 @@ DEFAULT_THEME = {
     "event_clipboard": "#ffcc00",
     "event_selection": "#ffcc00",
     "event_keyboard": "#2a5a8a",
+    "active_lane_bg": "#331111",
 }
 
 
@@ -63,6 +64,7 @@ class FrontendSettings:
     filter_no_vdesktop: bool = False       # hide windows without vdesktop in search/timeline
     hide_self: bool = True                # hide the GUI's own window from results
     hide_self_method: str = "id"          # "id" (x_window_id) or "title_prefix"
+    resizable: bool = True                # allow the main window to be resized
 
     def __post_init__(self) -> None:
         env_refresh = os.environ.get("DESKTOP_OVERVIEW_REFRESH_INTERVAL_S")
