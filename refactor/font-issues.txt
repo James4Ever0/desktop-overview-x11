@@ -1,0 +1,3 @@
+change font to fix chinese issues
+
+look for online help over chinese display font in tkinter tk python

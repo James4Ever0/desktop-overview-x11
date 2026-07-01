@@ -1,0 +1,5 @@
+use llm to recognize the ocr results, detect potential passwords or use regex?
+
+get the password-like thing, if it is password, record to database and perform quick cred removal next time before feeding into llm?
+
+or do a background censorship process, fast processor leads the way, llm follows

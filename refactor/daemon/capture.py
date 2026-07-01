@@ -51,15 +51,22 @@ def get_window_list() -> list[tuple[str, int, str]]:
     return windows
 
 
-def capture_window(win_id: str, title: str = "", max_dim: int | None = None):
+def capture_window(win_id: str, title: str = "", max_dim: int | None = None,
+                   timeout_s: float = 5.0):
     """``import -window <id> png:-`` → PIL Image (decoded), or None on failure.
 
     Blocking; runs in the executor.  Optionally downsizes so neither side exceeds
     ``max_dim`` (daemon-side cap replacing the demo's screen-relative cap).
+    ``timeout_s`` caps the subprocess so a destroyed window cannot hang forever.
     """
     cmd = ["import", "-window", win_id, "png:-"]
     t0 = time.perf_counter()
-    proc = subprocess.run(cmd, capture_output=True)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired as exc:
+        elapsed = (time.perf_counter() - t0) * 1000
+        log.warning("capture TIMEOUT %s (%s) %.0fms", win_id, title[:40], elapsed)
+        return None
     elapsed = (time.perf_counter() - t0) * 1000
     if proc.returncode != 0:
         stderr = proc.stderr.decode("utf-8", "replace").strip()
@@ -75,6 +82,20 @@ def capture_window(win_id: str, title: str = "", max_dim: int | None = None):
     if max_dim and (img.width > max_dim or img.height > max_dim):
         img.window_capture((max_dim, max_dim), Image.LANCZOS)
     return img
+
+
+def window_exists(win_id: str) -> bool:
+    """Cheap check that an X window id is still mapped (``xprop -id <id>``).
+
+    Returns False on any error so that a closing window is treated as gone.
+    """
+    try:
+        proc = subprocess.run(["xprop", "-id", win_id],
+                              capture_output=True, timeout=2)
+        return proc.returncode == 0
+    except Exception as exc:
+        log.debug("window_exists check failed for %s: %s", win_id, exc)
+        return False
 
 
 def get_app_name(win_id: str) -> str:

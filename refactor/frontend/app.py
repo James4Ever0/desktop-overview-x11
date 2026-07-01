@@ -137,6 +137,56 @@ SORT_LABELS = {v: k for k, v in SORT_OPTIONS}
 HOVER_POLL_MS = 120
 HOVER_MOVE_THRESHOLD_PX = 6
 
+HELP_TEXT = """\
+Desktop Overview — Keyboard & Mouse Shortcuts
+
+Global
+  ?               Open this help window.
+  Shift           Hold Shift to "freeze" a hover preview so you can move the
+                  mouse into it without it disappearing.
+
+Search view
+  Type            Focus the search box and search instantly.
+  Enter           Apply the search.
+  Ctrl+A          Select all text in the search box.
+  Left-click tile Jump to / activate that window.
+  Hover image     Show a larger screenshot preview.
+  Hover metadata  Show window details, usage, and recent hits.
+
+Timeline view
+  Left / Right         Move the red indicator line backward / forward.
+  Shift + Left / Right Move the indicator 10x faster.
+  Up / Down            Zoom in / out around the red line.
+  Ctrl + wheel         Zoom in / out at the cursor position.
+  Shift + wheel        Pan the time axis left / right.
+  Wheel                Scroll lanes up / down.
+  Right-drag           Pan the time axis.
+  Left-drag red line   Move the indicator to a chosen time.
+  Left-click lane label
+                       Jump to / activate that window.
+  Hover focus span     Show details + thumbnail for that focus period.
+  Hover lane label     Show a window summary.
+
+Control knobs
+  Fields          Which fields the search checks (title, app, clipboard,
+                  selection, keyboard).
+  Show            alive only / dead only / both.
+  all fields      Show every window, or only windows with search hits.
+  current desktop Hide windows not on the current virtual desktop.
+  hide self       Hide this Desktop Overview window from results.
+  current boot    Only show windows from the current boot session.
+  Sort / Order    Order the grid or timeline lanes.
+  Zoom (s/px)     Timeline scale: seconds per pixel.
+  Red line        Exact timestamp of the vertical indicator; editable.
+  Fit             Scale the timeline so the full data range fits the window.
+  Now             Jump the red line to the current time.
+
+Status colors
+  ● accessible    Window is alive and can be jumped to.
+  ○ dead          Window is no longer alive.
+  ○ other session Window exists but is not jumpable from here.
+"""
+
 
 def _palette(theme: dict) -> dict:
     """Expand config's theme into the full set of keys the demo UI used."""
@@ -405,6 +455,8 @@ class WindowPreviewApp(tk.Tk):
         self._timeline_range_lbl = ttk.Label(
             bar, textvariable=self._timeline_range_var, font=self.search_font)
 
+        self.help_btn = ttk.Button(bar, text="?", width=2, command=self._show_help)
+        self.help_btn.pack(side=tk.RIGHT, padx=4)
         self.refresh_btn = ttk.Button(bar, text="Refresh", command=self.on_refresh)
         self.refresh_btn.pack(side=tk.RIGHT, padx=4)
         self.status_var = tk.StringVar(value="ready")
@@ -895,11 +947,8 @@ class WindowPreviewApp(tk.Tk):
 
         def jump(_e=None, uid=w.window_uid):
             self.jump_to(uid)
-        def detail(_e=None, uid=w.window_uid):
-            self.open_window_scope(uid)
         for widget in (frame, img_label, title_label, app_label):
             widget.bind("<Button-1>", jump)
-            widget.bind("<Button-3>", detail)        # right-click → "search this window"
         self._update_tile(tile, w)
         self._load_window_capture(tile, w)
         return tile
@@ -1024,6 +1073,60 @@ class WindowPreviewApp(tk.Tk):
             self.status_var.set(f"captured {res.get('captured')}")
             self.render()
         self._submit(self.api.refresh_window_captures, done)
+
+    def _show_help(self):
+        """Open a non-modal help window with operation shortcuts and knob meanings."""
+        if getattr(self, "_help_window", None) and self._help_window.winfo_exists():
+            self._help_window.lift()
+            self._help_window.focus_force()
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Desktop Overview — Help")
+        win.configure(bg=self.theme["bg"])
+        win.transient(self)
+        win.geometry("620x520")
+        win.resizable(True, True)
+
+        frame = ttk.Frame(win)
+        frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        text = tk.Text(frame, wrap="word", bd=0,
+                       bg=self.theme["tile_bg"], fg=self.theme["fg"],
+                       highlightthickness=0, padx=8, pady=6,
+                       font=("TkDefaultFont", 10))
+        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        text.tag_configure("heading", foreground=self.theme["accent"],
+                           font=("TkDefaultFont", 10, "bold"))
+
+        sb = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=text.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        text.configure(yscrollcommand=sb.set)
+        self._bind_text_scroll(text)
+        self._block_wheel_on(win)
+
+        for raw in HELP_TEXT.splitlines():
+            line = raw.rstrip()
+            if not line:
+                text.insert(tk.END, "\n")
+            elif not line.startswith(" "):
+                text.insert(tk.END, line + "\n", "heading")
+            else:
+                text.insert(tk.END, line + "\n")
+        text.configure(state="disabled")
+
+        btn = ttk.Button(win, text="Close", command=win.destroy)
+        btn.pack(side=tk.BOTTOM, pady=(0, 8))
+
+        def _on_close(_event=None):
+            win.destroy()
+            return "break"
+
+        win.bind("<Escape>", _on_close)
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+
+        self._help_window = win
+        btn.focus_set()
 
     # ───────────────────────── search box / filters ─────────────────────────
     def on_search_key(self, _event):

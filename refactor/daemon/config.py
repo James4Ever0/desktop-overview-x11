@@ -63,6 +63,7 @@ class Settings:
     window_capture_keep_per_window: int = 5
     window_capture_retention_days: int | None = None
     window_capture_max_dim: int = 1920
+    capture_timeout_s: float = 5.0         # per-window ImageMagick capture timeout
     ocr_enabled: bool = False
     filter_no_vdesktop: bool = True       # skip windows without a vdesktop
     capture_on_focus: bool = True         # capture on focus change
@@ -73,6 +74,7 @@ class Settings:
     window_title_denylist: tuple[str, ...] = (
         "Desktop Overview — search",
         "Desktop Overview — timeline",
+        "Desktop Overview — Help",
         "Desktop — Plasma",
     )
 

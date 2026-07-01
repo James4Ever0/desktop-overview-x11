@@ -39,7 +39,8 @@ _WINDOWS = [("0x111", 0, "Firefox — inbox"), ("0x222", 0, "Konsole"), ("0x333"
 capture.get_window_list = lambda: list(_WINDOWS)
 capture.get_active_window_id = lambda: capture.normalize_win_id("0x111")
 capture.get_app_name = lambda wid: "app"
-capture.capture_window = lambda wid, title="", max_dim=None: Image.new("RGB", (12, 9), "blue")
+capture.window_exists = lambda wid: True
+capture.capture_window = lambda wid, title="", max_dim=None, timeout_s=5.0: Image.new("RGB", (12, 9), "blue")
 
 
 async def main():

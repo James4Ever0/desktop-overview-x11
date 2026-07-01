@@ -1,0 +1,9 @@
+when closing some window, while the background process is still capturing the image for it, i occasionally hit something blocking.
+
+my mouse cursor turn into a shape like below:
+
+_| |_
+_   _
+ | |
+
+so how is this going? how to prevent? must be the background daemon?

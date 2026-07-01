@@ -146,6 +146,12 @@ class WindowCaptureScheduler:
         xid = capture.normalize_win_id(wid_hex)
         if xid is None:
             return False
+
+        # Skip denied titles (e.g. the app's own windows, password managers).
+        if title and title in self.s.window_title_denylist:
+            log.debug("capture skipped: denied title %r", title)
+            return False
+
         wm = await self.rt.run_in_executor(capture.get_app_name, wid_hex)
         uid = await self.reg.ensure_window(xid, wm or None, now)
         await self.reg.set_app_name(uid, wm or None, now)
@@ -154,8 +160,16 @@ class WindowCaptureScheduler:
                 "SELECT vdesktop_index FROM window WHERE window_uid=? LIMIT 1", (uid,))
             if vrow is None or vrow[0] is None:
                 return False
+
+        # Last-moment existence check: the window can close between scheduling
+        # and execution (focus-change capture is async).
+        if not await self.rt.run_in_executor(capture.window_exists, wid_hex):
+            log.debug("capture skipped: window gone before capture %s (%s)", wid_hex, title[:40])
+            return False
+
         img = await self.rt.run_in_executor(
-            capture.capture_window, wid_hex, title, self.s.window_capture_max_dim)
+            capture.capture_window, wid_hex, title, self.s.window_capture_max_dim,
+            self.s.capture_timeout_s)
         if img is None:
             return False
 

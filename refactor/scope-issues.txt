@@ -1,0 +1,3 @@
+used to be: right click to scope to that window only, and search in timeline? in search view?
+
+but how to scope out? how about disable the scope in search only
