@@ -1,0 +1,3 @@
+when holding shift and move mouse, ignore mouse movements and do not hide hover interface.
+
+if mouse is within the geometry of hover interface, keyboard and mouse events will not trigger hiding of the hovering interface.

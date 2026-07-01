@@ -133,3 +133,15 @@ can you also display the keyboard captured chunk timestamp in the "hover" or det
 ---
 
 still cannot get the "hide self" working. the window capture still appears in the bottom of the list with process name tk and title "(no title)" which is strange. you shall capture the title no matter it is containing forbidden title or not. you just exclude it in results everywhere, from backend to frontend.
+
+---
+
+add enrichment last usage in 1d
+
+---
+
+cannot search out 10.10.11.149 results. cannot do whole text substring matching against database. query with "contains" or some regex like that?
+
+---
+
+can we make the substring matching search mechanism be like: first do a full search if input things like "konsole skills" then do a white space split and combination substring search first on "konsole" then on "skills" then combine all three results, treat as substring matching search mode (modify existing substring algo). for the mixed mode it would be minimal change since you already separate the substring search mode from fts5? 

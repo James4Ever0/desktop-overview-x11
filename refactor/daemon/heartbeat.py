@@ -19,6 +19,7 @@ USAGE_INTERVALS_S = {
     "usage_5m": 300,
     "usage_10m": 600,
     "usage_30m": 1800,
+    "usage_1d": 86400,
 }
 
 

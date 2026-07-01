@@ -210,7 +210,7 @@ async def list_windows(store, *, alive="both", sort="last_access", order="desc",
 async def search(store, *, q=None, window_uid=None, fields=None, alive="both",
                  t_from=None, t_to=None, sort="last_access", order="desc", hits="hit_only",
                  limit=100, offset=0, current_session_key=None,
-                 title_denylist=None, self_xid=None) -> list[dict]:
+                 title_denylist=None, self_xid=None, mode="mixed") -> list[dict]:
     """The core multi-field search (07 §4).
 
     ``q`` empty + ``window_uid`` set → scope-only "show this window's fields"
@@ -219,7 +219,13 @@ async def search(store, *, q=None, window_uid=None, fields=None, alive="both",
     """
     fields = [f for f in (fields or ALL_FIELDS) if f in FIELDS]
     if q:
-        per_uid = await _fts_collect(store, q, fields, window_uid, limit_per_field=limit * 4)
+        per_uid: dict[int, dict] = {}
+        if mode in ("fts", "mixed"):
+            fts = await _fts_collect(store, q, fields, window_uid, limit_per_field=limit * 4)
+            _merge_per_uid(per_uid, fts)
+        if mode in ("substring", "mixed"):
+            sub = await _substring_collect(store, q, fields, window_uid, limit_per_field=limit * 4)
+            _merge_per_uid(per_uid, sub)
     else:
         per_uid = await _scope_collect(store, fields, window_uid, per_field=10)
 
@@ -285,9 +291,113 @@ async def search(store, *, q=None, window_uid=None, fields=None, alive="both",
     return page
 
 
+def _safe_fts_query(q: str) -> str:
+    """Quote every token so FTS5 treats it as a phrase (safe for IPs, punctuation).
+
+    This avoids FTS5 syntax errors on dots/slashes and still does substring-style
+    matching because the FTS tables use the trigram tokenizer.
+    """
+    if not q:
+        return q
+    tokens = q.strip().split()
+    cleaned = [t.replace('"', '') for t in tokens if t.replace('"', '')]
+    if not cleaned:
+        return q
+    return " AND ".join(f'"{t}"' for t in cleaned)
+
+
+def _mark_substring(text: str, q: str) -> str:
+    """Build a short snippet with the first case-insensitive match wrapped in <mark>."""
+    if not text or not q:
+        return text
+    lo = text.lower()
+    qlo = q.lower()
+    idx = lo.find(qlo)
+    if idx < 0:
+        return text
+    radius = 24
+    start = max(0, idx - radius)
+    end = min(len(text), idx + len(q) + radius)
+    snippet = text[start:end]
+    rel = idx - start
+    marked = (
+        snippet[:rel] + "<mark>" + snippet[rel:rel + len(q)] + "</mark>" + snippet[rel + len(q):]
+    )
+    if start > 0:
+        marked = "…" + marked
+    if end < len(text):
+        marked = marked + "…"
+    return marked
+
+
+async def _substring_token_hits(store, token: str, fields, window_uid, *, limit_per_field) -> dict:
+    """Substring hits for a single token across all requested fields."""
+    per_uid: dict[int, dict] = {}
+    for field in fields:
+        _fts, content, ts_col = FIELDS[field]
+        text_col = "title" if field == "title" else ("app_name" if field == "app_name" else "text")
+        sql = (f"SELECT window_uid AS uid, {text_col} AS excerpt, {ts_col} AS ts "
+               f"FROM {content} WHERE INSTR(LOWER({text_col}), LOWER(?)) > 0 ")
+        params: list = [token]
+        if window_uid is not None:
+            sql += "AND window_uid = ? "
+            params.append(window_uid)
+        sql += f"ORDER BY {ts_col} DESC LIMIT ?"
+        params.append(limit_per_field)
+        rows = await store.fetchall(sql, tuple(params))
+        for r in rows:
+            uid = r["uid"]
+            if uid is None:
+                continue
+            excerpt = _mark_substring(r["excerpt"] or "", token)
+            _merge_hit(per_uid, uid, field, excerpt, r["ts"], 1000.0)
+    return per_uid
+
+
+async def _substring_collect(store, q, fields, window_uid, *, limit_per_field) -> dict:
+    """Whole-text substring fallback using INSTR(LOWER(...), LOWER(?)).
+
+    Multi-word queries are split on whitespace.  A window matches if either:
+      * the full query string appears as a substring in any field, OR
+      * every individual token appears somewhere across the requested fields
+        (the tokens do not need to be in the same field or row).
+    """
+    q = q.strip()
+    if not q:
+        return {}
+    tokens = q.split()
+    if len(tokens) <= 1:
+        return await _substring_token_hits(store, q, fields, window_uid,
+                                           limit_per_field=limit_per_field)
+
+    # Intersection: each token must be present in at least one field for the window.
+    token_results = [
+        await _substring_token_hits(store, t, fields, window_uid,
+                                    limit_per_field=limit_per_field)
+        for t in tokens
+    ]
+    common_uids = set(token_results[0])
+    for res in token_results[1:]:
+        common_uids &= set(res)
+
+    combined: dict[int, dict] = {}
+    for uid in common_uids:
+        for res in token_results:
+            agg = res.get(uid)
+            if agg is not None:
+                _merge_per_uid(combined, {uid: agg})
+
+    # Union with the exact full-phrase matches.
+    full_phrase = await _substring_token_hits(store, q, fields, window_uid,
+                                              limit_per_field=limit_per_field)
+    _merge_per_uid(combined, full_phrase)
+    return combined
+
+
 async def _fts_collect(store, q, fields, window_uid, *, limit_per_field) -> dict:
     """Run each field's FTS5 MATCH; group rowid→window_uid → {hits,rank,ts}."""
     per_uid: dict[int, dict] = {}
+    safe_q = _safe_fts_query(q)
     for field in fields:
         fts, content, ts_col = FIELDS[field]
         snippet = _SNIPPET.format(fts=fts)
@@ -295,7 +405,7 @@ async def _fts_collect(store, q, fields, window_uid, *, limit_per_field) -> dict
                f"c.{ts_col} AS ts, {fts}.rank AS rank "
                f"FROM {fts} JOIN {content} c ON c.id = {fts}.rowid "
                f"WHERE {fts} MATCH ? ")
-        params: list = [q]
+        params: list = [safe_q]
         if window_uid is not None:
             sql += "AND c.window_uid = ? "
             params.append(window_uid)
@@ -304,13 +414,35 @@ async def _fts_collect(store, q, fields, window_uid, *, limit_per_field) -> dict
         try:
             rows = await store.fetchall(sql, tuple(params))
         except Exception:
-            continue   # malformed MATCH (user typed FTS operators) → skip field
+            continue   # malformed MATCH → skip field
         for r in rows:
             uid = r["uid"]
             if uid is None:
                 continue
             _merge_hit(per_uid, uid, field, r["excerpt"], r["ts"], r["rank"])
     return per_uid
+
+
+def _merge_per_uid(target: dict, source: dict) -> None:
+    """Merge two {uid: {hits, best_rank, min_ts, max_ts}} maps."""
+    for uid, agg in source.items():
+        existing = target.get(uid)
+        if existing is None:
+            target[uid] = {
+                "hits": list(agg["hits"]),
+                "best_rank": agg["best_rank"],
+                "min_ts": agg["min_ts"],
+                "max_ts": agg["max_ts"],
+            }
+            continue
+        existing["hits"].extend(agg["hits"])
+        if agg["best_rank"] is not None and (existing["best_rank"] is None
+                                              or agg["best_rank"] < existing["best_rank"]):
+            existing["best_rank"] = agg["best_rank"]
+        if agg["min_ts"] is not None:
+            existing["min_ts"] = min(existing["min_ts"], agg["min_ts"]) if existing["min_ts"] is not None else agg["min_ts"]
+        if agg["max_ts"] is not None:
+            existing["max_ts"] = max(existing["max_ts"], agg["max_ts"]) if existing["max_ts"] is not None else agg["max_ts"]
 
 
 async def _scope_collect(store, fields, window_uid, *, per_field) -> dict:
@@ -384,34 +516,53 @@ async def _recent_events(store, uid, recent) -> list[dict]:
 async def timeline(store, *, t_from=None, t_to=None, window_uid=None, sort="last_access",
                    order="desc", current_session_key=None,
                    title_denylist=None, self_xid=None) -> list[dict]:
-    """Windows active in [from,to] with their focus spans + title history (07 §3, 08 §3)."""
-    where, params = [], []
-    if window_uid is not None:
-        where.append("fe.window_uid = ?")
-        params.append(window_uid)
-    if t_from is not None:
-        where.append("fe.focused_at >= ?")
-        params.append(t_from)
-    if t_to is not None:
-        where.append("fe.focused_at <= ?")
-        params.append(t_to)
-    clause = ("WHERE " + " AND ".join(where)) if where else ""
-    focus = await store.fetchall(
-        f"SELECT fe.window_uid AS uid, fe.focused_at AS ts, "
-        f"fe.vdesktop_index AS vidx, fe.vdesktop_name AS vname "
-        f"FROM focus_event fe {clause} ORDER BY fe.focused_at ASC", tuple(params))
+    """Windows active in [from,to] with continuous focus spans + instantaneous events.
 
+    Focus spans are derived from the global sequence of focus events: a span ends
+    when the next window gains focus.  The last span ends at the query's upper
+    bound (or now).  Title, clipboard, selection and keyboard events are attached
+    to each lane for hover detail.
+    """
+    # Fetch focus events globally from the lower bound onward so we can derive
+    # true continuous durations (only one window is focused at a time).
+    f_where, f_params = [], []
+    if t_from is not None:
+        f_where.append("focused_at >= ?")
+        f_params.append(t_from)
+    f_clause = ("WHERE " + " AND ".join(f_where)) if f_where else ""
+    focus_rows = await store.fetchall(
+        f"SELECT window_uid AS uid, focused_at AS ts, "
+        f"vdesktop_index AS vidx, vdesktop_name AS vname "
+        f"FROM focus_event {f_clause} ORDER BY focused_at ASC", tuple(f_params))
+
+    end_default = t_to if t_to is not None else time.time()
     lanes: dict[int, dict] = {}
-    for r in focus:
+    for i, r in enumerate(focus_rows):
         uid = r["uid"]
-        if uid is None:
+        start = r["ts"]
+        end = focus_rows[i + 1]["ts"] if i + 1 < len(focus_rows) else end_default
+        if t_from is not None:
+            start = max(start, t_from)
+        if t_to is not None:
+            end = min(end, t_to)
+        if end <= start:
             continue
         lane = lanes.get(uid)
         if lane is None:
-            lane = {"window_uid": uid, "focus_spans": [], "titles": []}
+            lane = {"window_uid": uid, "focus_spans": [], "titles": [], "events": []}
             lanes[uid] = lane
-        lane["focus_spans"].append({"focused_at": r["ts"], "vdesktop_index": r["vidx"],
-                                    "vdesktop_name": r["vname"]})
+        lane["focus_spans"].append({
+            "focused_at": r["ts"],
+            "ended_at": end,
+            "vdesktop_index": r["vidx"],
+            "vdesktop_name": r["vname"],
+        })
+
+    if window_uid is not None:
+        lanes = {uid: lane for uid, lane in lanes.items() if uid == window_uid}
+
+    if not lanes:
+        return []
 
     # title history within range, attached to each lane
     for uid, lane in lanes.items():
@@ -436,6 +587,8 @@ async def timeline(store, *, t_from=None, t_to=None, window_uid=None, sort="last
             lane["jumpable"] = m["jumpable"]
             lane["last_access"] = m["last_access"]
 
+    await _enrich_timeline_events(store, lanes, t_from, t_to)
+
     out = list(lanes.values())
     reverse = order != "asc"
     if sort == "title":
@@ -450,7 +603,7 @@ async def timeline(store, *, t_from=None, t_to=None, window_uid=None, sort="last
     else:  # last_access: latest focus span per lane, ties by uid for stability
         def _lane_last_access(lane):
             spans = lane.get("focus_spans") or []
-            ts = max((s.get("focused_at") or 0 for s in spans), default=0)
+            ts = max((s.get("ended_at") or s.get("focused_at") or 0 for s in spans), default=0)
             return ts, lane["window_uid"]
         out.sort(key=_lane_last_access, reverse=reverse)
     if title_denylist:
@@ -465,3 +618,37 @@ async def timeline(store, *, t_from=None, t_to=None, window_uid=None, sort="last
     elif sort.startswith("usage_"):
         out.sort(key=lambda l: (l.get(sort) or 0, l["window_uid"]), reverse=reverse)
     return out
+
+
+async def _enrich_timeline_events(store, lanes: dict[int, dict], t_from, t_to) -> None:
+    """Attach instantaneous events (title, clipboard, selection, keyboard) to lanes."""
+    uids = list(lanes)
+    placeholders = ",".join("?" * len(uids))
+    sources = [
+        ("title_history", "changed_at", "title", "title", None),
+        ("clipboard_event", "created_at", "clipboard", "text", "kind"),
+        ("selection_event", "created_at", "selection", "text", None),
+        ("kbd_segment", "started_at", "keyboard", "text", None),
+    ]
+    for table, ts_col, typ, text_col, kind_col in sources:
+        where = [f"window_uid IN ({placeholders})"]
+        params: list = list(uids)
+        if t_from is not None:
+            where.append(f"{ts_col} >= ?")
+            params.append(t_from)
+        if t_to is not None:
+            where.append(f"{ts_col} <= ?")
+            params.append(t_to)
+        cols = f"window_uid AS uid, {text_col} AS text, {ts_col} AS ts"
+        if kind_col:
+            cols += f", {kind_col} AS kind"
+        sql = f"SELECT {cols} FROM {table} WHERE " + " AND ".join(where) + f" ORDER BY {ts_col} DESC"
+        rows = await store.fetchall(sql, tuple(params))
+        for r in rows:
+            event = {"type": typ, "ts": r["ts"], "text": r["text"]}
+            if kind_col:
+                event["kind"] = r["kind"]
+            lanes[r["uid"]]["events"].append(event)
+    for lane in lanes.values():
+        lane["events"].sort(key=lambda e: e["ts"], reverse=True)
+        lane["events"] = lane["events"][:50]

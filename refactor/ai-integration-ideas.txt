@@ -1,0 +1,3 @@
+ai may infer our purpose via keylogging, window events, clipboard and selections.
+
+ai might do some hints over prompt when required.

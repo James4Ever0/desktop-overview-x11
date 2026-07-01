@@ -21,7 +21,8 @@ from . import models
 log = logging.getLogger("dovw.api")
 router = APIRouter()
 
-SORT_RE = r"^(last_access|focus_score|usage_5m|usage_10m|usage_30m|usage_total|title|window_id|relevance|recency)$"
+SORT_RE = r"^(last_access|focus_score|usage_5m|usage_10m|usage_30m|usage_1d|usage_total|title|window_id|relevance|recency)$"
+MODE_RE = r"^(fts|substring|mixed)$"
 
 
 def _fields(fields: str | None) -> list[str]:
@@ -137,11 +138,12 @@ async def get_search(
     t_from: float | None = Query(None, alias="from"),
     t_to: float | None = Query(None, alias="to"),
     self_xid: str | None = Query(None),
+    mode: str = Query("mixed", pattern=MODE_RE),
 ):
-    log.debug("GET /search q=%s window_uid=%s fields=%s sort=%s order=%s",
-              q, window_uid, fields, sort, order)
+    log.debug("GET /search q=%s window_uid=%s fields=%s sort=%s order=%s mode=%s",
+              q, window_uid, fields, sort, order, mode)
     return await _do_search(ctx, q, window_uid, fields, alive, sort, order, hits, t_from, t_to,
-                            self_xid=self_xid)
+                            self_xid=self_xid, mode=mode)
 
 
 # from/to need explicit aliasing because `from` is a Python keyword
@@ -158,13 +160,14 @@ async def get_history(
     t_from: float | None = Query(None, alias="from"),
     t_to: float | None = Query(None, alias="to"),
     self_xid: str | None = Query(None),
+    mode: str = Query("mixed", pattern=MODE_RE),
 ):
     return await _do_search(ctx, q, window_uid, fields, alive, sort, order, hits, t_from, t_to,
-                            self_xid=self_xid)
+                            self_xid=self_xid, mode=mode)
 
 
 async def _do_search(ctx, q, window_uid, fields, alive, sort, order, hits, t_from=None, t_to=None,
-                     self_xid=None):
+                     self_xid=None, mode="mixed"):
     s = ctx.settings
     limit = min(s.search_default_limit, s.search_max_limit)
     results = await search.search(
@@ -172,7 +175,8 @@ async def _do_search(ctx, q, window_uid, fields, alive, sort, order, hits, t_fro
         t_from=t_from, t_to=t_to, sort=sort, order=order, hits=hits, limit=limit,
         current_session_key=ctx.session_key,
         title_denylist=s.window_title_denylist,
-        self_xid=self_xid)
+        self_xid=self_xid,
+        mode=mode)
     return _enrich_window_vdesktops(ctx, results)
 
 

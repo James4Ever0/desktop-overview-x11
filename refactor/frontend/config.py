@@ -32,6 +32,7 @@ DEFAULT_THEME = {
     "mark_bg": "#5a4a00",
     "alive": "#4caf50",
     "dead": "#888888",
+    "indicator": "#ff4444",
 }
 
 
@@ -45,6 +46,8 @@ class FrontendSettings:
     search_debounce_ms: int = 200
     grid_auto_refresh_s: int = 2           # 0 = off
     grid_columns: int | None = None        # None = auto-fit width
+    grid_tile_width: int = 260
+    grid_tile_height: int = 260
     window_capture_display_dim: int = 240
     hover_preview_delay_ms: int = 400
     hover_preview_max_dim: int = 900

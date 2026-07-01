@@ -53,6 +53,7 @@ class Window:
     usage_5m: float | None = None
     usage_10m: float | None = None
     usage_30m: float | None = None
+    usage_1d: float | None = None
     usage_total: float | None = None
     focus_score: float | None = None
     hits: list[Hit] = field(default_factory=list)
@@ -85,10 +86,24 @@ class Window:
             window_capture_url=d.get("window_capture_url"),
             window_capture_ts=d.get("window_capture_ts"),
             usage_5m=d.get("usage_5m"), usage_10m=d.get("usage_10m"), usage_30m=d.get("usage_30m"),
+            usage_1d=d.get("usage_1d"),
             usage_total=d.get("usage_total"),
             focus_score=d.get("focus_score"),
             hits=[Hit(h["field"], h.get("excerpt")) for h in d.get("hits", [])],
         )
+
+
+@dataclass
+class LaneEvent:
+    type: str
+    ts: float
+    kind: str | None = None
+    text: str | None = None
+
+    @classmethod
+    def from_json(cls, d: dict) -> "LaneEvent":
+        return cls(type=d.get("type", "?"), ts=d["ts"],
+                   kind=d.get("kind"), text=d.get("text"))
 
 
 @dataclass
@@ -102,9 +117,11 @@ class TimelineLane:
     jumpable: bool | None
     focus_spans: list[dict]
     titles: list[dict]
+    events: list[LaneEvent] = field(default_factory=list)
     usage_5m: float | None = None
     usage_10m: float | None = None
     usage_30m: float | None = None
+    usage_1d: float | None = None
     usage_total: float | None = None
     focus_score: float | None = None
 
@@ -116,7 +133,9 @@ class TimelineLane:
             current_title=d.get("current_title"),
             alive=d.get("alive"), jumpable=d.get("jumpable"),
             focus_spans=d.get("focus_spans", []), titles=d.get("titles", []),
+            events=[LaneEvent.from_json(e) for e in d.get("events", [])],
             usage_5m=d.get("usage_5m"), usage_10m=d.get("usage_10m"), usage_30m=d.get("usage_30m"),
+            usage_1d=d.get("usage_1d"),
             usage_total=d.get("usage_total"),
             focus_score=d.get("focus_score"))
 
@@ -176,12 +195,12 @@ class ApiClient:
 
     def search(self, *, q=None, window_uid=None, fields=None, alive="both",
                sort="last_access", order="desc", hits="hit_only", t_from=None, t_to=None,
-               self_xid=None) -> list[Window]:
+               self_xid=None, mode="mixed") -> list[Window]:
         path = "/history" if (t_from is not None or t_to is not None) else "/search"
-        log.debug("api search q=%s window_uid=%s fields=%s sort=%s order=%s",
-                  q, window_uid, fields, sort, order)
+        log.debug("api search q=%s window_uid=%s fields=%s sort=%s order=%s mode=%s",
+                  q, window_uid, fields, sort, order, mode)
         params = dict(q=q, window_uid=window_uid, alive=alive, sort=sort, order=order, hits=hits,
-                      self_xid=self_xid)
+                      self_xid=self_xid, mode=mode)
         if fields:
             params["fields"] = ",".join(fields)
         if t_from is not None:

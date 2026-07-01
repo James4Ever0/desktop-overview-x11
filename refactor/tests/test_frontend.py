@@ -126,6 +126,14 @@ def _client_checks(uds: str, a: int, b: int):
 
         lanes = cli.timeline()
         check("client.timeline returns lanes", {l.window_uid for l in lanes} == {a, b})
+        la = next(l for l in lanes if l.window_uid == a)
+        check("timeline lane has focus spans with ended_at",
+              len(la.focus_spans) > 0 and la.focus_spans[0].get("ended_at") is not None)
+        event_types = {e.type for e in la.events}
+        check("timeline lane events include title + clipboard",
+              {"title", "clipboard"}.issubset(event_types))
+        lb = next(l for l in lanes if l.window_uid == b)
+        check("timeline lane b has events", len(lb.events) > 0)
 
         # activate (monkeypatch desktop side effects on the daemon side)
         capture_mod.get_window_list = lambda: [("0x000abcde", 0, "Inbox")]

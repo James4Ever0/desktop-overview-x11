@@ -37,6 +37,8 @@ class EventHandlers:
         # current focused window title/xid for keyboard denylist filtering
         self.current_focus_title: str | None = None
         self.current_focus_xid: int | None = None
+        # last recorded title per window to avoid duplicate title_history rows
+        self._last_title: dict[int, str] = {}
 
     def register_all(self, runtime) -> None:
         runtime.register("window_list", self.handle_window_list)
@@ -98,6 +100,10 @@ class EventHandlers:
             self.current_focus_title = new
         uid = await self.reg.ensure_window(xid, None, ts)
         await self.reg.bump_last_seen(uid, ts)
+        if self._last_title.get(uid) == new:
+            log.debug("title dedup window_uid=%d unchanged=%s", uid, new)
+            return
+        self._last_title[uid] = new
         log.debug("title window_uid=%d x=0x%08x new=%s", uid, xid, new)
         self.store.enqueue(
             "INSERT INTO title_history(window_uid, title, changed_at) VALUES(?,?,?)",

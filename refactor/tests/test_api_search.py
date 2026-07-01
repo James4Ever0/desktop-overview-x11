@@ -73,6 +73,9 @@ async def _seed(store):
         "INSERT INTO clipboard_event(window_uid, kind, text, n_chars, n_bytes, created_at)"
         " VALUES(?,?,?,?,?,?)", (a, "TEXT", "copied an invoice number", 24, 24, 140.0))
     await store.execute(
+        "INSERT INTO clipboard_event(window_uid, kind, text, n_chars, n_bytes, created_at)"
+        " VALUES(?,?,?,?,?,?)", (a, "TEXT", "server 10.10.11.149 is up", 25, 25, 142.0))
+    await store.execute(
         "INSERT INTO selection_event(window_uid, text, n_chars, created_at) VALUES(?,?,?,?)",
         (a, "highlighted invoice total", 26, 141.0))
     await store.execute(
@@ -113,6 +116,30 @@ async def test_search_pipeline(store, a, b, c):
     app_only = await search.search(store, q="firefox", fields=["app_name"],
                                    current_session_key="sess")
     check("fields=app_name finds window a", {r["window_uid"] for r in app_only} == {a})
+
+    # IP / punctuation: mixed mode uses quoted FTS + substring fallback
+    ip = await search.search(store, q="10.10.11.149", current_session_key="sess")
+    check("mixed search finds IP address", {r["window_uid"] for r in ip} == {a})
+    check("IP hit excerpt is marked",
+          any(h["field"] == "clipboard" and "<mark>10.10.11.149</mark>" in (h["excerpt"] or "")
+              for r in ip for h in r["hits"]))
+
+    # substring-only still works for short tokens the trigram tokenizer cannot index
+    short = await search.search(store, q="an", mode="substring", current_session_key="sess")
+    check("substring mode finds short token", a in {r["window_uid"] for r in short})
+
+    # multi-word substring: full phrase OR (token_a AND token_b AND ...) across fields
+    multi = await search.search(store, q="invoice number", mode="substring",
+                                current_session_key="sess")
+    check("multi-word substring matches window with both tokens", a in {r["window_uid"] for r in multi})
+    check("multi-word substring excludes window missing a token", b not in {r["window_uid"] for r in multi})
+    multi2 = await search.search(store, q="invoice up", mode="substring",
+                                 current_session_key="sess")
+    check("multi-word substring AND across fields", a in {r["window_uid"] for r in multi2})
+    check("multi-word substring excludes window missing a token (cross-field)", b not in {r["window_uid"] for r in multi2})
+    phrase = await search.search(store, q="copied an invoice", mode="substring",
+                                 current_session_key="sess")
+    check("substring full-phrase match still works", a in {r["window_uid"] for r in phrase})
 
     # field subset
     only_kbd = await search.search(store, q="invoice", fields=["keyboard"],
@@ -176,6 +203,18 @@ async def test_list_and_timeline(store, a, b, c):
     check("lane carries focus spans", len(lanes[a]["focus_spans"]) == 1)
     check("lane carries title history", lanes[a]["titles"][0]["title"] == "Inbox — invoice 2026")
     check("lane carries app_name", lanes[a].get("app_name") == "firefox")
+    # focus spans now have derived ended_at from the next focus event
+    a_span = lanes[a]["focus_spans"][0]
+    b_span = lanes[b]["focus_spans"][0]
+    check("focus span has ended_at", a_span.get("ended_at") is not None)
+    check("focus span ended_at is next global focus", a_span["ended_at"] == 120.0)
+    check("focus span b ended_at is next global focus", b_span["ended_at"] == 130.0)
+    # instantaneous events are attached to lanes
+    a_event_types = {e["type"] for e in lanes[a].get("events", [])}
+    check("lane a events include title+clipboard+selection",
+          {"title", "clipboard", "selection"}.issubset(a_event_types))
+    b_event_types = {e["type"] for e in lanes[b].get("events", [])}
+    check("lane b events include keyboard", "keyboard" in b_event_types)
     tl_one = await search.timeline(store, window_uid=a, current_session_key="sess")
     check("timeline window_uid scopes to one lane", [l["window_uid"] for l in tl_one] == [a])
 

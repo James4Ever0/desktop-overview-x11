@@ -25,12 +25,20 @@ from tkinter import font as tkfont
 from tkinter import ttk
 import functools
 
-from PIL import Image, ImageTk
+from PIL import Image, ImageOps, ImageTk
 
 from .apiclient import ApiClient, DaemonUnavailable, Window
 from . import views
 
 log = logging.getLogger("dovw.fe.app")
+
+
+def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
+    """Convert a '#RRGGBB' or '#RGB' hex colour to an (r,g,b) tuple."""
+    c = hex_color.lstrip("#")
+    if len(c) == 3:
+        c = "".join(ch * 2 for ch in c)
+    return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
 
 
 def _lane_has_vdesktop(lane) -> bool:
@@ -72,24 +80,45 @@ def _fmt_duration(minutes: float | None) -> str:
 
 
 def _fmt_usage(w: Window) -> str:
-    """Compact active-minutes + focus-score label."""
-    vals = [getattr(w, label, None) for label in ("usage_5m", "usage_10m", "usage_30m")]
-    total = getattr(w, "usage_total", None)
-    score = getattr(w, "focus_score", None)
-    if all(v is None for v in vals) and total is None and score is None:
+    """Compact short-window active-minutes label (5m/10m/30m/1d)."""
+    vals = [getattr(w, label, None) for label in ("usage_5m", "usage_10m", "usage_30m", "usage_1d")]
+    if all(v is None for v in vals):
         return "use: —"
     parts = []
-    for label, v in zip(("5m", "10m", "30m"), vals):
+    for label, v in zip(("5m", "10m", "30m", "1d"), vals):
         if v is None:
             parts.append(f"{label}:—")
         else:
             parts.append(f"{label}:{v:.1f}")
+    return "use: " + " ".join(parts)
+
+
+def _fmt_usage_summary(w: Window) -> str:
+    """Total focused time + focus score on a separate line."""
+    total = getattr(w, "usage_total", None)
+    score = getattr(w, "focus_score", None)
+    if total is None and score is None:
+        return ""
+    parts = []
     if total is not None:
         parts.append(f"tot:{_fmt_duration(total)}")
-    line = "use: " + " ".join(parts)
     if score is not None:
-        line += f" | score:{score:.2f}"
-    return line
+        parts.append(f"score:{score:.2f}")
+    return " | ".join(parts)
+
+
+def _fmt_ts(ts: float | None) -> str:
+    """ISO-style timestamp for event/keyboard chunks in the hover detail view."""
+    if ts is None or ts <= 0:
+        return "—"
+    import datetime
+    return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _truncate(text: str | None, n: int = 140) -> str:
+    if not text:
+        return ""
+    return text if len(text) <= n else text[:n].rstrip() + "…"
 
 
 ALL_FIELDS = ["title", "app_name", "clipboard", "selection", "keyboard"]
@@ -101,6 +130,7 @@ SORT_OPTIONS = [
     ("5m usage", "usage_5m"),
     ("10m usage", "usage_10m"),
     ("30m usage", "usage_30m"),
+    ("1d usage", "usage_1d"),
     ("total usage", "usage_total"),
 ]
 SORT_LABELS = {v: k for k, v in SORT_OPTIONS}
@@ -115,6 +145,7 @@ def _palette(theme: dict) -> dict:
         "tile_bg": theme["tile_bg"], "tile_border": theme["tile_border"],
         "accent": theme["accent"], "muted": theme["muted"],
         "mark_bg": theme["mark_bg"], "alive": theme["alive"], "dead": theme["dead"],
+        "indicator": theme.get("indicator", "#ff4444"),
         "canvas_bg": theme["bg"], "entry_bg": theme["tile_bg"], "entry_fg": theme["fg"],
         "select_bg": theme["accent"], "tip_border": theme["accent"],
         "tip_bg": theme["bg"], "tiptitle_bg": theme["tile_bg"], "tiptitle_fg": theme["fg"],
@@ -151,10 +182,15 @@ class WindowPreviewApp(tk.Tk):
         self._self_xid = self._get_self_xid()
         self._self_title_prefix = self.title()
         self._history_stack: list[dict] = []
+        self._timeline_view = None
+        self._syncing_timeline = False
+        self._resize_after = None
+        self._last_size = (1200, 800)
 
         # tiles keyed by window_uid (08 §2: reconcile by uid, not raw x id)
         self.tiles: dict[int, dict] = {}
         self._last_order_uids: tuple[int, ...] = ()
+        self._last_grid_cols: int = 0
         self._window_capture_cache: dict[int, ImageTk.PhotoImage] = {}
         self._preview_cache: dict[int, ImageTk.PhotoImage] = {}
 
@@ -168,6 +204,8 @@ class WindowPreviewApp(tk.Tk):
         self._preview_tip = None
         self._preview_title_label = None
         self._preview_image_label = None
+        self._preview_text = None
+        self._preview_kind = None
         self._hover_uid = None
         self._still_since = 0.0
         self._last_pointer = (-1, -1)
@@ -181,6 +219,7 @@ class WindowPreviewApp(tk.Tk):
         self.bind_all("<Button-5>", self.on_mousewheel)
         self.bind_all("<MouseWheel>", self.on_mousewheel)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.bind("<Configure>", self._on_root_configure)
 
         self.after(100, self.render)
         self._poll_hover()
@@ -202,6 +241,7 @@ class WindowPreviewApp(tk.Tk):
         base = tkfont.nametofont("TkDefaultFont").cget("family")
         self.search_font = tkfont.Font(family=base, size=self.s.font_size + 6)
         self.title_font = tkfont.Font(family=base, size=self.s.font_size + 4, weight="bold")
+        self.meta_font = tkfont.Font(family=base, size=max(8, self.s.font_size - 1))
 
     def _apply_theme(self):
         c = self.theme
@@ -352,6 +392,29 @@ class WindowPreviewApp(tk.Tk):
         self.order_combo.bind("<<ComboboxSelected>>", self._on_sort_changed)
         self.order_combo.pack(side=tk.LEFT, padx=2)
 
+        # timeline-specific controls (zoom + red-line time); shown only in timeline view, on the same row
+        self._timeline_filters: list[tk.Widget] = []
+        tl_pad = ttk.Label(flt, text="   ")
+        self._timeline_filters.append(tl_pad)
+        tl_zoom_lbl = ttk.Label(flt, text="Zoom (s/px):")
+        self._timeline_filters.append(tl_zoom_lbl)
+        self.scale_var = tk.StringVar(value="1")
+        self.scale_entry = ttk.Entry(flt, textvariable=self.scale_var, width=12, justify="right")
+        self.scale_entry.bind("<Return>", self._on_scale_entry)
+        self.scale_entry.bind("<FocusOut>", self._on_scale_entry)
+        self._timeline_filters.append(self.scale_entry)
+        tl_time_lbl = ttk.Label(flt, text="Red line:")
+        self._timeline_filters.append(tl_time_lbl)
+        self.indicator_var = tk.StringVar(value="")
+        self.indicator_entry = ttk.Entry(flt, textvariable=self.indicator_var, width=20)
+        self.indicator_entry.bind("<Return>", self._on_indicator_entry)
+        self.indicator_entry.bind("<FocusOut>", self._on_indicator_entry)
+        self._timeline_filters.append(self.indicator_entry)
+        self.fit_btn = ttk.Button(flt, text="Fit", command=self._fit_timeline)
+        self._timeline_filters.append(self.fit_btn)
+        self.now_btn = ttk.Button(flt, text="Now", command=self._now_timeline)
+        self._timeline_filters.append(self.now_btn)
+
     def _build_grid(self):
         self.canvas = tk.Canvas(self, bg=self.theme["canvas_bg"], highlightthickness=0)
         self.scrollbar = ttk.Scrollbar(self, orient=tk.VERTICAL, command=self.canvas.yview)
@@ -359,9 +422,28 @@ class WindowPreviewApp(tk.Tk):
         self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.inner_frame = ttk.Frame(self.canvas)
-        self.canvas.create_window((0, 0), window=self.inner_frame, anchor="nw")
+        self._inner_window = self.canvas.create_window((0, 0), window=self.inner_frame, anchor="nw")
         self.inner_frame.bind("<Configure>",
                               lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+
+    def _on_canvas_configure(self, event=None):
+        """Keep the inner_frame sized to the viewport so views fill the window.
+
+        In timeline mode we also pin the height so the timeline canvas expands
+        vertically; in search mode the height is left natural so tiles can scroll.
+        """
+        width = event.width if event else self.canvas.winfo_width()
+        height = event.height if event else self.canvas.winfo_height()
+        self.canvas.itemconfig(self._inner_window, width=width)
+        if self.view_state.get("view") == "timeline":
+            self.canvas.itemconfig(self._inner_window, height=height)
+            self.inner_frame.configure(width=width, height=height)
+            if self._timeline_view is not None:
+                self._timeline_view._draw()
+        else:
+            self.canvas.itemconfig(self._inner_window, height=0)
+            self.inner_frame.configure(width=width, height=0)
 
     def _build_banner(self):
         self.banner = ttk.Label(self, anchor="center", style="Dead.Tile.TLabel")
@@ -399,6 +481,17 @@ class WindowPreviewApp(tk.Tk):
         else:
             self._render_search()
 
+    def _on_root_configure(self, event):
+        if event.widget is not self:
+            return
+        size = (event.width, event.height)
+        if size == self._last_size:
+            return
+        self._last_size = size
+        if self._resize_after is not None:
+            self.after_cancel(self._resize_after)
+        self._resize_after = self.after(300, self.render)
+
     def switch_view(self, view: str):
         if view != self.view_state["view"]:
             self._push_history()
@@ -429,7 +522,7 @@ class WindowPreviewApp(tk.Tk):
             return self.api.search(q=q, window_uid=scope, fields=st["fields"],
                                    alive=st["alive"], sort=st["sort"], order=st["order"],
                                    hits=st["hits"], t_from=st["from"], t_to=st["to"],
-                                   self_xid=self_xid)
+                                   self_xid=self_xid, mode="mixed")
         self._submit(call, self._on_search_results)
 
     def _on_search_results(self, windows, err):
@@ -475,8 +568,73 @@ class WindowPreviewApp(tk.Tk):
         lanes = [l for l in lanes if not self._is_self(l)]
         self._hide_banner()
         self.status_var.set(f"{len(lanes) if lanes else 0} lane(s)")
-        self._clear_grid()
-        views.render_timeline(self, lanes or [])
+        view = views.render_timeline(self, lanes or [])
+        if view is not None:
+            view.scale_callback = self._on_timeline_scale
+            view.indicator_callback = self._on_timeline_indicator
+            self._on_canvas_configure()
+
+    def _on_timeline_scale(self, scale: float):
+        self.view_state["t_scale"] = scale
+        if self._syncing_timeline:
+            return
+        self._syncing_timeline = True
+        self.scale_var.set(f"{scale:.3f}".rstrip("0").rstrip("."))
+        self._syncing_timeline = False
+
+    def _on_timeline_indicator(self, ts: float):
+        self.view_state["t_indicator"] = ts
+        if self._syncing_timeline:
+            return
+        self._syncing_timeline = True
+        self.indicator_var.set(_fmt_ts(ts))
+        self._syncing_timeline = False
+
+    def _on_scale_entry(self, _event=None):
+        if self._syncing_timeline:
+            return
+        view = getattr(self, "_timeline_view", None)
+        if view is None:
+            return
+        try:
+            scale = float(self.scale_var.get().strip())
+        except ValueError:
+            self._flash_entry(self.scale_entry)
+            self._syncing_timeline = True
+            self.scale_var.set(f"{view.scale:.3f}".rstrip("0").rstrip("."))
+            self._syncing_timeline = False
+            return
+        view.set_scale(scale)
+
+    def _on_indicator_entry(self, _event=None):
+        if self._syncing_timeline:
+            return
+        view = getattr(self, "_timeline_view", None)
+        if view is None:
+            return
+        ts = view.parse_indicator_str(self.indicator_var.get())
+        if ts is None:
+            self._flash_entry(self.indicator_entry)
+            self._syncing_timeline = True
+            self.indicator_var.set(_fmt_ts(view.indicator_time))
+            self._syncing_timeline = False
+            return
+        view.set_indicator_time(ts)
+
+    def _fit_timeline(self):
+        view = getattr(self, "_timeline_view", None)
+        if view is not None:
+            view.fit()
+
+    def _now_timeline(self):
+        view = getattr(self, "_timeline_view", None)
+        if view is not None:
+            view.jump_to_now()
+
+    def _flash_entry(self, entry):
+        old = entry.cget("foreground")
+        entry.configure(foreground="#ff0000")
+        self.after(300, lambda: entry.configure(foreground=old))
 
     def _on_error(self, err):
         if isinstance(err, DaemonUnavailable):
@@ -493,8 +651,12 @@ class WindowPreviewApp(tk.Tk):
             child.destroy()
         self.tiles.clear()
         self._last_order_uids = ()
-        # caches NOT cleared — they survive view switches for faster re-render;
-        # only on_close drops them.
+        self._timeline_view = None
+        # Reset grid weights so a later timeline view gets the full width
+        # instead of sharing columns with a now-destroyed search grid.
+        for c in range(self._last_grid_cols):
+            self.inner_frame.columnconfigure(c, weight=0)
+        self._last_grid_cols = 0
 
     def _clear_grid(self):
         """Legacy — kept for callers that predate _clear_view."""
@@ -551,7 +713,8 @@ class WindowPreviewApp(tk.Tk):
                         self._update_preview_image(w)
 
         if reorder and windows:
-            cols = self.s.grid_columns or max(1, self.canvas.winfo_width() // (self.s.window_capture_display_dim + 20) or 4)
+            cols = self.s.grid_columns or max(1, self.canvas.winfo_width() // (self.s.grid_tile_width + 20) or 4)
+            self._last_grid_cols = cols
             for i, w in enumerate(windows):
                 tile = self.tiles[w.window_uid]
                 r, c = divmod(i, cols)
@@ -567,17 +730,22 @@ class WindowPreviewApp(tk.Tk):
 
     def _create_tile(self, w: Window) -> dict:
         c = self.theme
-        frame = ttk.Frame(self.inner_frame, style="Tile.TFrame", relief=tk.RAISED, borderwidth=1)
+        tw = self.s.grid_tile_width
+        th = self.s.grid_tile_height
+        frame = ttk.Frame(self.inner_frame, style="Tile.TFrame", relief=tk.RAISED, borderwidth=1,
+                          width=tw)
         img_label = ttk.Label(frame, style="Tile.TLabel")
         img_label.pack()
-        app_label = ttk.Label(frame, style="Muted.TLabel", wraplength=self.s.window_capture_display_dim)
+        app_label = ttk.Label(frame, style="Muted.TLabel", wraplength=tw - 12)
         app_label.pack(anchor="w")
-        title_label = ttk.Label(frame, style="Tile.TLabel", wraplength=self.s.window_capture_display_dim)
+        title_label = ttk.Label(frame, style="Tile.TLabel", wraplength=tw - 12)
         title_label.pack(anchor="w")
         access_label = ttk.Label(frame, style="Muted.TLabel")
         access_label.pack(anchor="w")
         usage_label = ttk.Label(frame, style="Muted.TLabel")
         usage_label.pack(anchor="w")
+        total_score_label = ttk.Label(frame, style="Muted.TLabel")
+        total_score_label.pack(anchor="w")
         badge_label = ttk.Label(frame, style="Muted.TLabel")
         badge_label.pack(anchor="w")
         status_label = ttk.Label(frame, style="Tile.TLabel")
@@ -590,6 +758,7 @@ class WindowPreviewApp(tk.Tk):
         tile = {"frame": frame, "img_label": img_label,
                 "app_label": app_label, "title_label": title_label,
                 "access_label": access_label, "usage_label": usage_label,
+                "total_score_label": total_score_label,
                 "badge_label": badge_label, "status_label": status_label,
                 "hits_box": hits_box, "win": w}
 
@@ -611,6 +780,7 @@ class WindowPreviewApp(tk.Tk):
         tile["title_label"].configure(text=(title[:48] + "…") if len(title) > 48 else title)
         tile["access_label"].configure(text=_fmt_last_access(w.last_access))
         tile["usage_label"].configure(text=_fmt_usage(w))
+        tile["total_score_label"].configure(text=_fmt_usage_summary(w))
         tile["badge_label"].configure(text=w.desktop_badge)
         if w.alive and w.jumpable:
             tile["status_label"].configure(text="● accessible", style="Alive.Tile.TLabel")
@@ -668,7 +838,9 @@ class WindowPreviewApp(tk.Tk):
                 return
             try:
                 img = Image.open(io.BytesIO(data))
-                img.thumbnail((self.s.window_capture_display_dim, self.s.window_capture_display_dim), Image.LANCZOS)
+                size = (self.s.grid_tile_width, self.s.grid_tile_height)
+                bg = _hex_to_rgb(self.theme["tile_bg"])
+                img = ImageOps.pad(img, size, color=bg)
                 photo = ImageTk.PhotoImage(img)
             except Exception as exc:                       # noqa: BLE001
                 log.debug("window_capture decode failed uid=%s: %s", w.window_uid, exc)
@@ -753,17 +925,23 @@ class WindowPreviewApp(tk.Tk):
         return "break"
 
     def _show_search_filters(self, visible: bool):
-        """Show/hide knobs that only apply to the search view."""
+        """Show/hide knobs that only apply to the current view."""
         if visible:
             self._fields_label.pack(side=tk.LEFT)
             for cb in self._field_cbs:
                 cb.pack(side=tk.LEFT, padx=2)
             self._hits_cb.pack(side=tk.LEFT, padx=(8, 2))
+            self.scope_label.pack(side=tk.LEFT, padx=8)
+            for w in self._timeline_filters:
+                w.pack_forget()
         else:
             self._fields_label.pack_forget()
             for cb in self._field_cbs:
                 cb.pack_forget()
             self._hits_cb.pack_forget()
+            self.scope_label.pack_forget()
+            for w in self._timeline_filters:
+                w.pack(side=tk.LEFT, padx=2)
 
     # ───────────────────────── history stack (08 §5) ─────────────────────────
     def _sync_filter_widgets(self):
@@ -798,8 +976,29 @@ class WindowPreviewApp(tk.Tk):
         if self._preview_tip is not None:
             self._destroy_tip()
         self._hover_uid = None
+        # Hide any open timeline hover preview on keyboard input.
+        view = getattr(self, "_timeline_view", None)
+        if view is not None:
+            view._destroy_hover_tip()
         if event.widget is self.search_entry:
             return
+        if self.view_state.get("view") == "timeline" and event.widget not in (
+            self.scale_entry, self.indicator_entry
+        ):
+            view = getattr(self, "_timeline_view", None)
+            if view is not None:
+                if event.keysym == "Left":
+                    view.set_indicator_time(view.indicator_time - view.ARROW_STEP_PX * view.scale)
+                    return "break"
+                if event.keysym == "Right":
+                    view.set_indicator_time(view.indicator_time + view.ARROW_STEP_PX * view.scale)
+                    return "break"
+                if event.keysym == "Up":
+                    view._zoom_to(view.scale / view.ZOOM_FACTOR, view.indicator_time)
+                    return "break"
+                if event.keysym == "Down":
+                    view._zoom_to(view.scale * view.ZOOM_FACTOR, view.indicator_time)
+                    return "break"
         if event.char and len(event.char) == 1 and (event.char.isprintable() or event.char == " "):
             self.search_entry.focus_set()
             self.search_entry.insert(tk.INSERT, event.char)
@@ -807,6 +1006,8 @@ class WindowPreviewApp(tk.Tk):
             return "break"
 
     def on_mousewheel(self, event):
+        if self.view_state.get("view") == "timeline":
+            return
         if event.num == 4:
             self.canvas.yview_scroll(-1, "units")
         elif event.num == 5:
@@ -844,29 +1045,53 @@ class WindowPreviewApp(tk.Tk):
             widget = None
         if widget is None:
             return None
+        path = str(widget)
         for tile in self.tiles.values():
-            if widget is tile["img_label"]:
+            frame = tile["frame"]
+            fpath = str(frame)
+            if widget is frame or path == fpath or path.startswith(fpath + "."):
                 return tile
         return None
 
+    def _hover_kind(self, px: int, py: int, tile: dict) -> str:
+        """Return 'image' if the pointer is over the tile's thumbnail, else 'metadata'."""
+        img = tile["img_label"]
+        if img.winfo_ismapped():
+            top = img.winfo_rooty()
+            bottom = top + img.winfo_height()
+            if top <= py < bottom:
+                return "image"
+        return "metadata"
+
     def _show_preview(self, tile, px, py):
         w: Window = tile["win"]
-        if w.window_capture_url is None:
-            return
-        photo = self._preview_cache.get(w.window_uid)
-        if photo is None:
-            data = self.api.get_bytes(w.window_capture_url)   # hover is rare; sync is fine
-            if not data:
-                return
+        kind = self._hover_kind(px, py, tile)
+
+        photo = None
+        if kind == "image":
+            photo = self._preview_cache.get(w.window_uid)
+            if photo is None and w.window_capture_url is not None:
+                data = self.api.get_bytes(w.window_capture_url)   # hover is rare; sync is fine
+                if data:
+                    try:
+                        img = Image.open(io.BytesIO(data))
+                        m = self.s.hover_preview_max_dim
+                        if img.width > m or img.height > m:
+                            img.thumbnail((m, m), Image.LANCZOS)
+                        photo = ImageTk.PhotoImage(img)
+                    except Exception:                              # noqa: BLE001
+                        photo = None
+                    if photo is not None:
+                        self._preview_cache[w.window_uid] = photo
+            if photo is None:
+                kind = "metadata"
+
+        detail = None
+        if kind == "metadata":
             try:
-                img = Image.open(io.BytesIO(data))
-                m = self.s.hover_preview_max_dim
-                if img.width > m or img.height > m:
-                    img.thumbnail((m, m), Image.LANCZOS)
-                photo = ImageTk.PhotoImage(img)
-            except Exception:                              # noqa: BLE001
-                return
-            self._preview_cache[w.window_uid] = photo
+                detail = self.api.window(w.window_uid)
+            except Exception as exc:                               # noqa: BLE001
+                log.debug("detail fetch failed uid=%s: %s", w.window_uid, exc)
 
         self._destroy_tip()
         tip = tk.Toplevel(self)
@@ -877,22 +1102,106 @@ class WindowPreviewApp(tk.Tk):
         except tk.TclError:
             pass
         title = w.display_label
-        title_lbl = tk.Label(tip, text=title, anchor="w", justify="left",
-                             bg=self.theme["tiptitle_bg"], fg=self.theme["tiptitle_fg"],
-                             font=self.title_font, padx=8, pady=4, wraplength=photo.width())
-        title_lbl.pack(fill=tk.X, padx=1, pady=(1, 0))
-        lbl = tk.Label(tip, image=photo, bg=self.theme["tip_bg"], borderwidth=0)
-        lbl.image = photo
-        lbl.pack(padx=1, pady=(0, 1))
-        self._preview_tip = tip
-        self._preview_title_label = title_lbl
-        self._preview_image_label = lbl
+
+        if kind == "image":
+            wrap_w = photo.width()
+            title_lbl = tk.Label(tip, text=title, anchor="w", justify="left",
+                                 bg=self.theme["tiptitle_bg"], fg=self.theme["tiptitle_fg"],
+                                 font=self.title_font, padx=8, pady=4, wraplength=wrap_w)
+            title_lbl.pack(fill=tk.X, padx=1, pady=(1, 0))
+            lbl = tk.Label(tip, image=photo, bg=self.theme["tip_bg"], borderwidth=0)
+            lbl.image = photo
+            lbl.pack(padx=1, pady=(0, 1))
+            self._preview_tip = tip
+            self._preview_title_label = title_lbl
+            self._preview_image_label = lbl
+            self._preview_text = None
+            self._preview_kind = "image"
+        else:
+            title_lbl = tk.Label(tip, text=title, anchor="w", justify="left",
+                                 bg=self.theme["tiptitle_bg"], fg=self.theme["tiptitle_fg"],
+                                 font=self.title_font, padx=8, pady=4, wraplength=500)
+            title_lbl.pack(fill=tk.X, padx=1, pady=(1, 0))
+            meta = tk.Text(tip, height=1, width=60, wrap="word", bd=0,
+                           bg=self.theme["tip_bg"], fg=self.theme["fg"],
+                           highlightthickness=0, padx=8, pady=4,
+                           font=self.meta_font)
+            meta.tag_configure("field", foreground=self.theme["accent"])
+            meta.tag_configure("mark", background=self.theme["mark_bg"])
+            meta.tag_configure("time", foreground=self.theme["muted"])
+            meta.tag_configure("section", foreground=self.theme["accent"])
+            meta.pack(fill=tk.X, padx=1, pady=(0, 1))
+            self._fill_preview_metadata(meta, w, detail)
+            meta.configure(state="disabled")
+            meta.update_idletasks()
+            try:
+                lines = int(float(meta.index("end-1c")))
+            except Exception:                                      # noqa: BLE001
+                lines = 6
+            meta.configure(height=min(max(lines, 3), 16))
+            self._preview_tip = tip
+            self._preview_title_label = title_lbl
+            self._preview_image_label = None
+            self._preview_text = meta
+            self._preview_kind = "metadata"
+
         self._hover_uid = w.window_uid
         self._position_preview_tip()
 
+    def _fill_preview_metadata(self, box: tk.Text, w: Window, detail: dict | None):
+        """Populate the hover detail Text with hits, usage, recent events, titles."""
+        box.configure(state="normal")
+        box.delete("1.0", tk.END)
+
+        box.insert(tk.END, f"window #{w.window_uid}\n", "section")
+        if w.app_name or w.wm_class:
+            box.insert(tk.END, f"app: {w.app_name or w.wm_class}\n")
+        if w.current_title:
+            box.insert(tk.END, f"title: {w.current_title}\n")
+        if w.vdesktop and w.vdesktop.index is not None:
+            box.insert(tk.END, f"desktop: {w.desktop_badge}\n")
+        status = "accessible" if w.alive and w.jumpable else ("dead" if not w.alive else "other session")
+        box.insert(tk.END, f"status: {status}\n")
+        box.insert(tk.END, f"last access: {_fmt_last_access(w.last_access)}\n")
+        usage_line = f"{_fmt_usage(w)}  |  {_fmt_usage_summary(w)}".strip()
+        if usage_line:
+            box.insert(tk.END, f"{usage_line}\n")
+
+        if w.hits:
+            box.insert(tk.END, "\nSearch hits\n", "section")
+            for h in w.hits:
+                box.insert(tk.END, f"{h.field}: ", "field")
+                self._insert_marked(box, _truncate(h.excerpt or "").replace("\n", " "))
+                box.insert(tk.END, "\n")
+
+        events = detail.get("events", []) if detail else []
+        if events:
+            box.insert(tk.END, "\nRecent events\n", "section")
+            for e in events:
+                typ = e.get("type", "?")
+                kind = e.get("kind")
+                label = f"{typ}/{kind}" if typ == "clipboard" and kind else typ
+                ts = _fmt_ts(e.get("ts"))
+                body = _truncate(e.get("text") or "").replace("\n", " ")
+                box.insert(tk.END, f"[{ts}] {label}: ", "time")
+                self._insert_marked(box, body)
+                box.insert(tk.END, "\n")
+
+        titles = detail.get("title_history", []) if detail else []
+        if len(titles) > 1:
+            box.insert(tk.END, "\nTitle history\n", "section")
+            for t in titles[:5]:
+                ts = _fmt_ts(t.get("changed_at"))
+                body = _truncate(t.get("title") or "").replace("\n", " ")
+                box.insert(tk.END, f"[{ts}] ", "time")
+                self._insert_marked(box, body)
+                box.insert(tk.END, "\n")
+
     def _update_preview_image(self, w: Window):
-        """Refresh the currently-open hover preview with a new capture/title, in place."""
+        """Refresh the currently-open image hover preview with a new capture/title."""
         if self._preview_tip is None or self._hover_uid != w.window_uid:
+            return
+        if getattr(self, "_preview_kind", None) != "image":
             return
         if w.window_capture_url is None:
             self._destroy_tip()
@@ -903,6 +1212,8 @@ class WindowPreviewApp(tk.Tk):
 
         def done(data, err):
             if self._preview_tip is None or self._hover_uid != w.window_uid:
+                return
+            if getattr(self, "_preview_kind", None) != "image":
                 return
             if not data:
                 return
@@ -915,9 +1226,12 @@ class WindowPreviewApp(tk.Tk):
             except Exception:                           # noqa: BLE001
                 return
             self._preview_cache[w.window_uid] = photo
-            self._preview_image_label.configure(image=photo)
-            self._preview_image_label.image = photo
+            if self._preview_image_label is not None:
+                self._preview_image_label.configure(image=photo)
+                self._preview_image_label.image = photo
             self._preview_title_label.configure(text=w.display_label)
+            if photo is not None:
+                self._preview_title_label.configure(wraplength=photo.width())
             self._position_preview_tip()
 
         self._submit(fetch, done)
@@ -944,6 +1258,8 @@ class WindowPreviewApp(tk.Tk):
             self._preview_tip = None
         self._preview_title_label = None
         self._preview_image_label = None
+        self._preview_text = None
+        self._preview_kind = None
 
     # ───────────────────────── auto-refresh + close ─────────────────────────
     def _schedule_auto_refresh(self):

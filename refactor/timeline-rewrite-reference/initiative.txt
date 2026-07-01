@@ -1,0 +1,5 @@
+treat many things like events. like window focus event, is an event. keyboard input event, also an event. keep the current idea of "making focus a continuous event, while keyboard input, clipboard set/get, and title change an instanteous event without duration".
+
+reference to folder ./timeline-view-tk to learn about the design language, while somehow stick to the original timeline design.
+
+need to provide "on hover to show detail" feature, showing the keyboard input events, clipboard events, title change events, selection get/set events along with the thumbnail preview when hovering on the focused event bar. do not prefetch that resource beforehand? only fetch from the db when required? or else? you decide? at least the image resource shall be fetched lazily.

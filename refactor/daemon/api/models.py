@@ -32,6 +32,7 @@ class WindowOut(BaseModel):
     usage_5m: float | None = None
     usage_10m: float | None = None
     usage_30m: float | None = None
+    usage_1d: float | None = None
     usage_total: float | None = None
     focus_score: float | None = None
     window_capture_url: str | None = None
@@ -59,8 +60,16 @@ class WindowDetail(WindowOut):
 
 class FocusSpan(BaseModel):
     focused_at: float
+    ended_at: float | None = None
     vdesktop_index: int | None = None
     vdesktop_name: str | None = None
+
+
+class LaneEvent(BaseModel):
+    type: str
+    ts: float
+    kind: str | None = None
+    text: str | None = None
 
 
 class TimelineLane(BaseModel):
@@ -74,10 +83,12 @@ class TimelineLane(BaseModel):
     usage_5m: float | None = None
     usage_10m: float | None = None
     usage_30m: float | None = None
+    usage_1d: float | None = None
     usage_total: float | None = None
     focus_score: float | None = None
     focus_spans: list[FocusSpan] = []
     titles: list[TitleChange] = []
+    events: list[LaneEvent] = []
 
 
 class VDesktopOut(BaseModel):

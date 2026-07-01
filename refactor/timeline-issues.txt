@@ -1,0 +1,100 @@
+2026-06-30 18:20:36 DEBUG   dovw.fe.app          app.py:473 timeline filters removed 7 lane(s) (alive=7, vdesktop=0)
+2026-06-30 18:20:36 DEBUG   dovw.fe.app          app.py:473 timeline filters removed 7 lane(s) (alive=7, vdesktop=0)
+Exception in Tkinter callback
+Traceback (most recent call last):
+  File "/home/jamesbrown/miniforge3/envs/gui_agent/lib/python3.12/tkinter/__init__.py", line 1968, in __call__
+    return self.func(*args)
+           ^^^^^^^^^^^^^^^^
+  File "/home/jamesbrown/Desktop/works/desktop_overview_with_search/refactor/frontend/views.py", line 94, in scope
+    app.open_window_scope(uid)
+    ^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'str' object has no attribute 'open_window_scope'
+Exception in Tkinter callback
+Traceback (most recent call last):
+  File "/home/jamesbrown/miniforge3/envs/gui_agent/lib/python3.12/tkinter/__init__.py", line 1968, in __call__
+    return self.func(*args)
+           ^^^^^^^^^^^^^^^^
+  File "/home/jamesbrown/Desktop/works/desktop_overview_with_search/refactor/frontend/views.py", line 94, in scope
+    app.open_window_scope(uid)
+    ^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'str' object has no attribute 'open_window_scope'
+Exception in Tkinter callback
+Traceback (most recent call last):
+  File "/home/jamesbrown/miniforge3/envs/gui_agent/lib/python3.12/tkinter/__init__.py", line 1968, in __call__
+    return self.func(*args)
+           ^^^^^^^^^^^^^^^^
+  File "/home/jamesbrown/Desktop/works/desktop_overview_with_search/refactor/frontend/views.py", line 94, in scope
+    app.open_window_scope(uid)
+    ^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'str' object has no attribute 'open_window_scope'
+2026-06-30 18:20:38 DEBUG   dovw.fe.app          app.py:473 timeline filters removed 7 lane(s) (alive=7, vdesktop=0)
+Exception in Tkinter callback
+Traceback (most recent call last):
+  File "/home/jamesbrown/miniforge3/envs/gui_agent/lib/python3.12/tkinter/__init__.py", line 1968, in __call__
+    return self.func(*args)
+           ^^^^^^^^^^^^^^^^
+  File "/home/jamesbrown/Desktop/works/desktop_overview_with_search/refactor/frontend/views.py", line 94, in scope
+    app.open_window_scope(uid)
+    ^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'str' object has no attribute 'open_window_scope'
+Exception in Tkinter callback
+Traceback (most recent call last):
+  File "/home/jamesbrown/miniforge3/envs/gui_agent/lib/python3.12/tkinter/__init__.py", line 1968, in __call__
+    return self.func(*args)
+           ^^^^^^^^^^^^^^^^
+  File "/home/jamesbrown/Desktop/works/desktop_overview_with_search/refactor/frontend/views.py", line 94, in scope
+    app.open_window_scope(uid)
+    ^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'str' object has no attribute 'open_window_scope'
+2026-06-30 18:20:40 DEBUG   dovw.fe.app          app.py:473 timeline filters removed 7 lane(s) (alive=7, vdesktop=0)
+Exception in Tkinter callback
+Traceback (most recent call last):
+  File "/home/jamesbrown/miniforge3/envs/gui_agent/lib/python3.12/tkinter/__init__.py", line 1968, in __call__
+    return self.func(*args)
+           ^^^^^^^^^^^^^^^^
+  File "/home/jamesbrown/Desktop/works/desktop_overview_with_search/refactor/frontend/views.py", line 94, in scope
+    app.open_window_scope(uid)
+    ^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'str' object has no attribute 'open_window_scope'
+Exception in Tkinter callback
+Traceback (most recent call last):
+  File "/home/jamesbrown/miniforge3/envs/gui_agent/lib/python3.12/tkinter/__init__.py", line 1968, in __call__
+    return self.func(*args)
+           ^^^^^^^^^^^^^^^^
+  File "/home/jamesbrown/Desktop/works/desktop_overview_with_search/refactor/frontend/views.py", line 94, in scope
+    app.open_window_scope(uid)
+    ^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'str' object has no attribute 'open_window_scope'
+Exception in Tkinter callback
+Traceback (most recent call last):
+  File "/home/jamesbrown/miniforge3/envs/gui_agent/lib/python3.12/tkinter/__init__.py", line 1968, in __call__
+    return self.func(*args)
+           ^^^^^^^^^^^^^^^^
+  File "/home/jamesbrown/Desktop/works/desktop_overview_with_search/refactor/frontend/views.py", line 94, in scope
+    app.open_window_scope(uid)
+    ^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'str' object has no attribute 'open_window_scope'
+2026-06-30 18:20:42 DEBUG   dovw.fe.app          app.py:473 timeline filters removed 7 lane(s) (alive=7, vdesktop=0)
+Exception in Tkinter callback
+Traceback (most recent call last):
+  File "/home/jamesbrown/miniforge3/envs/gui_agent/lib/python3.12/tkinter/__init__.py", line 1968, in __call__
+    return self.func(*args)
+           ^^^^^^^^^^^^^^^^
+  File "/home/jamesbrown/Desktop/works/desktop_overview_with_search/refactor/frontend/views.py", line 94, in scope
+    app.open_window_scope(uid)
+    ^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'str' object has no attribute 'open_window_scope'
+
+---
+
+start time and end time issues, should start with date & time -> date & time but now it is date & time -> time, cannot represent cross day timeline
+
+---
+
+guide and timeline display across window title area, wrong
+shall enable current preview if hover on window title text
+default to recent 1d expanded, do not show future, non-ready timespan guides.
+
+a button to move red line to "now" and switch scope there
+
+witness large scale "window title change" event during init or screen unlock? shall compare to old window title first. if title is not changed, why you would store the same title again?
