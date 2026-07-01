@@ -100,9 +100,20 @@ class EventHandlers:
             self.current_focus_title = new
         uid = await self.reg.ensure_window(xid, None, ts)
         await self.reg.bump_last_seen(uid, ts)
-        if self._last_title.get(uid) == new:
-            log.debug("title dedup window_uid=%d unchanged=%s", uid, new)
+
+        cached = self._last_title.get(uid)
+        if cached == new:
+            log.debug("title dedup (cache) window_uid=%d unchanged=%s", uid, new)
             return
+        if cached is None:
+            row = await self.store.fetchone(
+                "SELECT title FROM title_history WHERE window_uid = ? ORDER BY changed_at DESC LIMIT 1",
+                (uid,))
+            latest = row["title"] if row else None
+            if latest == new:
+                self._last_title[uid] = new
+                log.debug("title dedup (db) window_uid=%d unchanged=%s", uid, new)
+                return
         self._last_title[uid] = new
         log.debug("title window_uid=%d x=0x%08x new=%s", uid, xid, new)
         self.store.enqueue(

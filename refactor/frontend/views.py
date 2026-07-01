@@ -26,9 +26,11 @@ PAD = 6
 SCALE_H = 30
 
 
-def render_timeline(app, lanes: list) -> TimelineView | None:
-    """Render or refresh the interactive timeline view inside ``app.inner_frame``."""
-    parent = app.inner_frame
+def render_timeline(app, lanes: list, parent=None) -> TimelineView | None:
+    """Render or refresh the interactive timeline view inside ``app.timeline_frame``."""
+    parent = parent or getattr(app, "inner_frame", None)
+    if parent is None:
+        return None
     parent.rowconfigure(0, weight=1)
     parent.columnconfigure(0, weight=1)
 
@@ -93,6 +95,7 @@ class TimelineView:
         self._label_items: dict[int, int] = {}
         self._indicator_id: int | None = None
         self._indicator_text_id: int | None = None
+        self._indicator_text_bg_id: int | None = None
         self._drag_mode: str | None = None
         self._pan_start_x = 0.0
         self._pan_start_time = 0.0
@@ -118,12 +121,10 @@ class TimelineView:
         self.frame.grid(row=0, column=0, sticky="nsew")
 
         self.canvas = tk.Canvas(self.frame, bg=self.theme["tile_bg"], highlightthickness=0)
-        self.hbar = ttk.Scrollbar(self.frame, orient=tk.HORIZONTAL, command=self._on_hscroll)
         self.vbar = ttk.Scrollbar(self.frame, orient=tk.VERTICAL, command=self.canvas.yview)
-        self.canvas.configure(xscrollcommand=self.hbar.set, yscrollcommand=self.vbar.set)
+        self.canvas.configure(yscrollcommand=self.vbar.set)
 
         self.canvas.grid(row=0, column=0, sticky="nsew")
-        self.hbar.grid(row=1, column=0, sticky="ew")
         self.vbar.grid(row=0, column=1, sticky="ns")
         self.frame.rowconfigure(0, weight=1)
         self.frame.columnconfigure(0, weight=1)
@@ -283,10 +284,6 @@ class TimelineView:
     def _on_configure(self, _event=None):
         self._draw()
 
-    def _on_hscroll(self, *args):
-        self.canvas.xview(*args)
-        self._update_indicator()
-
     def _draw(self):
         self.canvas.delete("all")
         self._span_items.clear()
@@ -388,7 +385,26 @@ class TimelineView:
                 continue
             x = max(x_left, self._x_of(t))
             self.canvas.create_line(x, y + 2, x, y + LANE_H - 2,
-                                    fill=self.theme["mark_bg"])
+                                    fill=self.theme["event_title"])
+
+        # instantaneous event markers (clipboard/selection yellow, keyboard dark blue)
+        for e in lane.events:
+            if e.type == "title" or e.ts is None:
+                continue
+            x = max(x_left, self._x_of(e.ts))
+            if e.type == "clipboard":
+                color = self.theme["event_clipboard"]
+                y0, y1 = y + 2, y + 8
+            elif e.type == "selection":
+                color = self.theme["event_selection"]
+                y0, y1 = y + LANE_H - 8, y + LANE_H - 2
+            elif e.type == "keyboard":
+                color = self.theme["event_keyboard"]
+                mid = y + LANE_H // 2
+                y0, y1 = mid - 3, mid + 3
+            else:
+                continue
+            self.canvas.create_line(x, y0, x, y1, fill=color, width=2)
 
         # solid background for the label column, on top of any bars/ticks
         self.canvas.create_rectangle(0, y, x_left, y + LANE_H,
@@ -413,17 +429,29 @@ class TimelineView:
             x, y1, x, y2, fill=self.theme["indicator"], width=1,
             dash=(4, 4), tags=("indicator",))
         if x >= x_left:
+            text = _fmt_ts(self.indicator_time)
+            tx = x - 4
+            ty = 2
             self._indicator_text_id = self.canvas.create_text(
-                x + 4, 2, text=_fmt_ts(self.indicator_time), anchor="nw",
+                tx, ty, text=text, anchor="ne",
                 fill=self.theme["indicator"], tags=("indicator",))
+            self.canvas.update_idletasks()
+            bbox = self.canvas.bbox(self._indicator_text_id)
+            if bbox:
+                pad = 2
+                self._indicator_text_bg_id = self.canvas.create_rectangle(
+                    bbox[0] - pad, bbox[1] - pad,
+                    bbox[2] + pad, bbox[3] + pad,
+                    fill=self.theme["bg"], outline="#ffffff", width=1,
+                    tags=("indicator",))
+                self.canvas.lower(self._indicator_text_bg_id, self._indicator_text_id)
 
     def _delete_indicator(self):
-        if self._indicator_id is not None:
-            self.canvas.delete(self._indicator_id)
-            self._indicator_id = None
-        if self._indicator_text_id is not None:
-            self.canvas.delete(self._indicator_text_id)
-            self._indicator_text_id = None
+        for attr in ("_indicator_id", "_indicator_text_id", "_indicator_text_bg_id"):
+            item = getattr(self, attr, None)
+            if item is not None:
+                self.canvas.delete(item)
+                setattr(self, attr, None)
 
     def _update_indicator(self):
         x_left = self._x_offset()
@@ -433,8 +461,24 @@ class TimelineView:
             if len(coords) == 4:
                 self.canvas.coords(self._indicator_id, x, coords[1], x, coords[3])
         if self._indicator_text_id is not None:
-            self.canvas.coords(self._indicator_text_id, x + 4, 2)
+            tx = x - 4
+            self.canvas.coords(self._indicator_text_id, tx, 2)
             self.canvas.itemconfigure(self._indicator_text_id, text=_fmt_ts(self.indicator_time))
+            self.canvas.update_idletasks()
+            bbox = self.canvas.bbox(self._indicator_text_id)
+            if bbox:
+                pad = 2
+                if self._indicator_text_bg_id is None:
+                    self._indicator_text_bg_id = self.canvas.create_rectangle(
+                        bbox[0] - pad, bbox[1] - pad,
+                        bbox[2] + pad, bbox[3] + pad,
+                        fill=self.theme["bg"], outline="#ffffff", width=1,
+                        tags=("indicator",))
+                    self.canvas.lower(self._indicator_text_bg_id, self._indicator_text_id)
+                else:
+                    self.canvas.coords(self._indicator_text_bg_id,
+                                       bbox[0] - pad, bbox[1] - pad,
+                                       bbox[2] + pad, bbox[3] + pad)
 
     # ───────────────────────── zoom / pan ─────────────────────────
     def _zoom_to(self, new_scale: float, centre_t: float):
@@ -450,7 +494,8 @@ class TimelineView:
         self._sync_callbacks()
 
     def _on_wheel(self, event):
-        self._destroy_hover_tip()
+        if not self.app._pointer_in_tip(self._hover_tip):
+            self._destroy_hover_tip()
         cx = self.canvas.canvasx(event.x)
         ctrl = bool(event.state & 0x4)
         shift = bool(event.state & 0x1)
@@ -468,7 +513,8 @@ class TimelineView:
         return "break"
 
     def _on_pan_start(self, event):
-        self._destroy_hover_tip()
+        if not self.app._pointer_in_tip(self._hover_tip):
+            self._destroy_hover_tip()
         self.canvas.config(cursor="fleur")
         self._pan_start_x = self.canvas.canvasx(event.x)
         self._pan_start_time = self.start_time
@@ -482,7 +528,8 @@ class TimelineView:
 
     # ───────────────────────── pointer / selection ─────────────────────────
     def _on_press(self, event):
-        self._destroy_hover_tip()
+        if not self.app._pointer_in_tip(self._hover_tip):
+            self._destroy_hover_tip()
         cx = self.canvas.canvasx(event.x)
         cy = self.canvas.canvasy(event.y)
         item = self.canvas.find_closest(cx, cy)[0]
@@ -536,10 +583,21 @@ class TimelineView:
 
     # ───────────────────────── hover detail ─────────────────────────
     def _on_motion(self, event):
-        cx, cy = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
         px, py = event.x_root, event.y_root
+
+        # While Shift is held, ignore all mouse movement and never hide the hover interface.
+        if self.app._is_shift_held():
+            self._hover_pos = (px, py)
+            return
+
+        cx, cy = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
         log.debug("<Motion> widget=%s serial=%s canvas=(%.1f,%.1f) root=(%d,%d)",
                   event.widget, event.serial, cx, cy, px, py)
+
+        # Don't hide the hover tip if the pointer is currently inside it.
+        if self._hover_tip is not None and self.app._pointer_in_tip(self._hover_tip):
+            self._hover_pos = (px, py)
+            return
 
         # Hide the hover tip if the pointer has moved away from where it appeared.
         if self._hover_tip is not None:
@@ -656,21 +714,9 @@ class TimelineView:
             lines = 6
         meta.configure(height=min(max(lines, 3), self.HOVER_MAX_LINES))
 
-        img_lbl = tk.Label(tip, text="…", bg=self.theme["tip_bg"], fg=self.theme["fg"])
-        img_lbl.pack(padx=1, pady=(0, 1))
-
         self._hover_tip = tip
-        self._preview_image_label = img_lbl
+        self._preview_image_label = None
         self._position_hover_tip(px, py)
-
-        # lazy thumbnail at the span midpoint
-        start = span.get("focused_at") or 0
-        end = span.get("ended_at") or start
-        ts = (start + end) / 2.0
-        self.app._submit(
-            lambda: self.api.get_bytes(f"/windows/{lane.window_uid}/window_capture/{ts}"),
-            lambda data, err: self._on_hover_image(data, err, tip, img_lbl, px, py),
-        )
 
     def _show_lane_preview(self, lane, px, py):
         log.debug("_show_lane_preview lane=%d uid=%d", self._hover_lane_idx, lane.window_uid)

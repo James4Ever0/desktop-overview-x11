@@ -49,7 +49,7 @@ class Window:
     jumpable: bool
     last_access: float | None
     window_capture_url: str | None
-    window_capture_ts: int | None
+    window_capture_ts: float | None
     usage_5m: float | None = None
     usage_10m: float | None = None
     usage_30m: float | None = None
@@ -188,19 +188,22 @@ class ApiClient:
             return None
 
     # ───────────────────────── endpoints (08 §2-5) ─────────────────────────
-    def windows(self, *, sort="last_access", order="desc", alive="both", self_xid=None) -> list[Window]:
-        log.debug("api windows sort=%s order=%s alive=%s", sort, order, alive)
-        data = self._get("/windows", sort=sort, order=order, alive=alive, self_xid=self_xid)
+    def windows(self, *, sort="last_access", order="desc", alive="both", self_xid=None,
+                current_boot_only=None) -> list[Window]:
+        log.debug("api windows sort=%s order=%s alive=%s current_boot_only=%s",
+                  sort, order, alive, current_boot_only)
+        data = self._get("/windows", sort=sort, order=order, alive=alive, self_xid=self_xid,
+                         current_boot_only=current_boot_only)
         return [Window.from_json(d) for d in data]
 
     def search(self, *, q=None, window_uid=None, fields=None, alive="both",
                sort="last_access", order="desc", hits="hit_only", t_from=None, t_to=None,
-               self_xid=None, mode="mixed") -> list[Window]:
+               self_xid=None, mode="mixed", current_boot_only=None) -> list[Window]:
         path = "/history" if (t_from is not None or t_to is not None) else "/search"
-        log.debug("api search q=%s window_uid=%s fields=%s sort=%s order=%s mode=%s",
-                  q, window_uid, fields, sort, order, mode)
+        log.debug("api search q=%s window_uid=%s fields=%s sort=%s order=%s mode=%s current_boot_only=%s",
+                  q, window_uid, fields, sort, order, mode, current_boot_only)
         params = dict(q=q, window_uid=window_uid, alive=alive, sort=sort, order=order, hits=hits,
-                      self_xid=self_xid, mode=mode)
+                      self_xid=self_xid, mode=mode, current_boot_only=current_boot_only)
         if fields:
             params["fields"] = ",".join(fields)
         if t_from is not None:
@@ -212,9 +215,14 @@ class ApiClient:
     def window(self, uid: int) -> dict:
         return self._get(f"/windows/{uid}")
 
+    def window_captures(self, uid: int, *, before=None, after=None, limit=10) -> list[dict]:
+        return self._get(f"/windows/{uid}/window_captures", before=before, after=after, limit=limit)
+
     def timeline(self, *, window_uid=None, sort="last_access", order="desc",
-                 t_from=None, t_to=None, self_xid=None) -> list[TimelineLane]:
-        params = dict(window_uid=window_uid, sort=sort, order=order, self_xid=self_xid)
+                 t_from=None, t_to=None, self_xid=None,
+                 current_boot_only=None) -> list[TimelineLane]:
+        params = dict(window_uid=window_uid, sort=sort, order=order, self_xid=self_xid,
+                      current_boot_only=current_boot_only)
         if t_from is not None:
             params["from"] = t_from
         if t_to is not None:

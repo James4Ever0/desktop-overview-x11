@@ -81,13 +81,17 @@ async def get_windows(
     limit: int = Query(200, ge=1, le=2000),
     offset: int = Query(0, ge=0),
     self_xid: str | None = Query(None),
+    current_boot_only: bool = Query(False),
 ):
-    log.debug("GET /windows sort=%s order=%s alive=%s limit=%d", sort, order, alive, limit)
+    log.debug("GET /windows sort=%s order=%s alive=%s limit=%d current_boot_only=%s",
+              sort, order, alive, limit, current_boot_only)
+    current_boot_id = ctx.identity.boot_id if (current_boot_only and ctx.identity) else None
     results = await search.list_windows(
         ctx.store, alive=alive, sort=sort, order=order, limit=limit, offset=offset,
         current_session_key=ctx.session_key,
         title_denylist=ctx.settings.window_title_denylist,
-        self_xid=self_xid)
+        self_xid=self_xid,
+        current_boot_id=current_boot_id)
     return _enrich_window_vdesktops(ctx, results)
 
 
@@ -115,6 +119,35 @@ async def get_window_capture_at(uid: int, ts: float, ctx: DaemonContext = Depend
     return _window_capture_response(ctx, row)
 
 
+@router.get("/windows/{uid}/window_captures", response_model=list[models.WindowCaptureRef])
+async def list_window_captures(
+    uid: int,
+    ctx: DaemonContext = Depends(get_ctx),
+    before: float | None = Query(None, description="captures strictly before this timestamp"),
+    after: float | None = Query(None, description="captures strictly after this timestamp"),
+    limit: int = Query(10, ge=1, le=50),
+):
+    if before is not None:
+        rows = await ctx.store.fetchall(
+            "SELECT captured_at FROM window_capture WHERE window_uid = ? AND captured_at < ? "
+            "ORDER BY captured_at DESC LIMIT ?",
+            (uid, before, limit))
+    elif after is not None:
+        rows = await ctx.store.fetchall(
+            "SELECT captured_at FROM window_capture WHERE window_uid = ? AND captured_at > ? "
+            "ORDER BY captured_at ASC LIMIT ?",
+            (uid, after, limit))
+    else:
+        rows = await ctx.store.fetchall(
+            "SELECT captured_at FROM window_capture WHERE window_uid = ? ORDER BY captured_at DESC LIMIT ?",
+            (uid, limit))
+    return [
+        models.WindowCaptureRef(captured_at=row["captured_at"],
+                                url=f"/windows/{uid}/window_capture/{row['captured_at']}")
+        for row in rows
+    ]
+
+
 def _window_capture_response(ctx, row):
     if row is None or not row["rel_path"]:
         raise HTTPException(status_code=404, detail="no window_capture")
@@ -139,11 +172,13 @@ async def get_search(
     t_to: float | None = Query(None, alias="to"),
     self_xid: str | None = Query(None),
     mode: str = Query("mixed", pattern=MODE_RE),
+    current_boot_only: bool = Query(False),
 ):
-    log.debug("GET /search q=%s window_uid=%s fields=%s sort=%s order=%s mode=%s",
-              q, window_uid, fields, sort, order, mode)
+    log.debug("GET /search q=%s window_uid=%s fields=%s sort=%s order=%s mode=%s current_boot_only=%s",
+              q, window_uid, fields, sort, order, mode, current_boot_only)
     return await _do_search(ctx, q, window_uid, fields, alive, sort, order, hits, t_from, t_to,
-                            self_xid=self_xid, mode=mode)
+                            self_xid=self_xid, mode=mode,
+                            current_boot_only=current_boot_only)
 
 
 # from/to need explicit aliasing because `from` is a Python keyword
@@ -161,22 +196,26 @@ async def get_history(
     t_to: float | None = Query(None, alias="to"),
     self_xid: str | None = Query(None),
     mode: str = Query("mixed", pattern=MODE_RE),
+    current_boot_only: bool = Query(False),
 ):
     return await _do_search(ctx, q, window_uid, fields, alive, sort, order, hits, t_from, t_to,
-                            self_xid=self_xid, mode=mode)
+                            self_xid=self_xid, mode=mode,
+                            current_boot_only=current_boot_only)
 
 
 async def _do_search(ctx, q, window_uid, fields, alive, sort, order, hits, t_from=None, t_to=None,
-                     self_xid=None, mode="mixed"):
+                     self_xid=None, mode="mixed", current_boot_only=False):
     s = ctx.settings
     limit = min(s.search_default_limit, s.search_max_limit)
+    current_boot_id = ctx.identity.boot_id if (current_boot_only and ctx.identity) else None
     results = await search.search(
         ctx.store, q=q, window_uid=window_uid, fields=_fields(fields), alive=alive,
         t_from=t_from, t_to=t_to, sort=sort, order=order, hits=hits, limit=limit,
         current_session_key=ctx.session_key,
         title_denylist=s.window_title_denylist,
         self_xid=self_xid,
-        mode=mode)
+        mode=mode,
+        current_boot_id=current_boot_id)
     return _enrich_window_vdesktops(ctx, results)
 
 
@@ -190,13 +229,17 @@ async def get_timeline(
     t_from: float | None = Query(None, alias="from"),
     t_to: float | None = Query(None, alias="to"),
     self_xid: str | None = Query(None),
+    current_boot_only: bool = Query(False),
 ):
-    log.debug("GET /timeline window_uid=%s sort=%s order=%s", window_uid, sort, order)
+    log.debug("GET /timeline window_uid=%s sort=%s order=%s current_boot_only=%s",
+              window_uid, sort, order, current_boot_only)
+    current_boot_id = ctx.identity.boot_id if (current_boot_only and ctx.identity) else None
     lanes = await search.timeline(
         ctx.store, t_from=t_from, t_to=t_to, window_uid=window_uid,
         sort=sort, order=order, current_session_key=ctx.session_key,
         title_denylist=ctx.settings.window_title_denylist,
-        self_xid=self_xid)
+        self_xid=self_xid,
+        current_boot_id=current_boot_id)
     return _enrich_timeline_vdesktops(ctx, lanes)
 
 

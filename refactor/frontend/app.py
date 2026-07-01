@@ -146,11 +146,17 @@ def _palette(theme: dict) -> dict:
         "accent": theme["accent"], "muted": theme["muted"],
         "mark_bg": theme["mark_bg"], "alive": theme["alive"], "dead": theme["dead"],
         "indicator": theme.get("indicator", "#ff4444"),
+        "event_title": theme.get("event_title", "#4caf50"),
+        "event_clipboard": theme.get("event_clipboard", "#ffcc00"),
+        "event_selection": theme.get("event_selection", "#ffcc00"),
+        "event_keyboard": theme.get("event_keyboard", "#2a5a8a"),
         "canvas_bg": theme["bg"], "entry_bg": theme["tile_bg"], "entry_fg": theme["fg"],
         "select_bg": theme["accent"], "tip_border": theme["accent"],
         "tip_bg": theme["bg"], "tiptitle_bg": theme["tile_bg"], "tiptitle_fg": theme["fg"],
     }
 
+
+APP_GEOMETRY="1500x800"
 
 class WindowPreviewApp(tk.Tk):
     def __init__(self, settings, client: ApiClient):
@@ -159,7 +165,7 @@ class WindowPreviewApp(tk.Tk):
         self.api = client
         self.theme = _palette(settings.theme)
         self.title("Desktop Overview — search")
-        self.geometry("1200x800")
+        self.geometry(APP_GEOMETRY)
 
         self._setup_fonts()
         self._apply_theme()
@@ -177,6 +183,7 @@ class WindowPreviewApp(tk.Tk):
             "selected_window_uid": None,
             "filter_no_vdesktop": False,
             "hide_self": self.s.hide_self,
+            "current_boot_only": True,
         }
         # identify our own X window for the hide-self filter (Tk-only, no Xlib)
         self._self_xid = self._get_self_xid()
@@ -199,6 +206,7 @@ class WindowPreviewApp(tk.Tk):
         self._search_after = None
         self._refresh_after = None
         self._busy = False
+        self._render_generation = 0
 
         # hover preview state (lifted from the demo)
         self._preview_tip = None
@@ -210,16 +218,31 @@ class WindowPreviewApp(tk.Tk):
         self._still_since = 0.0
         self._last_pointer = (-1, -1)
 
+        # image-hover screenshot navigation state
+        self._preview_capture_ts: float | None = None
+
+        # focus tracking: hide hover tips when the main UI loses focus
+        self._focus_out_after: str | None = None
+
+        # shift state for temporarily locking hover previews
+        self._shift_count = 0
+
         self._build_controls()
         self._build_grid()
         self._build_banner()
 
         self.bind_all("<Key>", self.on_global_key)
+        self.bind_all("<KeyPress-Shift_L>", self._on_shift_press)
+        self.bind_all("<KeyPress-Shift_R>", self._on_shift_press)
+        self.bind_all("<KeyRelease-Shift_L>", self._on_shift_release)
+        self.bind_all("<KeyRelease-Shift_R>", self._on_shift_release)
         self.bind_all("<Button-4>", self.on_mousewheel)
         self.bind_all("<Button-5>", self.on_mousewheel)
         self.bind_all("<MouseWheel>", self.on_mousewheel)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.bind("<Configure>", self._on_root_configure)
+        self.bind("<FocusOut>", self._on_focus_out)
+        self.bind("<FocusIn>", self._on_focus_in)
 
         self.after(100, self.render)
         self._poll_hover()
@@ -278,6 +301,56 @@ class WindowPreviewApp(tk.Tk):
         self.option_add("*TCombobox*Listbox.selectForeground", c["entry_fg"])
         style.configure("TCheckbutton", background=c["bg"], foreground=c["fg"])
         style.configure("TRadiobutton", background=c["bg"], foreground=c["fg"])
+        # native notebook tabs: dark tiles with white text, selected matches page bg
+        style.configure("TNotebook", background=c["bg"], tabmargins=[0, 0, 0, 0])
+        style.configure("TNotebook.Tab", background=c["tile_bg"], foreground="#ffffff",
+                        padding=[10, 2])
+        style.map("TNotebook.Tab",
+                  background=[("selected", c["bg"]), ("active", c["select_bg"])],
+                  foreground=[("selected", "#ffffff"), ("active", "#ffffff")])
+
+    def _on_focus_out(self, _event=None):
+        self._focus_out_after = self.after(50, self._check_app_focus_lost)
+
+    def _on_focus_in(self, _event=None):
+        if self._focus_out_after is not None:
+            self.after_cancel(self._focus_out_after)
+            self._focus_out_after = None
+
+    def _check_app_focus_lost(self):
+        self._focus_out_after = None
+        if self.focus_get() is None:
+            log.debug("main UI lost focus; destroying hover tips")
+            self._destroy_tip()
+            view = getattr(self, "_timeline_view", None)
+            if view is not None:
+                view._destroy_hover_tip()
+
+    def _is_shift_held(self) -> bool:
+        return self._shift_count > 0
+
+    def _on_shift_press(self, _event=None):
+        self._shift_count += 1
+
+    def _on_shift_release(self, _event=None):
+        self._shift_count = max(0, self._shift_count - 1)
+        # Record the current pointer location so releasing Shift does not count
+        # as a sudden mouse movement.
+        try:
+            self._last_pointer = (self.winfo_pointerx(), self.winfo_pointery())
+        except Exception:                               # noqa: BLE001
+            pass
+
+    def _pointer_in_tip(self, tip: tk.Toplevel | None) -> bool:
+        """True if the pointer is currently inside the given hover Toplevel."""
+        if tip is None or not tip.winfo_exists() or not tip.winfo_viewable():
+            return False
+        px, py = self.winfo_pointerx(), self.winfo_pointery()
+        x1 = tip.winfo_rootx()
+        y1 = tip.winfo_rooty()
+        x2 = x1 + tip.winfo_width()
+        y2 = y1 + tip.winfo_height()
+        return x1 <= px < x2 and y1 <= py < y2
 
     def _get_self_xid(self) -> str | None:
         """Return this Tk window's X11 id as '0xXXXXXXXX', or None if unknown."""
@@ -313,16 +386,12 @@ class WindowPreviewApp(tk.Tk):
         bar = ttk.Frame(self)
         bar.pack(fill=tk.X, padx=6, pady=(6, 0))
 
-        # tabs (08 §5)
-        self.tab_search = ttk.Button(bar, text="🔍 Search", command=lambda: self.switch_view("search"))
-        self.tab_timeline = ttk.Button(bar, text="🕑 Timeline", command=lambda: self.switch_view("timeline"))
-        self.tab_search.pack(side=tk.LEFT)
-        self.tab_timeline.pack(side=tk.LEFT, padx=(4, 12))
         self.back_btn = ttk.Button(bar, text="◀ Back", command=self.go_back)
         if self.s.show_back_button:
             self.back_btn.pack(side=tk.LEFT)
 
-        ttk.Label(bar, text="Search:").pack(side=tk.LEFT, padx=(12, 4))
+        self._search_label = ttk.Label(bar, text="Search:")
+        self._search_label.pack(side=tk.LEFT, padx=(12, 4))
         self.search_var = tk.StringVar()
         self.search_entry = ttk.Entry(bar, textvariable=self.search_var, font=self.search_font)
         self.search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4, ipady=6)
@@ -379,6 +448,13 @@ class WindowPreviewApp(tk.Tk):
                                              command=self._apply_filters)
         self._hide_self_cb.pack(side=tk.LEFT, padx=(8, 2))
 
+        # current boot session filter (search + timeline)
+        self.current_boot_var = tk.BooleanVar(value=self.view_state.get("current_boot_only", True))
+        self._current_boot_cb = ttk.Checkbutton(flt, text="current boot",
+                                                variable=self.current_boot_var,
+                                                command=self._apply_filters)
+        self._current_boot_cb.pack(side=tk.LEFT, padx=(8, 2))
+
         # sort / order (applies to search grid and timeline lanes)
         ttk.Label(flt, text="   Sort:").pack(side=tk.LEFT)
         self.sort_var = tk.StringVar(value="last_access")
@@ -415,9 +491,18 @@ class WindowPreviewApp(tk.Tk):
         self.now_btn = ttk.Button(flt, text="Now", command=self._now_timeline)
         self._timeline_filters.append(self.now_btn)
 
+        # native tabbed container: each view keeps its own canvas and scroll position
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+        self.search_frame = ttk.Frame(self.notebook)
+        self.timeline_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.search_frame, text="Search")
+        self.notebook.add(self.timeline_frame, text="Timeline")
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
+
     def _build_grid(self):
-        self.canvas = tk.Canvas(self, bg=self.theme["canvas_bg"], highlightthickness=0)
-        self.scrollbar = ttk.Scrollbar(self, orient=tk.VERTICAL, command=self.canvas.yview)
+        self.canvas = tk.Canvas(self.search_frame, bg=self.theme["canvas_bg"], highlightthickness=0)
+        self.scrollbar = ttk.Scrollbar(self.search_frame, orient=tk.VERTICAL, command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=self.scrollbar.set)
         self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -428,22 +513,9 @@ class WindowPreviewApp(tk.Tk):
         self.canvas.bind("<Configure>", self._on_canvas_configure)
 
     def _on_canvas_configure(self, event=None):
-        """Keep the inner_frame sized to the viewport so views fill the window.
-
-        In timeline mode we also pin the height so the timeline canvas expands
-        vertically; in search mode the height is left natural so tiles can scroll.
-        """
+        """Keep the search inner_frame sized to the viewport width."""
         width = event.width if event else self.canvas.winfo_width()
-        height = event.height if event else self.canvas.winfo_height()
         self.canvas.itemconfig(self._inner_window, width=width)
-        if self.view_state.get("view") == "timeline":
-            self.canvas.itemconfig(self._inner_window, height=height)
-            self.inner_frame.configure(width=width, height=height)
-            if self._timeline_view is not None:
-                self._timeline_view._draw()
-        else:
-            self.canvas.itemconfig(self._inner_window, height=0)
-            self.inner_frame.configure(width=width, height=0)
 
     def _build_banner(self):
         self.banner = ttk.Label(self, anchor="center", style="Dead.Tile.TLabel")
@@ -476,6 +548,7 @@ class WindowPreviewApp(tk.Tk):
     # ───────────────────────── render dispatch (08 §5) ─────────────────────────
     def render(self):
         self._refresh_self_xid()
+        self._render_generation += 1
         if self.view_state["view"] == "timeline":
             self._render_timeline()
         else:
@@ -493,19 +566,62 @@ class WindowPreviewApp(tk.Tk):
         self._resize_after = self.after(300, self.render)
 
     def switch_view(self, view: str):
-        if view != self.view_state["view"]:
+        """Public alias used by external callers (kept for compatibility)."""
+        self._switch_to_view(view, push_history=True)
+
+    def _switch_to_view(self, view: str, push_history: bool = True, clear_scope: bool = True):
+        """Change the active view, clearing any stale hover/render state."""
+        if view == self.view_state["view"]:
+            return
+        if push_history:
             self._push_history()
-            self._clear_view()
-            # clear scope when switching views via tabs (it's only meaningful
-            # when set explicitly via open_window_scope / right-click)
+        # Bump the generation so any in-flight render result for the old view is ignored.
+        self._render_generation += 1
+        self.view_state["view"] = view
+        # Clear scope when switching via tabs (only meaningful when set explicitly).
+        if clear_scope:
             self.view_state["selected_window_uid"] = None
             self.scope_var.set("")
-        self.view_state["view"] = view
         self.title(f"Desktop Overview — {view}")
         self._self_title_prefix = self.title()
         self._show_search_filters(view == "search")
+        self._sync_notebook_tab()
+        self.focus()
+        if view == "search":
+            self._on_canvas_configure()
+        self._destroy_tip()
+        view_obj = getattr(self, "_timeline_view", None)
+        if view_obj is not None:
+            view_obj._destroy_hover_tip()
         log.info("switch view -> %s", view)
         self.render()
+
+    def _on_notebook_tab_changed(self, _event=None):
+        idx = self.notebook.index(self.notebook.select())
+        view = "timeline" if idx == 1 else "search"
+        if view == self.view_state["view"]:
+            return
+        self._switch_to_view(view, push_history=True)
+
+    def _sync_notebook_tab(self):
+        if not getattr(self, "notebook", None):
+            return
+        if self.view_state["view"] == "timeline":
+            self.notebook.select(self.timeline_frame)
+        else:
+            self.notebook.select(self.search_frame)
+
+    def _wrap_callback(self, generation: int, view: str, callback):
+        """Drop results from a render that was superseded or switched away from."""
+        def wrapped(res, err):
+            if not self.winfo_exists():
+                return
+            if generation != self._render_generation or self.view_state.get("view") != view:
+                log.debug("stale render result ignored gen=%d view=%s current=%s",
+                          generation, view, self.view_state.get("view"))
+                return
+            callback(res, err)
+        return wrapped
 
     def _render_search(self):
         st = self.view_state
@@ -518,12 +634,15 @@ class WindowPreviewApp(tk.Tk):
         def call():
             if q is None and scope is None and st["from"] is None and st["to"] is None:
                 return self.api.windows(sort=st["sort"], order=st["order"], alive=st["alive"],
-                                        self_xid=self_xid)
+                                        self_xid=self_xid,
+                                        current_boot_only=st.get("current_boot_only"))
             return self.api.search(q=q, window_uid=scope, fields=st["fields"],
                                    alive=st["alive"], sort=st["sort"], order=st["order"],
                                    hits=st["hits"], t_from=st["from"], t_to=st["to"],
-                                   self_xid=self_xid, mode="mixed")
-        self._submit(call, self._on_search_results)
+                                   self_xid=self_xid, mode="mixed",
+                                   current_boot_only=st.get("current_boot_only"))
+        gen = self._render_generation
+        self._submit(call, self._wrap_callback(gen, "search", self._on_search_results))
 
     def _on_search_results(self, windows, err):
         if err is not None:
@@ -545,8 +664,10 @@ class WindowPreviewApp(tk.Tk):
             return self.api.timeline(window_uid=st["selected_window_uid"],
                                      sort=st["sort"], order=st["order"],
                                      t_from=st["from"], t_to=st["to"],
-                                     self_xid=self_xid)
-        self._submit(call, self._on_timeline_results)
+                                     self_xid=self_xid,
+                                     current_boot_only=st.get("current_boot_only"))
+        gen = self._render_generation
+        self._submit(call, self._wrap_callback(gen, "timeline", self._on_timeline_results))
 
     def _on_timeline_results(self, lanes, err):
         if err is not None:
@@ -568,11 +689,10 @@ class WindowPreviewApp(tk.Tk):
         lanes = [l for l in lanes if not self._is_self(l)]
         self._hide_banner()
         self.status_var.set(f"{len(lanes) if lanes else 0} lane(s)")
-        view = views.render_timeline(self, lanes or [])
+        view = views.render_timeline(self, lanes or [], parent=self.timeline_frame)
         if view is not None:
             view.scale_callback = self._on_timeline_scale
             view.indicator_callback = self._on_timeline_indicator
-            self._on_canvas_configure()
 
     def _on_timeline_scale(self, scale: float):
         self.view_state["t_scale"] = scale
@@ -904,8 +1024,9 @@ class WindowPreviewApp(tk.Tk):
         self._search_after = None
         self.view_state["q"] = self.search_var.get()
         if self.view_state["view"] != "search":
-            self.view_state["view"] = "search"
-        self.render()
+            self._switch_to_view("search", push_history=False, clear_scope=False)
+        else:
+            self.render()
 
     def _apply_filters(self):
         self.view_state["fields"] = [f for f, v in self.field_vars.items() if v.get()] or list(ALL_FIELDS)
@@ -913,6 +1034,7 @@ class WindowPreviewApp(tk.Tk):
         self.view_state["hits"] = self.hits_var.get()
         self.view_state["filter_no_vdesktop"] = self.filter_no_vdesktop_var.get()
         self.view_state["hide_self"] = self.hide_self_var.get()
+        self.view_state["current_boot_only"] = self.current_boot_var.get()
         self.render()
 
     def _on_sort_changed(self, _event=None):
@@ -927,6 +1049,8 @@ class WindowPreviewApp(tk.Tk):
     def _show_search_filters(self, visible: bool):
         """Show/hide knobs that only apply to the current view."""
         if visible:
+            self._search_label.pack(side=tk.LEFT, padx=(12, 4))
+            self.search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4, ipady=6)
             self._fields_label.pack(side=tk.LEFT)
             for cb in self._field_cbs:
                 cb.pack(side=tk.LEFT, padx=2)
@@ -935,6 +1059,8 @@ class WindowPreviewApp(tk.Tk):
             for w in self._timeline_filters:
                 w.pack_forget()
         else:
+            self._search_label.pack_forget()
+            self.search_entry.pack_forget()
             self._fields_label.pack_forget()
             for cb in self._field_cbs:
                 cb.pack_forget()
@@ -954,6 +1080,7 @@ class WindowPreviewApp(tk.Tk):
         self.sort_var.set(self.view_state.get("sort", "last_access"))
         self.order_var.set(self.view_state.get("order", "desc"))
         self.hide_self_var.set(self.view_state.get("hide_self", self.s.hide_self))
+        self.current_boot_var.set(self.view_state.get("current_boot_only", True))
 
     def _push_history(self):
         self._history_stack.append(dict(self.view_state))
@@ -963,24 +1090,35 @@ class WindowPreviewApp(tk.Tk):
     def go_back(self):
         if not self._history_stack:
             return
+        prev_view = self.view_state.get("view")
         self.view_state = self._history_stack.pop()
         self.search_var.set(self.view_state.get("q", ""))
         uid = self.view_state.get("selected_window_uid")
         self.scope_var.set(f"scoped to window #{uid}  (clear ✕)" if uid else "")
         self._sync_filter_widgets()
         self._show_search_filters(self.view_state["view"] == "search")
+        self._sync_notebook_tab()
+        if self.view_state.get("view") == "search":
+            self._on_canvas_configure()
         self.render()
 
     # ───────────────────────── global key + mousewheel (from demo) ─────────────────────────
     def on_global_key(self, event):
-        if self._preview_tip is not None:
+        px, py = self.winfo_pointerx(), self.winfo_pointery()
+        in_tip = self._pointer_in_tip(self._preview_tip)
+        log.debug("on_global_key keysym=%s char=%r widget=%s view=%s kind=%s pointer=(%d,%d) in_tip=%s",
+                  event.keysym, event.char, event.widget, self.view_state.get("view"),
+                  self._preview_kind, px, py, in_tip)
+        # Don't hide a hover preview if the pointer is currently inside it.
+        if self._preview_tip is not None and not in_tip:
             self._destroy_tip()
-        self._hover_uid = None
-        # Hide any open timeline hover preview on keyboard input.
+            self._hover_uid = None
+        # Hide any open timeline hover preview on keyboard input unless pointer is inside it.
         view = getattr(self, "_timeline_view", None)
-        if view is not None:
+        if view is not None and view._hover_tip is not None and not self._pointer_in_tip(view._hover_tip):
             view._destroy_hover_tip()
         if event.widget is self.search_entry:
+            log.debug("key event in search entry; returning")
             return
         if self.view_state.get("view") == "timeline" and event.widget not in (
             self.scale_entry, self.indicator_entry
@@ -999,6 +1137,17 @@ class WindowPreviewApp(tk.Tk):
                 if event.keysym == "Down":
                     view._zoom_to(view.scale * view.ZOOM_FACTOR, view.indicator_time)
                     return "break"
+        # Image hover navigation: Left/Right steps through screenshots while pointer is inside the tip.
+        if (self._preview_tip is not None and self._preview_kind == "image"
+                and in_tip):
+            if event.keysym == "Left":
+                log.debug("image hover Left arrow recognised -> previous capture")
+                self._navigate_preview(1)   # previous (older) capture
+                return "break"
+            if event.keysym == "Right":
+                log.debug("image hover Right arrow recognised -> next capture")
+                self._navigate_preview(-1)  # next (newer) capture
+                return "break"
         if event.char and len(event.char) == 1 and (event.char.isprintable() or event.char == " "):
             self.search_entry.focus_set()
             self.search_entry.insert(tk.INSERT, event.char)
@@ -1018,7 +1167,16 @@ class WindowPreviewApp(tk.Tk):
     # ───────────────────────── hover preview (from demo) ─────────────────────────
     def _poll_hover(self):
         try:
+            # Hover previews only make sense in the search grid.
+            if self.view_state.get("view") != "search":
+                self._last_pointer = (self.winfo_pointerx(), self.winfo_pointery())
+                return
             px, py = self.winfo_pointerx(), self.winfo_pointery()
+            # While Shift is held, or while the pointer is inside the preview tip,
+            # ignore mouse movement completely and never hide the hover interface.
+            if self._is_shift_held() or self._pointer_in_tip(self._preview_tip):
+                self._last_pointer = (px, py)
+                return
             lx, ly = self._last_pointer
             moved = (abs(px - lx) > HOVER_MOVE_THRESHOLD_PX or abs(py - ly) > HOVER_MOVE_THRESHOLD_PX)
             self._last_pointer = (px, py)
@@ -1102,6 +1260,7 @@ class WindowPreviewApp(tk.Tk):
         except tk.TclError:
             pass
         title = w.display_label
+        self._preview_display_label = w.display_label
 
         if kind == "image":
             wrap_w = photo.width()
@@ -1117,12 +1276,19 @@ class WindowPreviewApp(tk.Tk):
             self._preview_image_label = lbl
             self._preview_text = None
             self._preview_kind = "image"
+            self._preview_capture_ts = w.window_capture_ts
+            self._update_preview_title(w.window_capture_ts)
+            self._block_wheel_on(tip)
+            self._block_wheel_on(title_lbl)
+            self._block_wheel_on(lbl)
         else:
             title_lbl = tk.Label(tip, text=title, anchor="w", justify="left",
                                  bg=self.theme["tiptitle_bg"], fg=self.theme["tiptitle_fg"],
                                  font=self.title_font, padx=8, pady=4, wraplength=500)
             title_lbl.pack(fill=tk.X, padx=1, pady=(1, 0))
-            meta = tk.Text(tip, height=1, width=60, wrap="word", bd=0,
+            meta_frame = ttk.Frame(tip)
+            meta_frame.pack(fill=tk.BOTH, expand=False, padx=1, pady=(0, 1))
+            meta = tk.Text(meta_frame, height=1, width=60, wrap="word", bd=0,
                            bg=self.theme["tip_bg"], fg=self.theme["fg"],
                            highlightthickness=0, padx=8, pady=4,
                            font=self.meta_font)
@@ -1130,7 +1296,7 @@ class WindowPreviewApp(tk.Tk):
             meta.tag_configure("mark", background=self.theme["mark_bg"])
             meta.tag_configure("time", foreground=self.theme["muted"])
             meta.tag_configure("section", foreground=self.theme["accent"])
-            meta.pack(fill=tk.X, padx=1, pady=(0, 1))
+            meta.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
             self._fill_preview_metadata(meta, w, detail)
             meta.configure(state="disabled")
             meta.update_idletasks()
@@ -1138,15 +1304,26 @@ class WindowPreviewApp(tk.Tk):
                 lines = int(float(meta.index("end-1c")))
             except Exception:                                      # noqa: BLE001
                 lines = 6
-            meta.configure(height=min(max(lines, 3), 16))
+            height = min(max(lines, 3), 16)
+            meta.configure(height=height)
+            if lines > height:
+                sb = ttk.Scrollbar(meta_frame, orient=tk.VERTICAL, command=meta.yview)
+                sb.pack(side=tk.RIGHT, fill=tk.Y)
+                meta.configure(yscrollcommand=sb.set)
+            self._bind_text_scroll(meta)
             self._preview_tip = tip
             self._preview_title_label = title_lbl
             self._preview_image_label = None
             self._preview_text = meta
             self._preview_kind = "metadata"
+            self._block_wheel_on(tip)
+            self._block_wheel_on(title_lbl)
+            self._block_wheel_on(meta_frame)
 
         self._hover_uid = w.window_uid
         self._position_preview_tip()
+        log.debug("created hover tip kind=%s uid=%d ts=%s",
+                  self._preview_kind, w.window_uid, _fmt_ts(self._preview_capture_ts))
 
     def _fill_preview_metadata(self, box: tk.Text, w: Window, detail: dict | None):
         """Populate the hover detail Text with hits, usage, recent events, titles."""
@@ -1197,11 +1374,109 @@ class WindowPreviewApp(tk.Tk):
                 self._insert_marked(box, body)
                 box.insert(tk.END, "\n")
 
+    def _block_wheel_on(self, widget):
+        """Stop mouse-wheel events on a hover tip from scrolling the main grid."""
+        widget.bind("<MouseWheel>", lambda _e: "break")
+        widget.bind("<Button-4>", lambda _e: "break")
+        widget.bind("<Button-5>", lambda _e: "break")
+
+    def _bind_text_scroll(self, text: tk.Text):
+        """Bind wheel events on a disabled/small Text so it scrolls itself."""
+        def _scroll(event):
+            if event.num == 4:
+                text.yview_scroll(-1, "units")
+            elif event.num == 5:
+                text.yview_scroll(1, "units")
+            elif event.delta:
+                text.yview_scroll(-1 if event.delta > 0 else 1, "units")
+            return "break"
+        text.bind("<MouseWheel>", _scroll)
+        text.bind("<Button-4>", _scroll)
+        text.bind("<Button-5>", _scroll)
+
+    def _update_preview_title(self, ts: float | None):
+        """Refresh the hover title label to show the screenshot timestamp."""
+        if self._preview_title_label is None:
+            return
+        text = self._preview_display_label or ""
+        if ts is not None and ts > 0:
+            text = f"{text}\n{_fmt_ts(ts)}"
+        self._preview_title_label.configure(text=text)
+
+    def _navigate_preview(self, delta: int):
+        """Step to the previous/next screenshot using cursor-style queries."""
+        if self._hover_uid is None or self._preview_kind != "image":
+            return
+        if delta == 0:
+            return
+        current_ts = self._preview_capture_ts
+        if current_ts is None or current_ts <= 0:
+            return
+        # delta > 0 → previous (older) capture; delta < 0 → next (newer) capture.
+        log.debug("navigate preview uid=%d delta=%d current_ts=%s", self._hover_uid, delta, _fmt_ts(current_ts))
+        if delta > 0:
+            self._submit(
+                lambda: self.api.window_captures(
+                    self._hover_uid, before=current_ts, limit=1),
+                lambda data, err: self._on_navigate_result(data, err, direction="prev"),
+            )
+        else:
+            self._submit(
+                lambda: self.api.window_captures(
+                    self._hover_uid, after=current_ts, limit=1),
+                lambda data, err: self._on_navigate_result(data, err, direction="next"),
+            )
+
+    def _on_navigate_result(self, data, err, direction: str):
+        if err or not data or self._preview_tip is None or self._preview_kind != "image":
+            log.debug("navigate result ignored direction=%s err=%s tip=%s kind=%s",
+                      direction, err is not None, self._preview_tip is not None, self._preview_kind)
+            return
+        cap = data[0]
+        ts = cap.get("captured_at")
+        url = cap.get("url")
+        if not ts or not url:
+            log.debug("navigate result empty direction=%s", direction)
+            return
+        log.debug("navigate result direction=%s ts=%s url=%s", direction, _fmt_ts(ts), url)
+        self._preview_capture_ts = ts
+        self._update_preview_title(ts)
+        self._submit(
+            lambda: self.api.get_bytes(url),
+            lambda data2, err2: self._on_navigated_image(data2, err2),
+        )
+
+    def _on_navigated_image(self, data, err):
+        if err or not data or self._preview_tip is None or self._preview_kind != "image":
+            log.debug("navigated image ignored err=%s tip=%s kind=%s",
+                      err is not None, self._preview_tip is not None, self._preview_kind)
+            return
+        try:
+            img = Image.open(io.BytesIO(data))
+            m = self.s.hover_preview_max_dim
+            if img.width > m or img.height > m:
+                img.thumbnail((m, m), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+        except Exception as exc:                                  # noqa: BLE001
+            log.debug("navigated image decode failed: %s", exc)
+            return
+        log.debug("navigated image loaded %dx%d; keeping existing tip position", photo.width(), photo.height())
+        if self._preview_image_label is not None:
+            self._preview_image_label.configure(image=photo, text="")
+            self._preview_image_label.image = photo
+        if self._preview_title_label is not None:
+            wrap_w = photo.width()
+            self._preview_title_label.configure(wraplength=wrap_w)
+
     def _update_preview_image(self, w: Window):
         """Refresh the currently-open image hover preview with a new capture/title."""
         if self._preview_tip is None or self._hover_uid != w.window_uid:
             return
         if getattr(self, "_preview_kind", None) != "image":
+            return
+        # If the user has navigated away from the latest capture, don't auto-refresh.
+        if (self._preview_capture_ts is not None
+                and self._preview_capture_ts != w.window_capture_ts):
             return
         if w.window_capture_url is None:
             self._destroy_tip()
@@ -1225,14 +1500,16 @@ class WindowPreviewApp(tk.Tk):
                 photo = ImageTk.PhotoImage(img)
             except Exception:                           # noqa: BLE001
                 return
+            log.debug("auto-refresh image loaded %dx%d for uid=%d; keeping tip position",
+                      photo.width(), photo.height(), w.window_uid)
             self._preview_cache[w.window_uid] = photo
             if self._preview_image_label is not None:
                 self._preview_image_label.configure(image=photo)
                 self._preview_image_label.image = photo
-            self._preview_title_label.configure(text=w.display_label)
+            self._preview_capture_ts = w.window_capture_ts
+            self._update_preview_title(w.window_capture_ts)
             if photo is not None:
                 self._preview_title_label.configure(wraplength=photo.width())
-            self._position_preview_tip()
 
         self._submit(fetch, done)
 
@@ -1250,16 +1527,21 @@ class WindowPreviewApp(tk.Tk):
         if x < 0:
             x = max(0, (sw - tw) // 2)
         y = max(0, min(py - th // 2, sh - th))
+        log.debug("positioning hover tip pointer=(%d,%d) tip=%dx%d pos=(%d,%d) screen=%dx%d",
+                  px, py, tw, th, x, y, sw, sh)
         self._preview_tip.geometry("+%d+%d" % (int(x), int(y)))
 
     def _destroy_tip(self):
         if self._preview_tip is not None:
+            log.debug("destroying hover tip")
             self._preview_tip.destroy()
             self._preview_tip = None
         self._preview_title_label = None
         self._preview_image_label = None
         self._preview_text = None
         self._preview_kind = None
+        self._preview_display_label = ""
+        self._preview_capture_ts = None
 
     # ───────────────────────── auto-refresh + close ─────────────────────────
     def _schedule_auto_refresh(self):

@@ -89,6 +89,13 @@ async def _seed(store):
     await store.execute(
         "INSERT INTO window_capture(window_uid, rel_path, width, height, captured_at, is_focused)"
         " VALUES(?,?,?,?,?,?)", (a, rel, 8, 8, 300.0, 1))
+    # second capture for cursor navigation tests
+    rel2 = os.path.join("window_captures", "b", str(a), "400000.png")
+    abs_path2 = Path(_TMP) / rel2
+    Image.new("RGB", (8, 8), (20, 30, 40)).save(abs_path2, "PNG")
+    await store.execute(
+        "INSERT INTO window_capture(window_uid, rel_path, width, height, captured_at, is_focused)"
+        " VALUES(?,?,?,?,?,?)", (a, rel2, 8, 8, 400.0, 1))
     return a, b, c
 
 
@@ -269,6 +276,18 @@ async def test_api(store, a, b, c):
         r = await cli.get(f"/windows/{b}/window_capture/latest")
         check("GET window_capture for window w/o window_capture 404", r.status_code == 404)
 
+        r = await cli.get(f"/windows/{a}/window_captures")
+        caps = r.json()
+        check("GET window_captures lists captures desc", r.status_code == 200 and [c["captured_at"] for c in caps] == [400.0, 300.0])
+        r = await cli.get(f"/windows/{a}/window_captures", params={"before": 400.0})
+        check("GET window_captures before returns older capture",
+              r.status_code == 200 and [c["captured_at"] for c in r.json()] == [300.0])
+        r = await cli.get(f"/windows/{a}/window_captures", params={"after": 300.0})
+        check("GET window_captures after returns newer capture",
+              r.status_code == 200 and [c["captured_at"] for c in r.json()] == [400.0])
+        r = await cli.get(f"/windows/{b}/window_captures")
+        check("GET window_captures for window w/o captures empty", r.status_code == 200 and r.json() == [])
+
         r = await cli.get("/timeline")
         check("GET /timeline 200", r.status_code == 200 and len(r.json()) == 3)
 
@@ -303,6 +322,91 @@ async def test_api(store, a, b, c):
         capture_mod.get_window_list = lambda: []   # now vanished from client list
         r = await cli.post(f"/windows/{a}/activate")
         check("activate vanished window -> reason vanished", r.json()["reason"] == "vanished")
+
+
+async def test_boot_filter(store):
+    print("[search] current_boot_only filter")
+    # Two machine boots: current and previous.  Windows are tied to the last daemon run
+    # that saw them; the filter should keep current-boot windows (alive or dead) and
+    # drop windows whose last run belonged to a previous boot.
+    rid_cur = await store.execute(
+        "INSERT INTO daemon_run(daemon_boot_id, machine_boot_id, session_key, started_at)"
+        " VALUES('dcur','current-boot','sess',1.0)")
+    rid_old = await store.execute(
+        "INSERT INTO daemon_run(daemon_boot_id, machine_boot_id, session_key, started_at)"
+        " VALUES('dold','old-boot','sess',1.0)")
+
+    async def boot_win(xid, rid, alive, title, focused_at):
+        uid = await store.execute(
+            "INSERT INTO window(session_key, first_daemon_run_id, last_daemon_run_id,"
+            " x_window_id, wm_class, app_name, vdesktop_index, vdesktop_name,"
+            " first_seen, last_seen, alive) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            ("sess", rid, rid, xid, "app", "app", 0, "Desk", 1.0, 500.0, alive))
+        await store.execute(
+            "INSERT INTO title_history(window_uid, title, changed_at) VALUES(?,?,?)",
+            (uid, title, focused_at))
+        await store.execute(
+            "INSERT INTO focus_event(window_uid, vdesktop_index, vdesktop_name, focused_at)"
+            " VALUES(?,?,?,?)", (uid, 0, "Desk", focused_at))
+        return uid
+
+    cur_alive = await boot_win(0xD001, rid_cur, 1, "current alive alpha", 1000.0)
+    cur_dead = await boot_win(0xD002, rid_cur, 0, "current dead alpha", 1001.0)
+    old_win = await boot_win(0xD003, rid_old, 0, "old boot alpha", 1002.0)
+
+    try:
+        # db-level filtering
+        listed = await search.list_windows(store, current_session_key="sess",
+                                           current_boot_id="current-boot")
+        check("list_windows current_boot keeps current alive+dead",
+              {cur_alive, cur_dead} <= {w["window_uid"] for w in listed}
+              and old_win not in {w["window_uid"] for w in listed})
+
+        searched = await search.search(store, q="alpha", current_session_key="sess",
+                                       current_boot_id="current-boot")
+        check("search current_boot keeps current alive+dead",
+              {cur_alive, cur_dead} == {w["window_uid"] for w in searched})
+
+        tl = await search.timeline(store, current_session_key="sess",
+                                   current_boot_id="current-boot")
+        check("timeline current_boot keeps current alive+dead",
+              {cur_alive, cur_dead} == {l["window_uid"] for l in tl})
+
+        # API-level: identity.boot_id drives the filter when current_boot_only=true
+        class _Ident:
+            boot_id = "current-boot"
+            session_key = "sess"
+        reg = WindowRegistry(store, "sess", 1)
+        ctx = DaemonContext(store=store, registry=reg, settings=Settings(),
+                            runtime=None, identity=_Ident(), handlers=None)
+        app = create_app(ctx)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as cli:
+            r = await cli.get("/windows", params={"current_boot_only": "true"})
+            check("GET /windows current_boot_only=true 200", r.status_code == 200)
+            uids = {w["window_uid"] for w in r.json()}
+            check("GET /windows current_boot_only excludes old boot",
+                  {cur_alive, cur_dead} <= uids and old_win not in uids)
+
+            r = await cli.get("/search", params={"q": "alpha", "current_boot_only": "1"})
+            check("GET /search current_boot_only finds current windows",
+                  {w["window_uid"] for w in r.json()} == {cur_alive, cur_dead})
+
+            r = await cli.get("/timeline", params={"current_boot_only": "1"})
+            check("GET /timeline current_boot_only filters old boot",
+                  {l["window_uid"] for l in r.json()} == {cur_alive, cur_dead})
+
+            # disabled by default
+            r = await cli.get("/windows")
+            check("GET /windows default includes old boot",
+                  old_win in {w["window_uid"] for w in r.json()})
+    finally:
+        # remove boot-filter fixtures so later tests still see only the three seeded windows
+        for uid in (cur_alive, cur_dead, old_win):
+            await store.execute("DELETE FROM title_history WHERE window_uid = ?", (uid,))
+            await store.execute("DELETE FROM focus_event WHERE window_uid = ?", (uid,))
+            await store.execute("DELETE FROM window WHERE window_uid = ?", (uid,))
+        await store.execute("DELETE FROM daemon_run WHERE id IN (?, ?)", (rid_cur, rid_old))
 
 
 async def test_focus_score_and_usage(store, a, b, c):
@@ -366,6 +470,7 @@ async def main():
     a, b, c = await _seed(store)
     await test_search_pipeline(store, a, b, c)
     await test_list_and_timeline(store, a, b, c)
+    await test_boot_filter(store)
     await test_focus_score_and_usage(store, a, b, c)
     await test_api(store, a, b, c)
     await store.close()

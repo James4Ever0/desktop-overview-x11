@@ -143,3 +143,7 @@ cannot search out 10.10.11.149 results. cannot do whole text substring matching 
 ---
 
 can we make the substring matching search mechanism be like: first do a full search if input things like "konsole skills" then do a white space split and combination substring search first on "konsole" then on "skills" then combine all three results, treat as substring matching search mode (modify existing substring algo). for the mixed mode it would be minimal change since you already separate the substring search mode from fts5? 
+
+---
+
+improve image compression rate of screenshots

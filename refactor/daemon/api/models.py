@@ -36,7 +36,7 @@ class WindowOut(BaseModel):
     usage_total: float | None = None
     focus_score: float | None = None
     window_capture_url: str | None = None
-    window_capture_ts: int | None = None
+    window_capture_ts: float | None = None
     hits: list[Hit] = []
     hit_fields: list[str] | None = None
 
@@ -51,6 +51,11 @@ class EventOut(BaseModel):
     kind: str | None = None
     text: str | None = None
     ts: float | None = None
+
+
+class WindowCaptureRef(BaseModel):
+    captured_at: float
+    url: str
 
 
 class WindowDetail(WindowOut):

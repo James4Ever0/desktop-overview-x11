@@ -47,7 +47,7 @@ _WINDOW_COLS = """
   (SELECT th.title FROM title_history th WHERE th.window_uid = w.window_uid
      ORDER BY th.changed_at DESC, th.id DESC LIMIT 1)            AS current_title,
   (SELECT tl.rel_path FROM window_capture_latest tl WHERE tl.window_uid = w.window_uid) AS window_capture_rel,
-  (SELECT CAST(tl.captured_at AS INTEGER) FROM window_capture_latest tl WHERE tl.window_uid = w.window_uid) AS window_capture_ts
+  (SELECT tl.captured_at FROM window_capture_latest tl WHERE tl.window_uid = w.window_uid) AS window_capture_ts
 """
 
 _SNIPPET = "snippet({fts}, 0, '<mark>', '</mark>', '…', 12)"
@@ -60,6 +60,13 @@ def _alive_sql(alive: str, col: str = "w.alive") -> str:
     if alive == "dead":
         return f"{col} = 0"
     return ""   # both
+
+
+def _boot_filter_sql(current_boot_id: str | None, col: str = "w.last_daemon_run_id") -> str:
+    """Current machine-boot filter → SQL fragment referencing the daemon_run table."""
+    if not current_boot_id:
+        return ""
+    return f"{col} IN (SELECT dr.id FROM daemon_run dr WHERE dr.machine_boot_id = ?)"
 
 
 def _xid_int(xid) -> int | None:
@@ -164,8 +171,18 @@ def _window_sort_col(sort: str) -> str:
 
 async def list_windows(store, *, alive="both", sort="last_access", order="desc",
                        limit=200, offset=0, current_session_key=None,
-                       title_denylist=None, self_xid=None) -> list[dict]:
-    where = _alive_sql(alive)
+                       title_denylist=None, self_xid=None,
+                       current_boot_id=None) -> list[dict]:
+    where = []
+    params = []
+    a = _alive_sql(alive)
+    if a:
+        where.append(a)
+    b = _boot_filter_sql(current_boot_id)
+    if b:
+        where.append(b)
+        params.append(current_boot_id)
+    where_clause = ("WHERE " + " AND ".join(where)) if where else ""
     now = time.time()
 
     def _filter_denied(results):
@@ -176,8 +193,8 @@ async def list_windows(store, *, alive="both", sort="last_access", order="desc",
 
     if sort == "focus_score" or sort.startswith("usage_"):
         # focus_score and usage sorts depend on enriched values, so sort globally in Python.
-        sql = f"SELECT {_WINDOW_COLS} FROM window w " + (f"WHERE {where} " if where else "")
-        rows = await store.fetchall(sql)
+        sql = f"SELECT {_WINDOW_COLS} FROM window w {where_clause}"
+        rows = await store.fetchall(sql, tuple(params))
         results = [assemble_window(r, current_session_key) for r in rows]
         results = _filter_denied(results)
         results = _filter_self(results, self_xid)
@@ -195,9 +212,9 @@ async def list_windows(store, *, alive="both", sort="last_access", order="desc",
     # secondary key keeps ordering stable when primary key ties
     secondary = "w.window_uid ASC"
     sql = (f"SELECT {_WINDOW_COLS} FROM window w "
-           + (f"WHERE {where} " if where else "")
-           + f"ORDER BY {sort_col} {direction}, {secondary} LIMIT ? OFFSET ?")
-    rows = await store.fetchall(sql, (limit, offset))
+           + where_clause
+           + f" ORDER BY {sort_col} {direction}, {secondary} LIMIT ? OFFSET ?")
+    rows = await store.fetchall(sql, tuple(params + [limit, offset]))
     results = [assemble_window(r, current_session_key) for r in rows]
     results = _filter_denied(results)
     results = _filter_self(results, self_xid)
@@ -210,7 +227,8 @@ async def list_windows(store, *, alive="both", sort="last_access", order="desc",
 async def search(store, *, q=None, window_uid=None, fields=None, alive="both",
                  t_from=None, t_to=None, sort="last_access", order="desc", hits="hit_only",
                  limit=100, offset=0, current_session_key=None,
-                 title_denylist=None, self_xid=None, mode="mixed") -> list[dict]:
+                 title_denylist=None, self_xid=None, mode="mixed",
+                 current_boot_id=None) -> list[dict]:
     """The core multi-field search (07 §4).
 
     ``q`` empty + ``window_uid`` set → scope-only "show this window's fields"
@@ -240,6 +258,10 @@ async def search(store, *, q=None, window_uid=None, fields=None, alive="both",
     a = _alive_sql(alive)
     if a:
         where.append(a)
+    b = _boot_filter_sql(current_boot_id)
+    if b:
+        where.append(b)
+        params.append(current_boot_id)
     sql = f"SELECT {_WINDOW_COLS} FROM window w WHERE " + " AND ".join(where)
     rows = await store.fetchall(sql, tuple(params))
 
@@ -515,7 +537,8 @@ async def _recent_events(store, uid, recent) -> list[dict]:
 # ───────────────────────── GET /timeline ─────────────────────────
 async def timeline(store, *, t_from=None, t_to=None, window_uid=None, sort="last_access",
                    order="desc", current_session_key=None,
-                   title_denylist=None, self_xid=None) -> list[dict]:
+                   title_denylist=None, self_xid=None,
+                   current_boot_id=None) -> list[dict]:
     """Windows active in [from,to] with continuous focus spans + instantaneous events.
 
     Focus spans are derived from the global sequence of focus events: a span ends
@@ -529,6 +552,12 @@ async def timeline(store, *, t_from=None, t_to=None, window_uid=None, sort="last
     if t_from is not None:
         f_where.append("focused_at >= ?")
         f_params.append(t_from)
+    if current_boot_id:
+        f_where.append(
+            "window_uid IN (SELECT window_uid FROM window "
+            "WHERE last_daemon_run_id IN (SELECT id FROM daemon_run WHERE machine_boot_id = ?))"
+        )
+        f_params.append(current_boot_id)
     f_clause = ("WHERE " + " AND ".join(f_where)) if f_where else ""
     focus_rows = await store.fetchall(
         f"SELECT window_uid AS uid, focused_at AS ts, "

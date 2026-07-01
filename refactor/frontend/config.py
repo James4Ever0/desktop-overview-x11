@@ -23,16 +23,20 @@ def _default_socket_path() -> Path:
 
 # Dark theme lifted from the no-ocr demo UI.
 DEFAULT_THEME = {
-    "bg": "#1e1e1e",
+    "bg": "#0a0a0a",
     "fg": "#e0e0e0",
-    "tile_bg": "#2a2a2a",
-    "tile_border": "#3a3a3a",
+    "tile_bg": "#111111",
+    "tile_border": "#222222",
     "accent": "#4a9eff",
     "muted": "#888888",
     "mark_bg": "#5a4a00",
     "alive": "#4caf50",
     "dead": "#888888",
     "indicator": "#ff4444",
+    "event_title": "#4caf50",
+    "event_clipboard": "#ffcc00",
+    "event_selection": "#ffcc00",
+    "event_keyboard": "#2a5a8a",
 }
 
 
