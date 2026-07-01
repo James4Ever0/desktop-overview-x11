@@ -6,8 +6,6 @@ most windows have (no title) but i think this shall be wrong.
 
 do not know the meaning of timeline view, i do not see a line, instead i see vertical bars. i think i need horizontal lines showing what timespan a window is focused, and clear guides showing time 16:00 16:10 16:20 etc, can be precise to seconds. can shift the timespan.
 
-what are those green and blue vertical bars?
-
 tell me how to enable verbose logging in run scripts. change those default to verbose or debug logging to stdout by default.
 
 shall add an option for viewing only those windows appearing current boot, filtering out those boot id mismatched.

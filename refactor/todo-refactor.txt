@@ -88,7 +88,3 @@ keyboard chunk storing is not working properly. shall push with current focused 
 ---
 
 put the focus score along with the total time usage to a new line.
-
----
-
-enlarge the interface
