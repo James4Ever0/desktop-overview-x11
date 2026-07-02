@@ -25,7 +25,7 @@ from . import capture
 from .aggregator import KeyboardAggregator
 from .api.app import DaemonContext
 from .api.server import ApiServer
-from .collectors import xpump, xrecord
+from .collectors import screen_lock, xpump, xrecord
 from .config import Settings
 from .db.store import Store
 from .handlers import EventHandlers
@@ -127,14 +127,24 @@ async def run(settings: Settings) -> None:
         except NotImplementedError:
             signal.signal(sig, _request_stop)
 
-    # ── Thread A (Xlib pump) + Thread B (XRecord) ────────────────────────────
+    # ── Thread A (Xlib pump) + Thread B (XRecord) + optional screen-lock detector ──
     tA = threading.Thread(target=xpump.run, args=(thread_stop, runtime.emit),
                           name="xpump", daemon=True)
     tB = threading.Thread(target=xrecord.run, args=(thread_stop, runtime.emit, settings),
                           name="xrecord", daemon=True)
     tA.start()
     tB.start()
-    log.info("collector threads started (xpump, xrecord)")
+    threads = [tA, tB]
+
+    if settings.screen_lock_enabled:
+        tLock = threading.Thread(target=screen_lock.run,
+                                 args=(thread_stop, runtime.emit, settings),
+                                 name="screen_lock", daemon=True)
+        tLock.start()
+        threads.append(tLock)
+        log.info("collector threads started (xpump, xrecord, screen_lock)")
+    else:
+        log.info("collector threads started (xpump, xrecord)")
 
     # One-time seed from wmctrl -l: _NET_CLIENT_LIST events can miss windows that
     # are already open when the pump attaches or that the WM omits transiently.
@@ -179,7 +189,7 @@ async def run(settings: Settings) -> None:
     await store.execute("UPDATE daemon_run SET stopped_at=? WHERE id=?",
                         (time.time(), run_id))
     await store.close()
-    for t in (tA, tB):
+    for t in threads:
         t.join(timeout=2.0)
     log.info("daemon stopped cleanly")
 

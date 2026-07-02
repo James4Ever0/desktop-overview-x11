@@ -564,12 +564,39 @@ async def timeline(store, *, t_from=None, t_to=None, window_uid=None, sort="last
         f"vdesktop_index AS vidx, vdesktop_name AS vname "
         f"FROM focus_event {f_clause} ORDER BY focused_at ASC", tuple(f_params))
 
+    # Fetch lock/unlock boundaries in the same range; they end focus spans.
+    l_where, l_params = [], []
+    if t_from is not None:
+        l_where.append("changed_at >= ?")
+        l_params.append(t_from)
+    if t_to is not None:
+        l_where.append("changed_at <= ?")
+        l_params.append(t_to)
+    l_clause = ("WHERE " + " AND ".join(l_where)) if l_where else ""
+    lock_rows = await store.fetchall(
+        f"SELECT locked, changed_at AS ts FROM screen_lock_event "
+        f"{l_clause} ORDER BY changed_at ASC", tuple(l_params))
+
     end_default = t_to if t_to is not None else time.time()
     lanes: dict[int, dict] = {}
-    for i, r in enumerate(focus_rows):
+
+    # Merge focus and lock rows by timestamp.  A lock row acts as a boundary:
+    # the currently focused span ends at the lock time, and no window is focused
+    # during the locked period.
+    merged = []
+    for r in focus_rows:
+        merged.append(("focus", r["ts"], r))
+    for r in lock_rows:
+        merged.append(("lock", r["ts"], r))
+    merged.sort(key=lambda x: x[1])
+
+    for i, (kind, ts, data) in enumerate(merged):
+        if kind != "focus":
+            continue
+        r = data
         uid = r["uid"]
         start = r["ts"]
-        end = focus_rows[i + 1]["ts"] if i + 1 < len(focus_rows) else end_default
+        end = merged[i + 1][1] if i + 1 < len(merged) else end_default
         if t_from is not None:
             start = max(start, t_from)
         if t_to is not None:

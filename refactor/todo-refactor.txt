@@ -88,3 +88,7 @@ keyboard chunk storing is not working properly. shall push with current focused 
 ---
 
 put the focus score along with the total time usage to a new line.
+
+---
+
+add group by: "application name" or some other stuff? display in timeline? or search results? create different horizontal sections for different apps?

@@ -44,6 +44,7 @@ class EventHandlers:
         runtime.register("window_list", self.handle_window_list)
         runtime.register("focus", self.handle_focus)
         runtime.register("title", self.handle_title)
+        runtime.register("screen_lock", self.handle_screen_lock)
         runtime.register("vdesktop_current", self.handle_vdesktop_current)
         runtime.register("vdesktop_meta", self.handle_vdesktop_meta)
 
@@ -88,6 +89,16 @@ class EventHandlers:
             " VALUES(?,?,?,?)", (uid, self.vdesktop_index, self.vdesktop_name, ts))
         for hook in self._focus_hooks:
             await hook(uid)
+
+    async def handle_screen_lock(self, ev) -> None:
+        """Record a lock/unlock boundary so focus spans do not include locked time."""
+        ts = ev.get("ts")
+        locked = 1 if ev.get("locked") else 0
+        method = ev.get("method")
+        self.store.enqueue(
+            "INSERT INTO screen_lock_event(locked, method, changed_at) VALUES(?,?,?)",
+            (locked, method, ts))
+        log.debug("screen_lock recorded locked=%d method=%s", locked, method)
 
     # ───────────────────────── title history (03 §1) ─────────────────────────
     async def handle_title(self, ev) -> None:

@@ -57,6 +57,13 @@ class Settings:
     # --- §2b clipboard / selection / paste ---
     read_event_capture_content: bool = True   # read the selection at paste time (03 §5)
 
+    # --- §2d screen lock ---
+    screen_lock_enabled: bool = True
+    screen_lock_dbus_enabled: bool = True
+    screen_lock_idle_enabled: bool = True
+    screen_lock_idle_threshold_s: float = 300.0   # 5 min
+    screen_lock_idle_poll_s: float = 10.0
+
     # --- §3 window_captures & capture ---
     refresh_interval_s: int = 5            # X
     refresh_batch_size: int = 3            # Y

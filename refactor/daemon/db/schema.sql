@@ -62,6 +62,14 @@ CREATE TABLE IF NOT EXISTS focus_event (         -- one row per focus gain
 );
 CREATE INDEX IF NOT EXISTS ix_focus_time ON focus_event(focused_at);
 
+CREATE TABLE IF NOT EXISTS screen_lock_event (   -- lock/unlock boundaries
+  id         INTEGER PRIMARY KEY,
+  locked     INTEGER NOT NULL,        -- 1 = locked, 0 = unlocked
+  method     TEXT,                    -- 'dbus' | 'idle'
+  changed_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_screen_lock_time ON screen_lock_event(changed_at);
+
 CREATE TABLE IF NOT EXISTS vdesktop_state (      -- desktop rename/count history
   id         INTEGER PRIMARY KEY,
   idx        INTEGER,

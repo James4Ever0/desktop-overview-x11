@@ -225,6 +225,16 @@ async def test_list_and_timeline(store, a, b, c):
     tl_one = await search.timeline(store, window_uid=a, current_session_key="sess")
     check("timeline window_uid scopes to one lane", [l["window_uid"] for l in tl_one] == [a])
 
+    # screen-lock boundary: a span that would have ended at b's focus (120.0) is
+    # cut short by a lock event at 115.0.
+    await store.execute(
+        "INSERT INTO screen_lock_event(locked, method, changed_at) VALUES(?,?,?)",
+        (1, "dbus", 115.0))
+    tl_lock = await search.timeline(store, current_session_key="sess")
+    lanes_lock = {l["window_uid"]: l for l in tl_lock}
+    a_span_lock = lanes_lock[a]["focus_spans"][0]
+    check("focus span ends at screen lock boundary", a_span_lock["ended_at"] == 115.0)
+
     # timeline sort/order
     tl_la = await search.timeline(store, sort="last_access", order="desc",
                                   current_session_key="sess")
