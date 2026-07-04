@@ -71,6 +71,26 @@ def _enrich_timeline_vdesktops(ctx: DaemonContext, lanes: list[dict]) -> list[di
     return lanes
 
 
+def _current_vdesktop_index(ctx: DaemonContext) -> int | None:
+    """Return the handler's current virtual-desktop index, if known."""
+    h = ctx.handlers
+    return h.vdesktop_index if h else None
+
+
+def _filter_current_vdesktop(items: list[dict], cur_idx: int | None) -> list[dict]:
+    """Keep only windows whose vdesktop index matches the current desktop."""
+    if cur_idx is None:
+        return items
+    return [w for w in items if (w.get("vdesktop") or {}).get("index") == cur_idx]
+
+
+def _filter_timeline_current_vdesktop(lanes: list[dict], cur_idx: int | None) -> list[dict]:
+    """Keep only timeline lanes whose window is on the current virtual desktop."""
+    if cur_idx is None:
+        return lanes
+    return [l for l in lanes if (l.get("vdesktop") or {}).get("index") == cur_idx]
+
+
 # ───────────────────────── windows ─────────────────────────
 @router.get("/windows", response_model=list[models.WindowOut])
 async def get_windows(
@@ -82,9 +102,10 @@ async def get_windows(
     offset: int = Query(0, ge=0),
     self_xid: str | None = Query(None),
     current_boot_only: bool = Query(False),
+    current_vdesktop_only: bool = Query(False),
 ):
-    log.debug("GET /windows sort=%s order=%s alive=%s limit=%d current_boot_only=%s",
-              sort, order, alive, limit, current_boot_only)
+    log.debug("GET /windows sort=%s order=%s alive=%s limit=%d current_boot_only=%s current_vdesktop_only=%s",
+              sort, order, alive, limit, current_boot_only, current_vdesktop_only)
     current_boot_id = ctx.identity.boot_id if (current_boot_only and ctx.identity) else None
     results = await search.list_windows(
         ctx.store, alive=alive, sort=sort, order=order, limit=limit, offset=offset,
@@ -92,7 +113,10 @@ async def get_windows(
         title_denylist=ctx.settings.window_title_denylist,
         self_xid=self_xid,
         current_boot_id=current_boot_id)
-    return _enrich_window_vdesktops(ctx, results)
+    results = _enrich_window_vdesktops(ctx, results)
+    if current_vdesktop_only:
+        results = _filter_current_vdesktop(results, _current_vdesktop_index(ctx))
+    return results
 
 
 @router.get("/windows/{uid}", response_model=models.WindowDetail)
@@ -173,12 +197,14 @@ async def get_search(
     self_xid: str | None = Query(None),
     mode: str = Query("mixed", pattern=MODE_RE),
     current_boot_only: bool = Query(False),
+    current_vdesktop_only: bool = Query(False),
 ):
-    log.debug("GET /search q=%s window_uid=%s fields=%s sort=%s order=%s mode=%s current_boot_only=%s",
-              q, window_uid, fields, sort, order, mode, current_boot_only)
+    log.debug("GET /search q=%s window_uid=%s fields=%s sort=%s order=%s mode=%s current_boot_only=%s current_vdesktop_only=%s",
+              q, window_uid, fields, sort, order, mode, current_boot_only, current_vdesktop_only)
     return await _do_search(ctx, q, window_uid, fields, alive, sort, order, hits, t_from, t_to,
                             self_xid=self_xid, mode=mode,
-                            current_boot_only=current_boot_only)
+                            current_boot_only=current_boot_only,
+                            current_vdesktop_only=current_vdesktop_only)
 
 
 # from/to need explicit aliasing because `from` is a Python keyword
@@ -197,14 +223,17 @@ async def get_history(
     self_xid: str | None = Query(None),
     mode: str = Query("mixed", pattern=MODE_RE),
     current_boot_only: bool = Query(False),
+    current_vdesktop_only: bool = Query(False),
 ):
     return await _do_search(ctx, q, window_uid, fields, alive, sort, order, hits, t_from, t_to,
                             self_xid=self_xid, mode=mode,
-                            current_boot_only=current_boot_only)
+                            current_boot_only=current_boot_only,
+                            current_vdesktop_only=current_vdesktop_only)
 
 
 async def _do_search(ctx, q, window_uid, fields, alive, sort, order, hits, t_from=None, t_to=None,
-                     self_xid=None, mode="mixed", current_boot_only=False):
+                     self_xid=None, mode="mixed", current_boot_only=False,
+                     current_vdesktop_only=False):
     s = ctx.settings
     limit = min(s.search_default_limit, s.search_max_limit)
     current_boot_id = ctx.identity.boot_id if (current_boot_only and ctx.identity) else None
@@ -216,7 +245,10 @@ async def _do_search(ctx, q, window_uid, fields, alive, sort, order, hits, t_fro
         self_xid=self_xid,
         mode=mode,
         current_boot_id=current_boot_id)
-    return _enrich_window_vdesktops(ctx, results)
+    results = _enrich_window_vdesktops(ctx, results)
+    if current_vdesktop_only:
+        results = _filter_current_vdesktop(results, _current_vdesktop_index(ctx))
+    return results
 
 
 # ───────────────────────── timeline ─────────────────────────
@@ -230,9 +262,10 @@ async def get_timeline(
     t_to: float | None = Query(None, alias="to"),
     self_xid: str | None = Query(None),
     current_boot_only: bool = Query(False),
+    current_vdesktop_only: bool = Query(False),
 ):
-    log.debug("GET /timeline window_uid=%s sort=%s order=%s current_boot_only=%s",
-              window_uid, sort, order, current_boot_only)
+    log.debug("GET /timeline window_uid=%s sort=%s order=%s current_boot_only=%s current_vdesktop_only=%s",
+              window_uid, sort, order, current_boot_only, current_vdesktop_only)
     current_boot_id = ctx.identity.boot_id if (current_boot_only and ctx.identity) else None
     lanes = await search.timeline(
         ctx.store, t_from=t_from, t_to=t_to, window_uid=window_uid,
@@ -240,7 +273,10 @@ async def get_timeline(
         title_denylist=ctx.settings.window_title_denylist,
         self_xid=self_xid,
         current_boot_id=current_boot_id)
-    return _enrich_timeline_vdesktops(ctx, lanes)
+    lanes = _enrich_timeline_vdesktops(ctx, lanes)
+    if current_vdesktop_only:
+        lanes = _filter_timeline_current_vdesktop(lanes, _current_vdesktop_index(ctx))
+    return lanes
 
 
 # ───────────────────────── vdesktops ─────────────────────────

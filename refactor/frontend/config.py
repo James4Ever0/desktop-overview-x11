@@ -37,6 +37,7 @@ DEFAULT_THEME = {
     "event_clipboard": "#ffcc00",
     "event_selection": "#ffcc00",
     "event_keyboard": "#2a5a8a",
+    "lifespan": "#333333",
     "active_lane_bg": "#331111",
 }
 
@@ -59,9 +60,9 @@ class FrontendSettings:
     history_stack_depth: int = 20
     show_back_button: bool = False       # 08 §5: navigation history button
     theme: dict = field(default_factory=lambda: dict(DEFAULT_THEME))
-    font_family: str = "TkDefaultFont"
+    font_family: str = "Noto Sans"
     font_size: int = 10
-    filter_no_vdesktop: bool = False       # hide windows without vdesktop in search/timeline
+    filter_no_vdesktop: bool = False       # filter search/timeline to the current virtual desktop
     hide_self: bool = True                # hide the GUI's own window from results
     hide_self_method: str = "id"          # "id" (x_window_id) or "title_prefix"
     resizable: bool = True                # allow the main window to be resized

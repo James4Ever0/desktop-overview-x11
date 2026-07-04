@@ -45,20 +45,21 @@ async def _seed(store):
     rid = await store.execute(
         "INSERT INTO daemon_run(daemon_boot_id, session_key, started_at) VALUES('b','sess',1.0)")
 
-    async def win(xid, sess, alive, last_seen, wm, vidx=None, vname=None, app_name=None):
+    async def win(xid, sess, alive, last_seen, wm, vidx=None, vname=None, app_name=None,
+                  first_seen=1.0, closed_at=None):
         uid = await store.execute(
             "INSERT INTO window(session_key, first_daemon_run_id, last_daemon_run_id,"
-            " x_window_id, wm_class, app_name, vdesktop_index, vdesktop_name, first_seen, last_seen, alive) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (sess, rid, rid, xid, wm, app_name, vidx, vname, 1.0, last_seen, alive))
+            " x_window_id, wm_class, app_name, vdesktop_index, vdesktop_name, first_seen, last_seen, closed_at, alive) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (sess, rid, rid, xid, wm, app_name, vidx, vname, first_seen, last_seen, closed_at, alive))
         if app_name:
             await store.execute(
                 "INSERT INTO app_name_history(window_uid, app_name, changed_at) VALUES(?,?,?)",
                 (uid, app_name, last_seen))
         return uid
 
-    a = await win(0xABCDE, "sess", 1, 300.0, "firefox", 1, "Web", "firefox")    # alive, this session → jumpable
-    b = await win(0xBBBBB, "sess", 0, 200.0, "code", 1, "Web", "code")        # dead
-    c = await win(0xCCCCC, "other", 1, 250.0, "mail", 1, "Web", "mail")       # different session
+    a = await win(0xABCDE, "sess", 1, 300.0, "firefox", 1, "Web", "firefox", first_seen=10.0)    # alive, this session → jumpable
+    b = await win(0xBBBBB, "sess", 0, 200.0, "code", 1, "Web", "code", first_seen=20.0, closed_at=210.0)        # dead
+    c = await win(0xCCCCC, "other", 1, 250.0, "mail", 1, "Web", "mail", first_seen=30.0)       # different session
     for uid, title, t in [(a, "Inbox — invoice 2026", 110.0),
                           (b, "draft document", 120.0),
                           (c, "mail client", 130.0)]:
@@ -210,6 +211,9 @@ async def test_list_and_timeline(store, a, b, c):
     check("lane carries focus spans", len(lanes[a]["focus_spans"]) == 1)
     check("lane carries title history", lanes[a]["titles"][0]["title"] == "Inbox — invoice 2026")
     check("lane carries app_name", lanes[a].get("app_name") == "firefox")
+    check("lane carries created_since", lanes[a].get("created_since") == 10.0)
+    check("dead lane carries dead_at", lanes[b].get("dead_at") == 210.0)
+    check("alive lane has no dead_at", lanes[a].get("dead_at") is None)
     # focus spans now have derived ended_at from the next focus event
     a_span = lanes[a]["focus_spans"][0]
     b_span = lanes[b]["focus_spans"][0]
@@ -473,6 +477,50 @@ async def test_focus_score_and_usage(store, a, b, c):
         search.time.time = original_time
 
 
+async def test_current_vdesktop_filter(store, a):
+    print("[api] current_vdesktop_only filter")
+    # Add a window on desktop 0 in the same session; existing a/b are on desktop 1.
+    d = await store.execute(
+        "INSERT INTO window(session_key, first_daemon_run_id, last_daemon_run_id,"
+        " x_window_id, wm_class, app_name, vdesktop_index, vdesktop_name, first_seen, last_seen, closed_at, alive)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("sess", 1, 1, 0xDDDDD, "term", "term", 0, "Web", 1.0, 100.0, None, 1))
+    await store.execute(
+        "INSERT INTO focus_event(window_uid, vdesktop_index, vdesktop_name, focused_at) VALUES(?,?,?,?)",
+        (d, 0, "Web", 100.0))
+
+    reg = WindowRegistry(store, "sess", 1)
+    ctx = DaemonContext(store=store, registry=reg, settings=Settings(),
+                        runtime=None, identity=None, handlers=None)
+    class _H:
+        desktop_names = ["Web", "Code"]
+        vdesktop_index = 1
+        vdesktop_name = "Code"
+    ctx.handlers = _H()
+    app = create_app(ctx)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as cli:
+        r = await cli.get("/windows", params={"current_vdesktop_only": "true"})
+        uids = {w["window_uid"] for w in r.json()}
+        check("GET /windows current_vdesktop_only keeps desktop 1 windows", a in uids and d not in uids)
+
+        r = await cli.get("/search", params={"q": "invoice", "current_vdesktop_only": "true"})
+        uids = {w["window_uid"] for w in r.json()}
+        check("GET /search current_vdesktop_only keeps desktop 1 matches", a in uids and d not in uids)
+
+        r = await cli.get("/timeline", params={"current_vdesktop_only": "true"})
+        uids = {l["window_uid"] for l in r.json()}
+        check("GET /timeline current_vdesktop_only keeps desktop 1 lanes", a in uids and d not in uids)
+
+        # When current desktop is unknown, filter is a no-op.
+        ctx.handlers.vdesktop_index = None
+        r = await cli.get("/windows", params={"current_vdesktop_only": "true"})
+        uids = {w["window_uid"] for w in r.json()}
+        check("GET /windows current_vdesktop_only no-op when current unknown",
+              a in uids and d in uids)
+
+
 async def main():
     s = Settings()
     store = Store(s)
@@ -483,6 +531,7 @@ async def main():
     await test_boot_filter(store)
     await test_focus_score_and_usage(store, a, b, c)
     await test_api(store, a, b, c)
+    await test_current_vdesktop_filter(store, a)
     await store.close()
     print(f"\n{'ALL PASS' if _fails == 0 else str(_fails) + ' FAILED'}  (temp dir {_TMP})")
     return 1 if _fails else 0

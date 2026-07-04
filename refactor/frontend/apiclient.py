@@ -113,11 +113,14 @@ class TimelineLane:
     wm_class: str | None
     app_name: str | None
     current_title: str | None
+    vdesktop: VDesktop | None
     alive: bool | None
     jumpable: bool | None
     focus_spans: list[dict]
     titles: list[dict]
     events: list[LaneEvent] = field(default_factory=list)
+    created_since: float | None = None
+    dead_at: float | None = None
     usage_5m: float | None = None
     usage_10m: float | None = None
     usage_30m: float | None = None
@@ -127,13 +130,17 @@ class TimelineLane:
 
     @classmethod
     def from_json(cls, d: dict) -> "TimelineLane":
+        vd = d.get("vdesktop")
         return cls(
             window_uid=d["window_uid"], x_window_id=d.get("x_window_id"),
             wm_class=d.get("wm_class"), app_name=d.get("app_name"),
             current_title=d.get("current_title"),
+            vdesktop=(VDesktop(vd.get("index"), vd.get("name")) if vd else None),
             alive=d.get("alive"), jumpable=d.get("jumpable"),
             focus_spans=d.get("focus_spans", []), titles=d.get("titles", []),
             events=[LaneEvent.from_json(e) for e in d.get("events", [])],
+            created_since=d.get("created_since"),
+            dead_at=d.get("dead_at"),
             usage_5m=d.get("usage_5m"), usage_10m=d.get("usage_10m"), usage_30m=d.get("usage_30m"),
             usage_1d=d.get("usage_1d"),
             usage_total=d.get("usage_total"),
@@ -189,21 +196,24 @@ class ApiClient:
 
     # ───────────────────────── endpoints (08 §2-5) ─────────────────────────
     def windows(self, *, sort="last_access", order="desc", alive="both", self_xid=None,
-                current_boot_only=None) -> list[Window]:
-        log.debug("api windows sort=%s order=%s alive=%s current_boot_only=%s",
-                  sort, order, alive, current_boot_only)
+                current_boot_only=None, current_vdesktop_only=None) -> list[Window]:
+        log.debug("api windows sort=%s order=%s alive=%s current_boot_only=%s current_vdesktop_only=%s",
+                  sort, order, alive, current_boot_only, current_vdesktop_only)
         data = self._get("/windows", sort=sort, order=order, alive=alive, self_xid=self_xid,
-                         current_boot_only=current_boot_only)
+                         current_boot_only=current_boot_only,
+                         current_vdesktop_only=current_vdesktop_only)
         return [Window.from_json(d) for d in data]
 
     def search(self, *, q=None, window_uid=None, fields=None, alive="both",
                sort="last_access", order="desc", hits="hit_only", t_from=None, t_to=None,
-               self_xid=None, mode="mixed", current_boot_only=None) -> list[Window]:
+               self_xid=None, mode="mixed", current_boot_only=None,
+               current_vdesktop_only=None) -> list[Window]:
         path = "/history" if (t_from is not None or t_to is not None) else "/search"
-        log.debug("api search q=%s window_uid=%s fields=%s sort=%s order=%s mode=%s current_boot_only=%s",
-                  q, window_uid, fields, sort, order, mode, current_boot_only)
+        log.debug("api search q=%s window_uid=%s fields=%s sort=%s order=%s mode=%s current_boot_only=%s current_vdesktop_only=%s",
+                  q, window_uid, fields, sort, order, mode, current_boot_only, current_vdesktop_only)
         params = dict(q=q, window_uid=window_uid, alive=alive, sort=sort, order=order, hits=hits,
-                      self_xid=self_xid, mode=mode, current_boot_only=current_boot_only)
+                      self_xid=self_xid, mode=mode, current_boot_only=current_boot_only,
+                      current_vdesktop_only=current_vdesktop_only)
         if fields:
             params["fields"] = ",".join(fields)
         if t_from is not None:
@@ -220,9 +230,10 @@ class ApiClient:
 
     def timeline(self, *, window_uid=None, sort="last_access", order="desc",
                  t_from=None, t_to=None, self_xid=None,
-                 current_boot_only=None) -> list[TimelineLane]:
+                 current_boot_only=None, current_vdesktop_only=None) -> list[TimelineLane]:
         params = dict(window_uid=window_uid, sort=sort, order=order, self_xid=self_xid,
-                      current_boot_only=current_boot_only)
+                      current_boot_only=current_boot_only,
+                      current_vdesktop_only=current_vdesktop_only)
         if t_from is not None:
             params["from"] = t_from
         if t_to is not None:

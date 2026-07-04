@@ -83,8 +83,11 @@ class TimelineLane(BaseModel):
     wm_class: str | None = None
     app_name: str | None = None
     current_title: str | None = None
+    vdesktop: VDesktopRef | None = None
     alive: bool | None = None
     jumpable: bool | None = None
+    created_since: float | None = None
+    dead_at: float | None = None
     usage_5m: float | None = None
     usage_10m: float | None = None
     usage_30m: float | None = None

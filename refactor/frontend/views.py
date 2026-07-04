@@ -25,6 +25,20 @@ BAR_H = 18
 PAD = 6
 SCALE_H = 30
 
+
+def _parse_lane_filter(query: str) -> list[str]:
+    """Return non-empty lower-case tokens for AND matching."""
+    return [t.lower() for t in query.split() if t.strip()]
+
+
+def _lane_title_matches(lane, tokens: list[str]) -> bool:
+    """True when every token is a substring of the lane's lower-cased current title."""
+    if not tokens:
+        return True
+    title = (lane.current_title or "").lower()
+    return all(token in title for token in tokens)
+
+
 def render_timeline(app, lanes: list, parent=None) -> TimelineView | None:
     """Render or refresh the interactive timeline view inside ``app.timeline_frame``."""
     parent = parent or getattr(app, "inner_frame", None)
@@ -124,6 +138,8 @@ class TimelineView:
         self.start_time = 0.0
         self.indicator_time = indicator_time or 0.0
         self.lanes: list = []
+        self._all_lanes: list = []
+        self._title_filter_query: str = ""
         self.t_min = 0.0
         self.t_max = 1.0
 
@@ -252,15 +268,14 @@ class TimelineView:
     # ───────────────────────── public state ─────────────────────────
     def set_lanes(self, lanes: list):
         self._cancel_hover()
-        self.lanes = lanes or []
-        self.t_min, self.t_max = self._calc_bounds()
-        if self.t_max <= self.t_min:
-            self.t_max = self.t_min + 1.0
+        self._all_lanes = lanes or []
+        self._apply_title_filter()
         self.indicator_time = max(self.t_min, min(self.indicator_time, self.t_max))
 
         if not self.lanes:
             self.scale_canvas.delete("all")
             self.canvas.delete("all")
+            self._draw_empty_message()
             self._notify_range()
             return
 
@@ -281,6 +296,35 @@ class TimelineView:
             self._clamp_view()
             self._draw()
         self._sync_callbacks()
+
+    def set_title_filter(self, query: str):
+        """Filter visible lanes by current title (frontend-only, AND tokens); keep zoom + red line."""
+        self._title_filter_query = query
+        self._apply_title_filter()
+        self._draw()
+        self._sync_callbacks()
+        self._update_sticky()
+        self._update_details_panel()
+
+    def _apply_title_filter(self):
+        tokens = _parse_lane_filter(self._title_filter_query)
+        self.lanes = [lane for lane in self._all_lanes if _lane_title_matches(lane, tokens)]
+        self.t_min, self.t_max = self._calc_bounds()
+        if self.t_max <= self.t_min:
+            self.t_max = self.t_min + 1.0
+
+    def _draw_empty_message(self):
+        """Draw a helpful message when filtering leaves no lanes."""
+        x = max(50, self._canvas_width() // 2)
+        y = max(50, self.canvas.winfo_height() // 2)
+        self.canvas.create_text(
+            x, y,
+            text="No lanes match the title filter.",
+            fill=self.theme.get("muted", "#888888"),
+            font=("TkDefaultFont", 12),
+            anchor="center",
+            tags=("empty_message",)
+        )
 
     def fit(self):
         """Scale and scroll so the whole time range fits the visible width."""
@@ -445,6 +489,8 @@ class TimelineView:
         if self._active_key(self._active_span, self._active_lane) != self._active_key(old_span, old_lane):
             self._update_details_panel()
         if not self.lanes:
+            self._draw_empty_message()
+            self._notify_range()
             return
         self._draw_scale()
         self._draw_lanes()
@@ -529,6 +575,16 @@ class TimelineView:
                                 x_left + (self.t_max - self.t_min) / self.scale + PAD,
                                 y + LANE_H // 2,
                                 fill=self.theme["tile_border"])
+
+        # window lifespan line (behind the focus-span rectangles)
+        if lane.created_since is not None:
+            life_start = lane.created_since
+            life_end = lane.dead_at if lane.dead_at is not None else self.t_max
+            lx0 = max(x_left, self._x_of(life_start))
+            lx1 = self._x_of(life_end)
+            mid = y + LANE_H // 2
+            self.canvas.create_line(lx0, mid, lx1, mid,
+                                    fill=self.theme.get("lifespan", "#333333"), width=2)
 
         # focus spans (clipped so they never draw over the label column)
         bar_y = y + (LANE_H - BAR_H) // 2

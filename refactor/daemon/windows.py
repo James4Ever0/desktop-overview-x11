@@ -33,6 +33,10 @@ class WindowRegistry:
         self._missing_since: dict[int, float] = {}
         self._alive_grace_s = (store.s.window_alive_grace_s
                                if hasattr(store.s, "window_alive_grace_s") else 5.0)
+        # Reconcile is called once at daemon startup by window_captures.  Windows
+        # that were alive in the DB from a previous run but closed before this run
+        # must not get a fresh closed_at on the first sweep.
+        self._first_reconcile = True
 
     def alive_items(self) -> list[tuple[int, int]]:
         """Return [(x_window_id, window_uid)] for windows currently believed alive."""
@@ -159,11 +163,19 @@ class WindowRegistry:
 
         # windows missing from this sweep
         missing = set(db_alive) - current
-        for xid in list(missing):
-            first_missing = self._missing_since.setdefault(xid, now)
-            if now - first_missing >= self._alive_grace_s:
-                await self.mark_dead(xid, now)
-                self._missing_since.pop(xid, None)
+        if not self._first_reconcile:
+            for xid in list(missing):
+                first_missing = self._missing_since.setdefault(xid, now)
+                if now - first_missing >= self._alive_grace_s:
+                    await self.mark_dead(xid, now)
+                    self._missing_since.pop(xid, None)
+        else:
+            # Startup sweep: do not write a death timestamp for windows that may
+            # simply have been closed before this daemon run.  Remember them as
+            # missing so the next reconcile can mark them dead if they stay gone.
+            for xid in missing:
+                self._missing_since.setdefault(xid, now)
+            self._first_reconcile = False
 
         # came back or still present: clear any pending grace
         for xid in current:

@@ -19,6 +19,7 @@ from pathlib import Path
 from .config import FrontendSettings
 from .log import setup_logging
 from .apiclient import ApiClient
+from ._font_setup import setup_fonts
 
 
 def parse_args(argv=None) -> FrontendSettings:
@@ -73,6 +74,9 @@ def main(argv=None) -> int:
     log = logging.getLogger("dovw.fe")
     log.info("starting frontend (uds=%s tcp=%s) logfile=%s",
              settings.socket_path, settings.use_tcp, logfile)
+
+    # Register bundled Noto fonts with fontconfig before Tk loads.
+    setup_fonts()
 
     # import Tk lazily so --help works headless and import errors are logged
     from .app import WindowPreviewApp

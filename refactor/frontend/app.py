@@ -29,6 +29,10 @@ from PIL import Image, ImageOps, ImageTk
 
 from .apiclient import ApiClient, DaemonUnavailable, Window
 from . import views
+from ._font_setup import setup_fonts
+
+# Register bundled Noto fonts with fontconfig before any Tk widget is created.
+setup_fonts()
 
 log = logging.getLogger("dovw.fe.app")
 
@@ -39,14 +43,6 @@ def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
     if len(c) == 3:
         c = "".join(ch * 2 for ch in c)
     return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
-
-
-def _lane_has_vdesktop(lane) -> bool:
-    """True if at least one focus_span carries a vdesktop_index."""
-    return any(
-        sp.get("vdesktop_index") is not None
-        for sp in getattr(lane, "focus_spans", []) or []
-    )
 
 
 def _fmt_last_access(ts: float | None) -> str:
@@ -200,6 +196,7 @@ def _palette(theme: dict) -> dict:
         "event_clipboard": theme.get("event_clipboard", "#ffcc00"),
         "event_selection": theme.get("event_selection", "#ffcc00"),
         "event_keyboard": theme.get("event_keyboard", "#2a5a8a"),
+        "lifespan": theme.get("lifespan", "#333333"),
         "active_lane_bg": theme.get("active_lane_bg", "#331111"),
         "canvas_bg": theme["bg"], "entry_bg": theme["tile_bg"], "entry_fg": theme["fg"],
         "select_bg": theme["accent"], "tip_border": theme["accent"],
@@ -236,6 +233,7 @@ class WindowPreviewApp(tk.Tk):
             "filter_no_vdesktop": False,
             "hide_self": self.s.hide_self,
             "current_boot_only": True,
+            "lane_title_filter": "",
         }
         # identify our own X window for the hide-self filter (Tk-only, no Xlib)
         self._self_xid = self._get_self_xid()
@@ -313,6 +311,12 @@ class WindowPreviewApp(tk.Tk):
             f.configure(size=self.s.font_size)
             if fam and fam != "TkDefaultFont":
                 f.configure(family=fam)
+        # Use the bundled monospace font for fixed-width widgets.
+        try:
+            fixed = tkfont.nametofont("TkFixedFont")
+            fixed.configure(family="Noto Sans Mono", size=self.s.font_size)
+        except tk.TclError:
+            pass
         base = tkfont.nametofont("TkDefaultFont").cget("family")
         self.search_font = tkfont.Font(family=base, size=self.s.font_size + 6)
         self.title_font = tkfont.Font(family=base, size=self.s.font_size + 4, weight="bold")
@@ -371,7 +375,12 @@ class WindowPreviewApp(tk.Tk):
 
     def _check_app_focus_lost(self):
         self._focus_out_after = None
-        if self.focus_get() is None:
+        try:
+            focused = self.focus_get()
+        except (KeyError, tk.TclError):
+            # Combobox/menu popdowns can make focus_get() fail transiently.
+            return
+        if focused is None:
             log.debug("main UI lost focus; destroying hover tips")
             self._destroy_tip()
             view = getattr(self, "_timeline_view", None)
@@ -454,6 +463,20 @@ class WindowPreviewApp(tk.Tk):
         self._timeline_range_var = tk.StringVar(value="")
         self._timeline_range_lbl = ttk.Label(
             bar, textvariable=self._timeline_range_var, font=self.search_font)
+
+        # lane title filter (timeline-only, frontend-only AND search), placed like the search box
+        self._timeline_top_filters: list[tk.Widget] = []
+        lane_filter_lbl = ttk.Label(bar, text="Lanes:")
+        self._timeline_top_filters.append(lane_filter_lbl)
+        self.lane_filter_var = tk.StringVar(value=self.view_state.get("lane_title_filter", ""))
+        self.lane_filter_var.trace_add("write", self._on_lane_filter_changed)
+        self.lane_filter_entry = ttk.Entry(bar, textvariable=self.lane_filter_var,
+                                           font=self.search_font, width=30)
+        self.lane_filter_entry.bind("<Control-a>", self._select_all)
+        self._timeline_top_filters.append(self.lane_filter_entry)
+        self.lane_filter_clear_btn = ttk.Button(bar, text="×", width=2,
+                                                command=self._clear_lane_filter)
+        self._timeline_top_filters.append(self.lane_filter_clear_btn)
 
         self.help_btn = ttk.Button(bar, text="?", width=2, command=self._show_help)
         self.help_btn.pack(side=tk.RIGHT, padx=4)
@@ -694,12 +717,14 @@ class WindowPreviewApp(tk.Tk):
             if q is None and scope is None and st["from"] is None and st["to"] is None:
                 return self.api.windows(sort=st["sort"], order=st["order"], alive=st["alive"],
                                         self_xid=self_xid,
-                                        current_boot_only=st.get("current_boot_only"))
+                                        current_boot_only=st.get("current_boot_only"),
+                                        current_vdesktop_only=st.get("filter_no_vdesktop"))
             return self.api.search(q=q, window_uid=scope, fields=st["fields"],
                                    alive=st["alive"], sort=st["sort"], order=st["order"],
                                    hits=st["hits"], t_from=st["from"], t_to=st["to"],
                                    self_xid=self_xid, mode="mixed",
-                                   current_boot_only=st.get("current_boot_only"))
+                                   current_boot_only=st.get("current_boot_only"),
+                                   current_vdesktop_only=st.get("filter_no_vdesktop"))
         gen = self._render_generation
         self._submit(call, self._wrap_callback(gen, "search", self._on_search_results))
 
@@ -707,7 +732,6 @@ class WindowPreviewApp(tk.Tk):
         if err is not None:
             self._on_error(err)
             return
-        windows = self._filter_vdesktop(windows)
         windows = [w for w in windows if not self._is_self(w)]
         self._hide_banner()
         self.status_var.set(f"{len(windows)} window(s)")
@@ -724,7 +748,8 @@ class WindowPreviewApp(tk.Tk):
                                      sort=st["sort"], order=st["order"],
                                      t_from=st["from"], t_to=st["to"],
                                      self_xid=self_xid,
-                                     current_boot_only=st.get("current_boot_only"))
+                                     current_boot_only=st.get("current_boot_only"),
+                                     current_vdesktop_only=st.get("filter_no_vdesktop"))
         gen = self._render_generation
         self._submit(call, self._wrap_callback(gen, "timeline", self._on_timeline_results))
 
@@ -738,13 +763,9 @@ class WindowPreviewApp(tk.Tk):
             lanes = [l for l in lanes if l.alive]
         elif alive_mode == "dead":
             lanes = [l for l in lanes if not l.alive]
-        removed_alive = n_before - len(lanes)
-        if self.view_state.get("filter_no_vdesktop", False):
-            lanes = [l for l in lanes if _lane_has_vdesktop(l)]
         removed = n_before - len(lanes)
         if removed:
-            log.debug("timeline filters removed %d lane(s) (alive=%d, vdesktop=%d)",
-                      removed, removed_alive, removed - removed_alive)
+            log.debug("timeline filters removed %d lane(s)", removed)
         lanes = [l for l in lanes if not self._is_self(l)]
         self._hide_banner()
         self.status_var.set(f"{len(lanes) if lanes else 0} lane(s)")
@@ -753,6 +774,11 @@ class WindowPreviewApp(tk.Tk):
             view.scale_callback = self._on_timeline_scale
             view.indicator_callback = self._on_timeline_indicator
             view.range_callback = self._on_timeline_range
+            query = self.view_state.get("lane_title_filter", "")
+            if query:
+                self.lane_filter_var.set(query)
+                view.set_title_filter(query)
+            self.status_var.set(f"{len(view.lanes)} lane(s)")
 
     def _on_timeline_range(self, t0: float, t1: float):
         self._timeline_range_var.set(f"{_fmt_ts(t0)}  →  {_fmt_ts(t1)}")
@@ -814,6 +840,18 @@ class WindowPreviewApp(tk.Tk):
         if view is not None:
             view.jump_to_now()
 
+    def _on_lane_filter_changed(self, *_args):
+        """Apply the frontend-only lane title filter, preserving zoom and red line."""
+        query = self.lane_filter_var.get()
+        self.view_state["lane_title_filter"] = query
+        view = getattr(self, "_timeline_view", None)
+        if view is not None:
+            view.set_title_filter(query)
+            self.status_var.set(f"{len(view.lanes)} lane(s)")
+
+    def _clear_lane_filter(self):
+        self.lane_filter_var.set("")
+
     def _flash_entry(self, entry):
         old = entry.cget("foreground")
         entry.configure(foreground="#ff0000")
@@ -844,15 +882,6 @@ class WindowPreviewApp(tk.Tk):
     def _clear_grid(self):
         """Legacy — kept for callers that predate _clear_view."""
         self._clear_view()
-
-    def _filter_vdesktop(self, windows: list[Window]) -> list[Window]:
-        """Filter out windows with no virtual-desktop association when enabled."""
-        if not self.view_state.get("filter_no_vdesktop", False):
-            return windows
-        out = [w for w in windows if w.vdesktop is not None and w.vdesktop.index is not None]
-        if len(out) < len(windows):
-            log.debug("vdesktop filter removed %d window(s)", len(windows) - len(out))
-        return out
 
     def _reconcile_tiles(self, windows: list[Window]):
         """Add/remove/keep tiles keyed by window_uid; render in API order (08 §2).
@@ -1156,8 +1185,11 @@ class WindowPreviewApp(tk.Tk):
         self.view_state["order"] = self.order_var.get()
         self.render()
 
-    def _select_all(self, _event):
-        self.search_entry.selection_range(0, tk.END)
+    def _select_all(self, event):
+        try:
+            event.widget.selection_range(0, tk.END)
+        except tk.TclError:
+            pass
         return "break"
 
     def _show_search_filters(self, visible: bool):
@@ -1171,6 +1203,8 @@ class WindowPreviewApp(tk.Tk):
             self._hits_cb.pack(side=tk.LEFT, padx=(8, 2))
             self.scope_label.pack(side=tk.LEFT, padx=8)
             self._timeline_range_lbl.pack_forget()
+            for w in self._timeline_top_filters:
+                w.pack_forget()
             for w in self._timeline_filters:
                 w.pack_forget()
         else:
@@ -1181,6 +1215,9 @@ class WindowPreviewApp(tk.Tk):
                 cb.pack_forget()
             self._hits_cb.pack_forget()
             self.scope_label.pack_forget()
+            # lane filter sits at the left, range indicator expands to fill the rest
+            for w in self._timeline_top_filters:
+                w.pack(side=tk.LEFT, padx=2)
             self._timeline_range_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
             for w in self._timeline_filters:
                 w.pack(side=tk.LEFT, padx=2)

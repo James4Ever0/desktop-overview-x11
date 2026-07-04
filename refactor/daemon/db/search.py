@@ -42,6 +42,8 @@ _WINDOW_COLS = """
   w.session_key      AS session_key,
   w.vdesktop_index   AS vdesktop_index,
   w.vdesktop_name    AS vdesktop_name,
+  w.first_seen       AS first_seen,
+  w.closed_at        AS closed_at,
   (SELECT COALESCE(MAX(fe.focused_at), 0) FROM focus_event fe
      WHERE fe.window_uid = w.window_uid)                              AS last_access,
   (SELECT th.title FROM title_history th WHERE th.window_uid = w.window_uid
@@ -108,6 +110,8 @@ def assemble_window(row, current_session_key: str | None) -> dict:
         "alive": alive,
         "jumpable": alive and same_session,
         "last_access": row["last_access"],
+        "first_seen": row["first_seen"],
+        "closed_at": row["closed_at"],
         "window_capture_url": (f"/windows/{uid}/window_capture/latest" if row["window_capture_rel"] else None),
         "window_capture_ts": row["window_capture_ts"],
         "hits": [],
@@ -639,9 +643,12 @@ async def timeline(store, *, t_from=None, t_to=None, window_uid=None, sort="last
             lane["wm_class"] = m["wm_class"]
             lane["app_name"] = m["app_name"]
             lane["current_title"] = m["current_title"]
+            lane["vdesktop"] = m["vdesktop"]
             lane["alive"] = m["alive"]
             lane["jumpable"] = m["jumpable"]
             lane["last_access"] = m["last_access"]
+            lane["created_since"] = m["first_seen"]
+            lane["dead_at"] = m["closed_at"]
 
     await _enrich_timeline_events(store, lanes, t_from, t_to)
 
