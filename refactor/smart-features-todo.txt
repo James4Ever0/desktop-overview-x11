@@ -13,3 +13,5 @@ todo: keep dead window preview for most x days in desktop overview
 ---
 
 think of user interactions within the frontend ui and how we can log user behavior, what actions are meaningful within the ui and how we can improve ux with that data
+
+create & display ai summary on window interactions, what user is doing in this window recent x minutes? process those frequently focused ones, then process those idle ones if possible
