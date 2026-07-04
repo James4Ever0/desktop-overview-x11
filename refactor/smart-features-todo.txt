@@ -1,0 +1,15 @@
+recognize window as: "focused, fully visible but not focused, partially visible but not focused, not visible, minimized" per virtual desktop, and display those with different colors on timeline
+
+retrieve window icons if possible
+
+record jump event timestamp to backend and order by 'most jumped in xx ' mark as diamond symbol also include in search tab grid stats
+
+Calculate focus time after jump as metric in a given time window
+
+Suggest common search term by history and jump count (infer from those events) tab completion?
+
+todo: keep dead window preview for most x days in desktop overview
+
+---
+
+think of user interactions within the frontend ui and how we can log user behavior, what actions are meaningful within the ui and how we can improve ux with that data
