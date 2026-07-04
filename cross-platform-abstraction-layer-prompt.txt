@@ -1,0 +1,13 @@
+abstract class creation and methods defined for basic capture, event listeners and polling.
+
+if platform does not support event listener, use polling based impl and wrap it to be event like.
+
+first identify those platform specific code, then design abstract class, then rewrite existing linux x11 code to adopt those code.
+
+then consider windows, macos
+
+then consider change language, like golang, rust.
+
+we might discard some functions or apply mitigations (compromise, implement some features "the other way") due to restrictions.
+
+the frontend is the easiest to "cross platform" in my opinion. 
