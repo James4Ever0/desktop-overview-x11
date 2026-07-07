@@ -107,6 +107,44 @@ class LaneEvent:
 
 
 @dataclass
+class GlobalEvent:
+    id: int
+    type: str
+    ts: float
+    window_uid: int | None = None
+    kind: str | None = None
+    wm_class: str | None = None
+    app_name: str | None = None
+    current_title: str | None = None
+    vdesktop: VDesktop | None = None
+    alive: bool | None = None
+    text: str | None = None
+    excerpt: str | None = None
+    hit_count: int | None = None
+    hit_excerpts: list[str] | None = None
+
+    @classmethod
+    def from_json(cls, d: dict) -> "GlobalEvent":
+        vd = d.get("vdesktop")
+        return cls(
+            id=d["id"],
+            type=d["type"],
+            ts=d["ts"],
+            window_uid=d.get("window_uid"),
+            kind=d.get("kind"),
+            wm_class=d.get("wm_class"),
+            app_name=d.get("app_name"),
+            current_title=d.get("current_title"),
+            vdesktop=(VDesktop(vd.get("index"), vd.get("name")) if vd else None),
+            alive=d.get("alive"),
+            text=d.get("text"),
+            excerpt=d.get("excerpt"),
+            hit_count=d.get("hit_count"),
+            hit_excerpts=d.get("hit_excerpts"),
+        )
+
+
+@dataclass
 class TimelineLane:
     window_uid: int
     x_window_id: str | None
@@ -196,13 +234,20 @@ class ApiClient:
 
     # ───────────────────────── endpoints (08 §2-5) ─────────────────────────
     def windows(self, *, sort="last_access", order="desc", alive="both", self_xid=None,
-                current_boot_only=None, current_vdesktop_only=None) -> list[Window]:
-        log.debug("api windows sort=%s order=%s alive=%s current_boot_only=%s current_vdesktop_only=%s",
-                  sort, order, alive, current_boot_only, current_vdesktop_only)
+                current_boot_only=None, current_vdesktop_only=None,
+                limit=20, offset=0, enrich=True) -> list[Window]:
+        log.debug("api windows sort=%s order=%s alive=%s limit=%d offset=%d enrich=%s current_boot_only=%s current_vdesktop_only=%s",
+                  sort, order, alive, limit, offset, enrich, current_boot_only, current_vdesktop_only)
         data = self._get("/windows", sort=sort, order=order, alive=alive, self_xid=self_xid,
                          current_boot_only=current_boot_only,
-                         current_vdesktop_only=current_vdesktop_only)
+                         current_vdesktop_only=current_vdesktop_only,
+                         limit=limit, offset=offset, enrich=1 if enrich else 0)
         return [Window.from_json(d) for d in data]
+
+    def window_scores(self, uids: list[int]) -> dict[int, dict]:
+        log.debug("api window_scores uids=%d", len(uids))
+        data = self._post("/windows/scores", json=uids)
+        return {int(k): v for k, v in data.items()}
 
     def search(self, *, q=None, window_uid=None, fields=None, alive="both",
                sort="last_access", order="desc", hits="hit_only", t_from=None, t_to=None,
@@ -239,6 +284,19 @@ class ApiClient:
         if t_to is not None:
             params["to"] = t_to
         return [TimelineLane.from_json(d) for d in self._get("/timeline", **params)]
+
+    def events(self, *, q=None, type=None, t_from=None, t_to=None,
+               sort="ts_desc", limit=100, offset=0) -> tuple[list[GlobalEvent], int]:
+        log.debug("api events q=%s type=%s sort=%s limit=%d offset=%d",
+                  q, type, sort, limit, offset)
+        params = dict(q=q, type=type, sort=sort, limit=limit, offset=offset)
+        if t_from is not None:
+            params["from"] = t_from
+        if t_to is not None:
+            params["to"] = t_to
+        data = self._get("/events", **params)
+        items = [GlobalEvent.from_json(e) for e in data.get("items", [])]
+        return items, data.get("total", 0)
 
     def vdesktops(self) -> list[dict]:
         return self._get("/vdesktops")

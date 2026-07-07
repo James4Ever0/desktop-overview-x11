@@ -53,6 +53,28 @@ class EventOut(BaseModel):
     ts: float | None = None
 
 
+class GlobalEvent(BaseModel):
+    id: int
+    type: str
+    kind: str | None = None
+    ts: float
+    window_uid: int | None = None
+    wm_class: str | None = None
+    app_name: str | None = None
+    current_title: str | None = None
+    vdesktop: VDesktopRef | None = None
+    alive: bool | None = None
+    text: str | None = None
+    excerpt: str | None = None
+    hit_count: int | None = None
+    hit_excerpts: list[str] | None = None
+
+
+class EventListOut(BaseModel):
+    total: int
+    items: list[GlobalEvent]
+
+
 class WindowCaptureRef(BaseModel):
     captured_at: float
     url: str

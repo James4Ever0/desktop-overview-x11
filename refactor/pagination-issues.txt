@@ -1,0 +1,11 @@
+when performing "app search", need to first, sort by given criterion, not collect all metrics at once.
+
+when doing event search, surely we support pagination.
+
+can load the per app search, with pagination, gradual loading, fetch 100 and next 100 manually.
+
+or you could use a full text search engine which is faster, or use ripgrep, or other stuff?
+
+we could:
+
+first load all windows (those dead), then collect event with hit with pagination. during collection, move those with hit towards the front, then sort those with hit, keep those without hit at the bottom. update display on each page iteration.  when done, remove those with no hit.

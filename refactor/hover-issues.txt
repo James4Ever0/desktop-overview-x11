@@ -1,3 +1,7 @@
 when holding shift and move mouse, ignore mouse movements and do not hide hover interface.
 
 if mouse is within the geometry of hover interface, keyboard and mouse events will not trigger hiding of the hovering interface.
+
+---
+
+even if mouse is inside on the hovered preview interface of search / timeline objects, when the main ui is not focused, it shall hide.

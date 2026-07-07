@@ -1,0 +1,3 @@
+keep multiple panes, like "recently jumped windows" at bottom, multiple views for different purposes.
+
+similarly we might split the event tab from event stream browsing to event stream searching

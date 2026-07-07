@@ -84,6 +84,12 @@ async def main():
     check("bump_last_seen updates column", ls2 == now + 6)
 
     # ── reconcile: konsole stays, firefox(uid2) gone, a new window appears ──
+    # First reconcile acts as the daemon startup sweep and must not write death
+    # timestamps for windows that may simply have closed before this run.
+    await reg.reconcile(set(), now=now + 6)
+    ff_before = await store.fetchone("SELECT alive FROM window WHERE window_uid=?", (uid2,))
+    check("first reconcile does not kill pre-existing missing windows", ff_before[0] == 1)
+
     await reg.reconcile({0x4b00001, 0x5c00009},
                         wm_class_of=lambda x: {0x5c00009: "code"}.get(x), now=now + 7)
     ff = await store.fetchone("SELECT alive FROM window WHERE window_uid=?", (uid2,))

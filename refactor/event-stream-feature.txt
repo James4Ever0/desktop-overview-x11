@@ -1,0 +1,3 @@
+read latest event stream from given api endpoint
+
+view it live on webpage, which we can search, filter and keep buffer with limit

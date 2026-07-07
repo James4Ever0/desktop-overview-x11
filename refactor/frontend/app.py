@@ -36,6 +36,8 @@ setup_fonts()
 
 log = logging.getLogger("dovw.fe.app")
 
+_ALL_EVENT_TYPES = ("title", "app_name", "clipboard", "selection", "keyboard", "read", "focus", "lock")
+
 
 def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
     """Convert a '#RRGGBB' or '#RGB' hex colour to an (r,g,b) tuple."""
@@ -141,7 +143,7 @@ Global
   Shift           Hold Shift to "freeze" a hover preview so you can move the
                   mouse into it without it disappearing.
 
-Search view
+Windows view
   Type            Focus the search box and search instantly.
   Enter           Apply the search.
   Ctrl+A          Select all text in the search box.
@@ -212,7 +214,7 @@ class WindowPreviewApp(tk.Tk):
         self.s = settings
         self.api = client
         self.theme = _palette(settings.theme)
-        self.title("Desktop Overview — search")
+        self.title("Desktop Overview — windows")
         self.geometry(APP_GEOMETRY)
         self.resizable(self.s.resizable, self.s.resizable)
 
@@ -221,7 +223,7 @@ class WindowPreviewApp(tk.Tk):
 
         # shared view-state (08 §5): the two tabs render the SAME state
         self.view_state = {
-            "view": "search",        # 'search' | 'timeline'
+            "view": "windows",        # 'windows' | 'timeline' | 'events'
             "q": "",
             "fields": list(ALL_FIELDS),
             "alive": "only",         # only | dead | both
@@ -234,6 +236,13 @@ class WindowPreviewApp(tk.Tk):
             "hide_self": self.s.hide_self,
             "current_boot_only": True,
             "lane_title_filter": "",
+            "events_q": "",
+            "events_types": list(_ALL_EVENT_TYPES),
+            "events_offset": 0,
+            "events_limit": 100,
+            "events_auto_refresh": False,
+            "windows_offset": 0,
+            "windows_loading": False,
         }
         # identify our own X window for the hide-self filter (Tk-only, no Xlib)
         self._self_xid = self._get_self_xid()
@@ -250,6 +259,7 @@ class WindowPreviewApp(tk.Tk):
         self._last_grid_cols: int = 0
         self._window_capture_cache: dict[int, ImageTk.PhotoImage] = {}
         self._preview_cache: dict[int, ImageTk.PhotoImage] = {}
+        self._current_windows: list[Window] = []
 
         self.pool = ThreadPoolExecutor(max_workers=settings.request_worker_threads,
                                        thread_name_prefix="api")
@@ -380,7 +390,13 @@ class WindowPreviewApp(tk.Tk):
         except (KeyError, tk.TclError):
             # Combobox/menu popdowns can make focus_get() fail transiently.
             return
-        if focused is None:
+        focused_toplevel = None
+        try:
+            if focused is not None:
+                focused_toplevel = focused.winfo_toplevel()
+        except tk.TclError:
+            pass
+        if focused is None or focused_toplevel is not self:
             log.debug("main UI lost focus; destroying hover tips")
             self._destroy_tip()
             view = getattr(self, "_timeline_view", None)
@@ -578,8 +594,10 @@ class WindowPreviewApp(tk.Tk):
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
         self.search_frame = ttk.Frame(self.notebook)
         self.timeline_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.search_frame, text="Search")
+        self.events_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.search_frame, text="Windows")
         self.notebook.add(self.timeline_frame, text="Timeline")
+        self.notebook.add(self.events_frame, text="Events")
         self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
 
     def _build_grid(self):
@@ -633,6 +651,8 @@ class WindowPreviewApp(tk.Tk):
         self._render_generation += 1
         if self.view_state["view"] == "timeline":
             self._render_timeline()
+        elif self.view_state["view"] == "events":
+            self._render_events()
         else:
             self._render_search()
 
@@ -666,10 +686,10 @@ class WindowPreviewApp(tk.Tk):
             self.scope_var.set("")
         self.title(f"Desktop Overview — {view}")
         self._self_title_prefix = self.title()
-        self._show_search_filters(view == "search")
+        self._show_search_filters(view)
         self._sync_notebook_tab()
         self.focus()
-        if view == "search":
+        if view == "windows":
             self._on_canvas_configure()
         self._destroy_tip()
         view_obj = getattr(self, "_timeline_view", None)
@@ -680,7 +700,7 @@ class WindowPreviewApp(tk.Tk):
 
     def _on_notebook_tab_changed(self, _event=None):
         idx = self.notebook.index(self.notebook.select())
-        view = "timeline" if idx == 1 else "search"
+        view = ["windows", "timeline", "events"][idx]
         if view == self.view_state["view"]:
             return
         self._switch_to_view(view, push_history=True)
@@ -688,10 +708,9 @@ class WindowPreviewApp(tk.Tk):
     def _sync_notebook_tab(self):
         if not getattr(self, "notebook", None):
             return
-        if self.view_state["view"] == "timeline":
-            self.notebook.select(self.timeline_frame)
-        else:
-            self.notebook.select(self.search_frame)
+        tab = {"windows": self.search_frame, "timeline": self.timeline_frame, "events": self.events_frame}.get(self.view_state["view"])
+        if tab is not None:
+            self.notebook.select(tab)
 
     def _wrap_callback(self, generation: int, view: str, callback):
         """Drop results from a render that was superseded or switched away from."""
@@ -713,26 +732,165 @@ class WindowPreviewApp(tk.Tk):
         self_xid = self._self_xid if st.get("hide_self") else None
         log.debug("render_search q=%r scope=%s t_from=%s t_to=%s", q, scope, st["from"], st["to"])
 
+        # Empty query: chunked, fast-metadata loading with background score patching.
+        if q is None and scope is None and st["from"] is None and st["to"] is None:
+            self._start_chunked_load(self._render_generation)
+            return
+
+        t0 = time.perf_counter()
+
         def call():
             if q is None and scope is None and st["from"] is None and st["to"] is None:
                 return self.api.windows(sort=st["sort"], order=st["order"], alive=st["alive"],
                                         self_xid=self_xid,
                                         current_boot_only=st.get("current_boot_only"),
-                                        current_vdesktop_only=st.get("filter_no_vdesktop"))
+                                        current_vdesktop_only=st.get("filter_no_vdesktop"),
+                                        limit=200, offset=0)
             return self.api.search(q=q, window_uid=scope, fields=st["fields"],
                                    alive=st["alive"], sort=st["sort"], order=st["order"],
                                    hits=st["hits"], t_from=st["from"], t_to=st["to"],
                                    self_xid=self_xid, mode="mixed",
                                    current_boot_only=st.get("current_boot_only"),
                                    current_vdesktop_only=st.get("filter_no_vdesktop"))
+
+        def on_done(windows, err):
+            dt = (time.perf_counter() - t0) * 1000
+            log.info("_render_search round-trip view=%s alive=%s sort=%s ms=%.1f",
+                     st.get("view"), st.get("alive"), st.get("sort"), dt)
+            self._on_search_results(windows, err)
+
         gen = self._render_generation
-        self._submit(call, self._wrap_callback(gen, "search", self._on_search_results))
+        self._submit(call, self._wrap_callback(gen, "windows", on_done))
+
+    def _start_chunked_load(self, gen: int):
+        st = self.view_state
+        self._clear_grid()
+        self._current_windows = []
+        st["windows_offset"] = 0
+        st["windows_loading"] = True
+        self._fetch_windows_chunk(gen)
+
+    def _fetch_windows_chunk(self, gen: int):
+        st = self.view_state
+        if gen != self._render_generation or st.get("view") != "windows":
+            return
+        self_xid = self._self_xid if st.get("hide_self") else None
+        offset = st.get("windows_offset", 0)
+        page_size = self.s.windows_page_size
+
+        def call():
+            return self.api.windows(sort=st["sort"], order=st["order"], alive=st["alive"],
+                                    self_xid=self_xid,
+                                    current_boot_only=st.get("current_boot_only"),
+                                    current_vdesktop_only=st.get("filter_no_vdesktop"),
+                                    limit=page_size, offset=offset, enrich=False)
+
+        def on_done(windows, err):
+            if gen != self._render_generation or st.get("view") != "windows":
+                return
+            if err is not None:
+                self._on_error(err)
+                st["windows_loading"] = False
+                return
+            windows = [w for w in windows if not self._is_self(w)]
+            self._current_windows.extend(windows)
+            self._hide_banner()
+            self._reconcile_tiles(self._current_windows)
+            loaded = len(self._current_windows)
+            uids = [w.window_uid for w in windows]
+
+            self.status_var.set(f"loading… {loaded} loaded")
+
+            # Score the page just loaded, then request the next page.
+            # We keep paging while the backend returns any rows; we stop only on
+            # an empty page.  Stopping when ``len(windows) < page_size`` was wrong
+            # because backend-side filtering (self/denylist) can make a non-final
+            # page look partial.
+            def next_page():
+                st["windows_offset"] = offset + page_size
+                self._fetch_windows_chunk(gen)
+
+            def finish_page():
+                if not windows:
+                    st["windows_loading"] = False
+                    self.status_var.set(f"{loaded} window(s)")
+                    log.info("_render_search chunked done view=%s alive=%s sort=%s loaded=%d",
+                             st.get("view"), st.get("alive"), st.get("sort"), loaded)
+                    return
+                next_page()
+
+            if uids:
+                self._fetch_scores_for_uids(gen, uids, finish_page)
+            else:
+                finish_page()
+
+        self._submit(call, on_done)
+
+    def _fetch_scores_for_uids(self, gen: int, uids: list[int], on_complete=None):
+        if not uids:
+            if on_complete:
+                on_complete()
+            return
+
+        def call():
+            return self.api.window_scores(uids)
+
+        def on_done(scores, err):
+            if gen != self._render_generation or self.view_state.get("view") != "windows":
+                return
+            if err is not None:
+                log.warning("window_scores failed: %s", err)
+            else:
+                self._patch_tile_scores(scores)
+            if on_complete:
+                on_complete()
+
+        self._submit(call, on_done)
+
+    def _patch_tile_scores(self, scores: dict[int, dict]):
+        for uid, score in scores.items():
+            tile = self.tiles.get(uid)
+            if tile is None:
+                continue
+            w = tile["win"]
+            for label in ("usage_5m", "usage_10m", "usage_30m", "usage_1d",
+                          "usage_total", "focus_score"):
+                setattr(w, label, score.get(label))
+            self._update_tile(tile, w)
+
+    def _refresh_visible_scores(self):
+        """Auto-refresh helper: update scores for the tiles already on screen.
+
+        Avoids re-fetching the window list on every tick, which is especially
+        expensive for ``alive=dead`` / ``current_boot_only``.
+        """
+        if self.view_state.get("view") != "windows":
+            return
+        if self.view_state.get("windows_loading"):
+            return
+        uids = list(self.tiles.keys())
+        if not uids:
+            return
+
+        def call():
+            return self.api.window_scores(uids)
+
+        def on_done(scores, err):
+            if self.view_state.get("view") != "windows":
+                return
+            if err is not None:
+                log.warning("visible score refresh failed: %s", err)
+            else:
+                self._patch_tile_scores(scores)
+
+        self._submit(call, on_done)
 
     def _on_search_results(self, windows, err):
         if err is not None:
             self._on_error(err)
             return
         windows = [w for w in windows if not self._is_self(w)]
+        self._current_windows = list(windows)
         self._hide_banner()
         self.status_var.set(f"{len(windows)} window(s)")
         log.debug("search returned %d windows", len(windows))
@@ -779,6 +937,62 @@ class WindowPreviewApp(tk.Tk):
                 self.lane_filter_var.set(query)
                 view.set_title_filter(query)
             self.status_var.set(f"{len(view.lanes)} lane(s)")
+
+    def _render_events(self):
+        st = self.view_state
+        self.status_var.set("loading events…")
+        view = getattr(self, "_events_view", None)
+        if view is None or not getattr(view, "frame", None) or not view.frame.winfo_exists():
+            view = views.EventsView(self.events_frame, self, self.theme)
+            self._events_view = view
+            view.search_var.set(st.get("events_q", ""))
+            view.auto_refresh_var.set(st.get("events_auto_refresh", False))
+            for typ, var in view.type_vars.items():
+                var.set(typ in st.get("events_types", _ALL_EVENT_TYPES))
+
+        types = [typ for typ, var in view.type_vars.items() if var.get()]
+        st["events_types"] = types
+        view.auto_refresh_var.set(st.get("events_auto_refresh", False))
+
+        def call():
+            return self.api.events(
+                q=st.get("events_q") or None,
+                type=",".join(types) if types else None,
+                sort="rank" if st.get("events_q") else "ts_desc",
+                limit=st.get("events_limit", 100),
+                offset=st.get("events_offset", 0))
+        gen = self._render_generation
+        self._submit(call, self._wrap_callback(gen, "events", self._on_events_results))
+
+    def _on_events_results(self, result, err):
+        if err is not None:
+            self._on_error(err)
+            return
+        events, total = result
+        self._hide_banner()
+        view = getattr(self, "_events_view", None)
+        if view is not None:
+            view.set_events(events, total, self.view_state.get("events_offset", 0),
+                            self.view_state.get("events_limit", 100))
+        self.status_var.set(f"{len(events)} event(s)")
+
+    def _apply_events_filters(self, *_args):
+        view = getattr(self, "_events_view", None)
+        if view is not None:
+            self.view_state["events_q"] = view.search_var.get()
+        self.view_state["events_offset"] = 0
+        self.render()
+
+    def _events_prev(self):
+        limit = self.view_state.get("events_limit", 100)
+        offset = max(0, self.view_state.get("events_offset", 0) - limit)
+        self.view_state["events_offset"] = offset
+        self.render()
+
+    def _events_next(self):
+        limit = self.view_state.get("events_limit", 100)
+        self.view_state["events_offset"] += limit
+        self.render()
 
     def _on_timeline_range(self, t0: float, t1: float):
         self._timeline_range_var.set(f"{_fmt_ts(t0)}  →  {_fmt_ts(t1)}")
@@ -871,6 +1085,7 @@ class WindowPreviewApp(tk.Tk):
         for child in list(self.inner_frame.winfo_children()):
             child.destroy()
         self.tiles.clear()
+        self._current_windows = []
         self._last_order_uids = ()
         self._timeline_view = None
         # Reset grid weights so a later timeline view gets the full width
@@ -1166,8 +1381,8 @@ class WindowPreviewApp(tk.Tk):
     def _commit_search(self):
         self._search_after = None
         self.view_state["q"] = self.search_var.get()
-        if self.view_state["view"] != "search":
-            self._switch_to_view("search", push_history=False, clear_scope=False)
+        if self.view_state["view"] != "windows":
+            self._switch_to_view("windows", push_history=False, clear_scope=False)
         else:
             self.render()
 
@@ -1192,9 +1407,9 @@ class WindowPreviewApp(tk.Tk):
             pass
         return "break"
 
-    def _show_search_filters(self, visible: bool):
+    def _show_search_filters(self, view: str):
         """Show/hide knobs that only apply to the current view."""
-        if visible:
+        if view == "windows":
             self._search_label.pack(side=tk.LEFT, padx=(12, 4))
             self.search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4, ipady=6)
             self._fields_label.pack(side=tk.LEFT)
@@ -1207,7 +1422,7 @@ class WindowPreviewApp(tk.Tk):
                 w.pack_forget()
             for w in self._timeline_filters:
                 w.pack_forget()
-        else:
+        elif view == "timeline":
             self._search_label.pack_forget()
             self.search_entry.pack_forget()
             self._fields_label.pack_forget()
@@ -1221,6 +1436,20 @@ class WindowPreviewApp(tk.Tk):
             self._timeline_range_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
             for w in self._timeline_filters:
                 w.pack(side=tk.LEFT, padx=2)
+        else:
+            # events (or any other view): hide all shared search/timeline filters
+            self._search_label.pack_forget()
+            self.search_entry.pack_forget()
+            self._fields_label.pack_forget()
+            for cb in self._field_cbs:
+                cb.pack_forget()
+            self._hits_cb.pack_forget()
+            self.scope_label.pack_forget()
+            self._timeline_range_lbl.pack_forget()
+            for w in self._timeline_top_filters:
+                w.pack_forget()
+            for w in self._timeline_filters:
+                w.pack_forget()
 
     # ───────────────────────── history stack (08 §5) ─────────────────────────
     def _sync_filter_widgets(self):
@@ -1249,9 +1478,9 @@ class WindowPreviewApp(tk.Tk):
         uid = self.view_state.get("selected_window_uid")
         self.scope_var.set(f"scoped to window #{uid}  (clear ✕)" if uid else "")
         self._sync_filter_widgets()
-        self._show_search_filters(self.view_state["view"] == "search")
+        self._show_search_filters(self.view_state["view"])
         self._sync_notebook_tab()
-        if self.view_state.get("view") == "search":
+        if self.view_state.get("view") == "windows":
             self._on_canvas_configure()
         self.render()
 
@@ -1301,7 +1530,7 @@ class WindowPreviewApp(tk.Tk):
                 log.debug("image hover Right arrow recognised -> next capture")
                 self._navigate_preview(-1)  # next (newer) capture
                 return "break"
-        if (self.view_state.get("view") == "search"
+        if (self.view_state.get("view") == "windows"
                 and event.char and len(event.char) == 1
                 and (event.char.isprintable() or event.char == " ")):
             self.search_entry.focus_set()
@@ -1323,7 +1552,7 @@ class WindowPreviewApp(tk.Tk):
     def _poll_hover(self):
         try:
             # Hover previews only make sense in the search grid.
-            if self.view_state.get("view") != "search":
+            if self.view_state.get("view") != "windows":
                 self._last_pointer = (self.winfo_pointerx(), self.winfo_pointery())
                 return
             px, py = self.winfo_pointerx(), self.winfo_pointery()
@@ -1701,7 +1930,16 @@ class WindowPreviewApp(tk.Tk):
     # ───────────────────────── auto-refresh + close ─────────────────────────
     def _schedule_auto_refresh(self):
         def tick():
-            self.render()
+            view = self.view_state.get("view")
+            if view == "events":
+                if self.view_state.get("events_auto_refresh", False):
+                    self.render()
+            elif view == "windows":
+                # plan 15: refresh only the scores/captures of already-visible tiles,
+                # not the whole grid, to avoid re-querying the dead-window list every tick.
+                self._refresh_visible_scores()
+            else:
+                self.render()
             self._refresh_after = self.after(self.s.grid_auto_refresh_s * 1000, tick)
         self._refresh_after = self.after(self.s.grid_auto_refresh_s * 1000, tick)
 

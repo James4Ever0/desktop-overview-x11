@@ -114,6 +114,18 @@ def _client_checks(uds: str, a: int, b: int):
         check("client.windows returns typed Window list",
               wins and all(isinstance(w, Window) for w in wins))
         check("client.windows finds both windows", {w.window_uid for w in wins} == {a, b})
+
+        page = cli.windows(limit=1, offset=0)
+        check("client.windows(limit=1) returns one row", len(page) == 1)
+        page2 = cli.windows(limit=1, offset=1)
+        check("client.windows offset shifts page", page[0].window_uid != page2[0].window_uid)
+
+        scores = cli.window_scores([a, b])
+        check("client.window_scores returns dict", isinstance(scores, dict))
+        check("scores contains requested uids", {a, b} <= set(scores.keys()))
+        check("dead window b only has usage_total",
+              set(scores.get(b, {}).keys()) == {"usage_total"})
+
         wa = next(w for w in wins if w.window_uid == a)
         check("alive+session window is jumpable", wa.jumpable is True)
         check("desktop_badge formats vdesktop", wa.desktop_badge == "[1: Web]")

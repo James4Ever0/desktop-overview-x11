@@ -9,6 +9,7 @@ in-memory daemon state directly — no IPC (07 §1).  We hang a single
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -26,6 +27,7 @@ class DaemonContext:
     window_captures: Any = None          # window_captures.WindowCaptureScheduler (refresh)
     handlers: Any = None            # handlers.EventHandlers (current vdesktop, kbd toggle target)
     stats: dict = field(default_factory=dict)   # last_full_sweep, etc.
+    score_task: asyncio.Task | None = None      # cancellable /windows/scores task (plan 15)
 
     @property
     def session_key(self) -> str | None:

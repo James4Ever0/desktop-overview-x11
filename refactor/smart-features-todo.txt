@@ -15,3 +15,21 @@ todo: keep dead window preview for most x days in desktop overview
 think of user interactions within the frontend ui and how we can log user behavior, what actions are meaningful within the ui and how we can improve ux with that data
 
 create & display ai summary on window interactions, what user is doing in this window recent x minutes? process those frequently focused ones, then process those idle ones if possible
+
+---
+
+improve sorting by "click through rate" of specific query terms
+
+add sorting option "smart" which will use algo and improve by usage, ai, semantics
+
+---
+
+mind selection event within the frontend ui?
+
+---
+
+a tab to browse hot keywords, topics in recent x minutes, new words not found anywhere in history (discover)
+
+---
+
+a tab to browse & search for "events", and group similar events with same content or similar content (compare levenshtein distance, grouping) in visual, or group by app id, or etc.

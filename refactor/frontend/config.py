@@ -51,6 +51,7 @@ class FrontendSettings:
     request_worker_threads: int = 4
     search_debounce_ms: int = 200
     grid_auto_refresh_s: int = 2           # 0 = off
+    windows_page_size: int = 20            # plan 15: chunked Windows tab loading
     grid_columns: int | None = None        # None = auto-fit width
     grid_tile_width: int = 260
     grid_tile_height: int = 260

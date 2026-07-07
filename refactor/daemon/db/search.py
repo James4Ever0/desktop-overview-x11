@@ -15,10 +15,14 @@ so ``snippet(fts_X, 0, …)`` is correct for all of them.
 """
 from __future__ import annotations
 
+import logging
 import time
 
 from ..config import Settings
 from ..heartbeat import USAGE_INTERVALS_S, usage_rates
+
+log = logging.getLogger("dovw.search")
+_T = lambda: time.perf_counter() * 1000
 
 FIELDS = {
     # field name : (fts table, content table, ts column on the content table)
@@ -163,6 +167,34 @@ async def _enrich_focus_score(store, items: list[dict], now=None) -> None:
             o.get("last_access"), now, s)
 
 
+def _is_usage_sort(sort: str) -> bool:
+    return sort == "focus_score" or sort.startswith("usage_")
+
+
+async def _enrich_usage_total_only(store, items: list[dict], key: str = "window_uid") -> None:
+    """Attach only usage_total (cheapest heartbeat aggregation) for dead/visible rows."""
+    if not items:
+        return
+    uids = [o[key] for o in items]
+    interval = getattr(store.s, "heartbeat_interval_s", 10.0)
+    placeholders = ",".join("?" * len(uids))
+    sql = (f"SELECT window_uid, COUNT(*) AS n FROM window_heartbeat "
+           f"WHERE window_uid IN ({placeholders}) GROUP BY window_uid")
+    rows = await store.fetchall(sql, tuple(uids))
+    totals = {row["window_uid"]: round(row["n"] * interval / 60.0, 1) for row in rows}
+    for o in items:
+        o["usage_total"] = totals.get(o[key], 0.0)
+
+
+def _set_dead_scores_zero(items: list[dict]) -> None:
+    """Set all usage fields and focus_score to 0.0 (used when sorting by usage/focus)."""
+    for o in items:
+        for label in USAGE_INTERVALS_S:
+            o[label] = 0.0
+        o["usage_total"] = 0.0
+        o["focus_score"] = 0.0
+
+
 # ───────────────────────── GET /windows (no FTS) ─────────────────────────
 def _window_sort_col(sort: str) -> str:
     """Map public sort key to a SQL column/expression on the window table."""
@@ -173,10 +205,33 @@ def _window_sort_col(sort: str) -> str:
     return "last_access"  # last_access default, derived from focus_event.focused_at
 
 
+async def _page_uids_last_access(store, where_clause: str, params: list,
+                                 order: str, limit: int, offset: int) -> list[int]:
+    """Select just window_uids ordered by last_access via a pre-aggregated join.
+
+    This avoids evaluating the expensive ``_WINDOW_COLS`` correlated subqueries
+    for every candidate row; we only fetch full metadata for the small result page.
+    """
+    direction = "ASC" if order == "asc" else "DESC"
+    sql = (
+        "WITH last_focus AS ("
+        " SELECT window_uid, MAX(focused_at) AS focused_at FROM focus_event GROUP BY window_uid"
+        ")"
+        " SELECT w.window_uid, COALESCE(last_focus.focused_at, 0) AS last_access"
+        " FROM window w"
+        " LEFT JOIN last_focus ON last_focus.window_uid = w.window_uid"
+        f" {where_clause}"
+        f" ORDER BY last_access {direction}, w.window_uid ASC"
+        " LIMIT ? OFFSET ?"
+    )
+    rows = await store.fetchall(sql, tuple(params + [limit, offset]))
+    return [r["window_uid"] for r in rows]
+
+
 async def list_windows(store, *, alive="both", sort="last_access", order="desc",
                        limit=200, offset=0, current_session_key=None,
                        title_denylist=None, self_xid=None,
-                       current_boot_id=None) -> list[dict]:
+                       current_boot_id=None, enrich=True) -> list[dict]:
     where = []
     params = []
     a = _alive_sql(alive)
@@ -197,13 +252,26 @@ async def list_windows(store, *, alive="both", sort="last_access", order="desc",
 
     if sort == "focus_score" or sort.startswith("usage_"):
         # focus_score and usage sorts depend on enriched values, so sort globally in Python.
+        t0 = _T()
         sql = f"SELECT {_WINDOW_COLS} FROM window w {where_clause}"
         rows = await store.fetchall(sql, tuple(params))
+        t1 = _T()
+        log.info("list_windows metadata alive=%s sort=%s enrich=%s rows=%d ms=%.1f",
+                 alive, sort, enrich, len(rows), t1 - t0)
         results = [assemble_window(r, current_session_key) for r in rows]
         results = _filter_denied(results)
         results = _filter_self(results, self_xid)
-        await _enrich_usage(store, results, now=now)
-        await _enrich_focus_score(store, results, now=now)
+        if enrich:
+            alive_items = [r for r in results if r["alive"]]
+            if alive_items:
+                await _enrich_usage(store, alive_items, now=now)
+                await _enrich_focus_score(store, alive_items, now=now)
+            dead_items = [r for r in results if not r["alive"]]
+            if dead_items:
+                _set_dead_scores_zero(dead_items)
+            t2 = _T()
+            log.info("list_windows enrich alive=%s sort=%s enrich=%s rows=%d ms=%.1f",
+                     alive, sort, enrich, len(results), t2 - t1)
         reverse = order != "asc"
         if sort == "focus_score":
             results.sort(key=lambda o: (o["focus_score"], o["window_uid"]), reverse=reverse)
@@ -211,20 +279,92 @@ async def list_windows(store, *, alive="both", sort="last_access", order="desc",
             results.sort(key=lambda o: (o.get(sort) or 0, o["window_uid"]), reverse=reverse)
         return results[offset:offset + limit]
 
-    sort_col = _window_sort_col(sort)
-    direction = "ASC" if order == "asc" else "DESC"
-    # secondary key keeps ordering stable when primary key ties
-    secondary = "w.window_uid ASC"
-    sql = (f"SELECT {_WINDOW_COLS} FROM window w "
-           + where_clause
-           + f" ORDER BY {sort_col} {direction}, {secondary} LIMIT ? OFFSET ?")
-    rows = await store.fetchall(sql, tuple(params + [limit, offset]))
-    results = [assemble_window(r, current_session_key) for r in rows]
-    results = _filter_denied(results)
-    results = _filter_self(results, self_xid)
-    await _enrich_usage(store, results, now=now)
-    await _enrich_focus_score(store, results, now=now)
+    if sort == "last_access":
+        # Fast path: pre-aggregate focus times, select uids for the page, then fetch
+        # full metadata for just those uids.  This avoids evaluating the expensive
+        # _WINDOW_COLS correlated subqueries over the entire candidate set.
+        t0 = _T()
+        uids = await _page_uids_last_access(store, where_clause, params, order, limit, offset)
+        t1 = _T()
+        log.info("list_windows uid-select alive=%s sort=%s enrich=%s rows=%d ms=%.1f",
+                 alive, sort, enrich, len(uids), t1 - t0)
+        if not uids:
+            return []
+        placeholders = ",".join("?" * len(uids))
+        sql = f"SELECT {_WINDOW_COLS} FROM window w WHERE w.window_uid IN ({placeholders})"
+        rows = await store.fetchall(sql, tuple(uids))
+        row_by_uid = {r["window_uid"]: r for r in rows}
+        ordered_rows = [row_by_uid[uid] for uid in uids if uid in row_by_uid]
+        results = [assemble_window(r, current_session_key) for r in ordered_rows]
+        results = _filter_denied(results)
+        results = _filter_self(results, self_xid)
+    else:
+        sort_col = _window_sort_col(sort)
+        direction = "ASC" if order == "asc" else "DESC"
+        # secondary key keeps ordering stable when primary key ties
+        secondary = "w.window_uid ASC"
+        t0 = _T()
+        sql = (f"SELECT {_WINDOW_COLS} FROM window w "
+               + where_clause
+               + f" ORDER BY {sort_col} {direction}, {secondary} LIMIT ? OFFSET ?")
+        rows = await store.fetchall(sql, tuple(params + [limit, offset]))
+        t1 = _T()
+        log.info("list_windows metadata alive=%s sort=%s enrich=%s rows=%d ms=%.1f",
+                 alive, sort, enrich, len(rows), t1 - t0)
+        results = [assemble_window(r, current_session_key) for r in rows]
+        results = _filter_denied(results)
+        results = _filter_self(results, self_xid)
+    if enrich:
+        if alive == "dead":
+            await _enrich_usage_total_only(store, results)
+        elif alive == "both":
+            alive_items = [r for r in results if r["alive"]]
+            if alive_items:
+                await _enrich_usage(store, alive_items, now=now)
+                await _enrich_focus_score(store, alive_items, now=now)
+            dead_items = [r for r in results if not r["alive"]]
+            if dead_items:
+                await _enrich_usage_total_only(store, dead_items)
+        else:  # only
+            await _enrich_usage(store, results, now=now)
+            await _enrich_focus_score(store, results, now=now)
+        t2 = _T()
+        log.info("list_windows enrich alive=%s sort=%s enrich=%s rows=%d ms=%.1f",
+                 alive, sort, enrich, len(results), t2 - t1)
     return results
+
+
+async def window_scores(store, uids: list[int], now=None) -> dict[int, dict]:
+    """Return {window_uid: scores} for a small set of visible windows.
+
+    Alive rows receive full recent-usage buckets and focus_score.  Dead rows
+    receive only usage_total; recent intervals and focus_score are omitted.
+    """
+    if not uids:
+        return {}
+    now = time.time() if now is None else now
+    placeholders = ",".join("?" * len(uids))
+    rows = await store.fetchall(
+        f"SELECT window_uid, alive FROM window WHERE window_uid IN ({placeholders})",
+        tuple(uids))
+    alive_map = {row["window_uid"]: bool(row["alive"]) for row in rows}
+
+    items = [{"window_uid": uid, "alive": alive_map.get(uid, False)} for uid in uids]
+    await _enrich_usage(store, items, now=now)
+    alive_items = [it for it in items if it["alive"]]
+    if alive_items:
+        await _enrich_focus_score(store, alive_items, now=now)
+
+    out: dict[int, dict] = {}
+    for it in items:
+        uid = it["window_uid"]
+        if it["alive"]:
+            out[uid] = {label: it.get(label) for label in USAGE_INTERVALS_S}
+            out[uid]["usage_total"] = it.get("usage_total")
+            out[uid]["focus_score"] = it.get("focus_score")
+        else:
+            out[uid] = {"usage_total": it.get("usage_total", 0.0)}
+    return out
 
 
 # ───────────────────────── GET /search (FTS) ─────────────────────────
@@ -332,8 +472,13 @@ def _safe_fts_query(q: str) -> str:
     return " AND ".join(f'"{t}"' for t in cleaned)
 
 
-def _mark_substring(text: str, q: str) -> str:
-    """Build a short snippet with the first case-insensitive match wrapped in <mark>."""
+def _mark_substring(text: str, q: str, *, radius: int = 24, max_total: int | None = None) -> str:
+    """Build a snippet with the first case-insensitive match wrapped in <mark>.
+
+    ``radius`` is the desired context on each side.  When ``max_total`` is set,
+    the radius is reduced so the final snippet (including markup) does not
+    exceed that length.
+    """
     if not text or not q:
         return text
     lo = text.lower()
@@ -341,13 +486,16 @@ def _mark_substring(text: str, q: str) -> str:
     idx = lo.find(qlo)
     if idx < 0:
         return text
-    radius = 24
+    if max_total is not None:
+        # markup adds <mark>...</mark> (13 chars); reserve a char for each ellipsis.
+        max_radius = max(0, (max_total - len(qlo) - 13 - 2) // 2)
+        radius = min(radius, max_radius)
     start = max(0, idx - radius)
-    end = min(len(text), idx + len(q) + radius)
+    end = min(len(text), idx + len(qlo) + radius)
     snippet = text[start:end]
     rel = idx - start
     marked = (
-        snippet[:rel] + "<mark>" + snippet[rel:rel + len(q)] + "</mark>" + snippet[rel + len(q):]
+        snippet[:rel] + "<mark>" + snippet[rel:rel + len(qlo)] + "</mark>" + snippet[rel + len(qlo):]
     )
     if start > 0:
         marked = "…" + marked

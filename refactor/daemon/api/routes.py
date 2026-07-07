@@ -7,6 +7,7 @@ read daemon state → serialize.  No business logic here (07 §6).  Everything i
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 
@@ -14,7 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 
 from .. import capture
-from ..db import search
+from ..db import events, search
 from .app import DaemonContext, get_ctx
 from . import models
 
@@ -103,20 +104,43 @@ async def get_windows(
     self_xid: str | None = Query(None),
     current_boot_only: bool = Query(False),
     current_vdesktop_only: bool = Query(False),
+    enrich: bool = Query(True),
 ):
-    log.debug("GET /windows sort=%s order=%s alive=%s limit=%d current_boot_only=%s current_vdesktop_only=%s",
-              sort, order, alive, limit, current_boot_only, current_vdesktop_only)
+    log.debug("GET /windows sort=%s order=%s alive=%s limit=%d enrich=%s current_boot_only=%s current_vdesktop_only=%s",
+              sort, order, alive, limit, enrich, current_boot_only, current_vdesktop_only)
     current_boot_id = ctx.identity.boot_id if (current_boot_only and ctx.identity) else None
     results = await search.list_windows(
         ctx.store, alive=alive, sort=sort, order=order, limit=limit, offset=offset,
         current_session_key=ctx.session_key,
         title_denylist=ctx.settings.window_title_denylist,
         self_xid=self_xid,
-        current_boot_id=current_boot_id)
+        current_boot_id=current_boot_id,
+        enrich=enrich)
     results = _enrich_window_vdesktops(ctx, results)
     if current_vdesktop_only:
         results = _filter_current_vdesktop(results, _current_vdesktop_index(ctx))
     return results
+
+
+@router.post("/windows/scores")
+async def post_window_scores(
+    uids: list[int],
+    ctx: DaemonContext = Depends(get_ctx),
+):
+    log.debug("POST /windows/scores uids=%d", len(uids))
+    if ctx.score_task is not None and not ctx.score_task.done():
+        ctx.score_task.cancel()
+        try:
+            await ctx.score_task
+        except asyncio.CancelledError:
+            pass
+    task = asyncio.create_task(search.window_scores(ctx.store, uids))
+    ctx.score_task = task
+    try:
+        return await task
+    except asyncio.CancelledError:
+        log.debug("POST /windows/scores cancelled for stale request")
+        return {}
 
 
 @router.get("/windows/{uid}", response_model=models.WindowDetail)
@@ -277,6 +301,29 @@ async def get_timeline(
     if current_vdesktop_only:
         lanes = _filter_timeline_current_vdesktop(lanes, _current_vdesktop_index(ctx))
     return lanes
+
+
+# ───────────────────────── events ─────────────────────────
+@router.get("/events", response_model=models.EventListOut)
+async def get_events(
+    ctx: DaemonContext = Depends(get_ctx),
+    q: str | None = Query(None),
+    type: str | None = Query(None, description="comma-separated event types"),
+    t_from: float | None = Query(None, alias="from"),
+    t_to: float | None = Query(None, alias="to"),
+    sort: str = Query("ts_desc", pattern="^(ts_desc|ts_asc|rank)$"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    log.debug("GET /events q=%s type=%s sort=%s limit=%d offset=%d",
+              q, type, sort, limit, offset)
+    types = [t.strip() for t in type.split(",") if t.strip()] if type else None
+    rows, total = await events.search_events(
+        ctx.store, q=q, types=types, t_from=t_from, t_to=t_to,
+        sort=sort, limit=limit, offset=offset,
+        current_session_key=ctx.session_key)
+    items = [models.GlobalEvent(**r) for r in rows]
+    return models.EventListOut(total=total, items=items)
 
 
 # ───────────────────────── vdesktops ─────────────────────────

@@ -1,0 +1,3 @@
+set max scale factor, do not scale beyond one week.
+
+when browsing old data, first fetch the latest one timestamp. then move view to there. user can scrollback and dynamically load the rest. do not load those if not by user request.

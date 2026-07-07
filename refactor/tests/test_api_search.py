@@ -272,6 +272,19 @@ async def test_api(store, a, b, c):
         check("GET /windows x_window_id hex-formatted",
               r.json()[0]["x_window_id"].startswith("0x"))
 
+        r = await cli.get("/windows", params={"enrich": "0", "limit": "10"})
+        check("GET /windows enrich=0 omits scores",
+              r.status_code == 200
+              and all(w.get("usage_total") is None for w in r.json()))
+
+        r = await cli.post("/windows/scores", json=[a, b])
+        check("POST /windows/scores 200", r.status_code == 200)
+        scores = r.json()
+        check("scores alive a has focus_score",
+              scores.get(str(a), {}).get("focus_score") is not None)
+        check("scores dead b only usage_total",
+              set(scores.get(str(b), {}).keys()) == {"usage_total"})
+
         r = await cli.get("/search", params={"q": "invoice"})
         check("GET /search 200", r.status_code == 200)
         suids = {w["window_uid"] for w in r.json()}
@@ -451,19 +464,19 @@ async def test_focus_score_and_usage(store, a, b, c):
         by_uid = {w["window_uid"]: w for w in wins}
         check("window a has 5m usage 5.0", by_uid[a].get("usage_5m") == 5.0)
         check("window a has total usage 5.0", by_uid[a].get("usage_total") == 5.0)
-        check("window b has 5m usage 0.0", by_uid[b].get("usage_5m") == 0.0)
+        check("window b dead has no recent 5m usage", by_uid[b].get("usage_5m") is None)
         check("window b has total usage 1.0", by_uid[b].get("usage_total") == 1.0)
 
         by_fs = await search.list_windows(store, sort="focus_score", order="desc",
                                           current_session_key="sess")
-        check("focus_score desc order", [w["window_uid"] for w in by_fs[:3]] == [a, b, c])
+        check("focus_score desc order", [w["window_uid"] for w in by_fs[:3]] == [a, c, b])
         by_fs_asc = await search.list_windows(store, sort="focus_score", order="asc",
                                               current_session_key="sess")
-        check("focus_score asc order", [w["window_uid"] for w in by_fs_asc[:3]] == [c, b, a])
+        check("focus_score asc order", [w["window_uid"] for w in by_fs_asc[:3]] == [b, c, a])
 
         by_tot = await search.list_windows(store, sort="usage_total", order="desc",
                                            current_session_key="sess")
-        check("usage_total desc order", [w["window_uid"] for w in by_tot[:3]] == [a, b, c])
+        check("usage_total desc order", [w["window_uid"] for w in by_tot[:3]] == [a, c, b])
 
         srch = await search.search(store, q="invoice", sort="focus_score", order="desc",
                                    current_session_key="sess")

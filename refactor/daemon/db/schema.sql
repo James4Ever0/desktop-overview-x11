@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS focus_event (         -- one row per focus gain
   focused_at     REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_focus_time ON focus_event(focused_at);
+CREATE INDEX IF NOT EXISTS ix_focus_window_time ON focus_event(window_uid, focused_at);
 
 CREATE TABLE IF NOT EXISTS screen_lock_event (   -- lock/unlock boundaries
   id         INTEGER PRIMARY KEY,

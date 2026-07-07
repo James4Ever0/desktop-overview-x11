@@ -22,6 +22,8 @@ USAGE_INTERVALS_S = {
     "usage_1d": 86400,
 }
 
+_T = lambda: time.perf_counter() * 1000
+
 
 class HeartbeatRecorder:
     def __init__(self, store, registry, settings, daemon_boot_id: str):
@@ -74,6 +76,7 @@ async def usage_rates(store, window_uids: list[int], now: float | None = None) -
     if not window_uids:
         return {}
     now = time.time() if now is None else now
+    t0 = _T()
     interval = getattr(store.s, "heartbeat_interval_s", 10.0)
     max_age = max(USAGE_INTERVALS_S.values())
     placeholders = ",".join("?" * len(window_uids))
@@ -89,6 +92,8 @@ async def usage_rates(store, window_uids: list[int], now: float | None = None) -
            f"WHERE window_uid IN ({placeholders}) AND ts >= ? "
            "GROUP BY window_uid")
     rows = await store.fetchall(sql, tuple(params))
+    t1 = _T()
+    log.info("usage_rates uids=%d rows=%d ms=%.1f", len(window_uids), len(rows), t1 - t0)
     out: dict[int, dict] = {uid: {label: 0.0 for label in USAGE_INTERVALS_S} for uid in window_uids}
     for row in rows:
         uid = row["window_uid"]

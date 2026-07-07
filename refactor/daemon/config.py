@@ -80,7 +80,9 @@ class Settings:
     # --- §3b title denylist ---
     window_title_denylist: tuple[str, ...] = (
         "Desktop Overview — search",
+        "Desktop Overview — windows",
         "Desktop Overview — timeline",
+        "Desktop Overview — events",
         "Desktop Overview — Help",
         "Desktop — Plasma",
     )

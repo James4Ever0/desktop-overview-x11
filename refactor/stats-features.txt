@@ -1,0 +1,3 @@
+create a new tab stats
+
+visualize db size (sqlite), photo size, opened window count, dead window count (current sess), current window id, opened window count per virtual desktop id, total virtual desktop count, event count, earliest event timestamp. latest event timestamp per event type or in total

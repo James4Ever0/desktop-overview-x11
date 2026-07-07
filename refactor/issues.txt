@@ -155,3 +155,7 @@ display help question mark button on the top right corner, to display all operat
 ---
 
 add "window lifespan" indicator in timeline, record "created since" timestamp on window creation, and indicate its lifespan "alive to death" by recording "dead" timestamp if that window id along with the boot id is not recognized. if the window is alive during a span, could draw a horizontal straight line for that behind the blue rectangle <focus> region (display order behind the focus region). if the daemon reboots, and a window with "created since" indicator stored in db, do not record "dead" timestamp. if not detected, we can record that dead timestamp and mark window dead. periodically check and list window ids to get newly created windows and record create since indicators and mark those missing as dead and record dead timestamp indicator. if a window is alive, it shall not have dead timestamp indicator and the straight line shall draw till now.
+
+---
+
+add button to close window (with confirmation), will identify the process helding the window and send different signals, will display commandline, pid of that process before sending signal

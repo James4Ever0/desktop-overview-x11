@@ -1177,3 +1177,160 @@ class TimelineView:
         self._destroy_hover_tip()
         if self.frame is not None:
             self.frame.destroy()
+
+
+class EventsView:
+    """Paginated, searchable global event log (plan 13)."""
+
+    EVENT_TYPES = ("title", "app_name", "clipboard", "selection", "keyboard", "read", "focus", "lock")
+
+    def __init__(self, parent, app, theme):
+        self.app = app
+        self.theme = theme
+        self.frame = ttk.Frame(parent, style="Tile.TFrame")
+        self.frame.grid(row=0, column=0, sticky="nsew")
+        parent.rowconfigure(0, weight=1)
+        parent.columnconfigure(0, weight=1)
+
+        # top control bar
+        self.bar = ttk.Frame(self.frame, style="Tile.TFrame")
+        self.bar.pack(fill=tk.X, padx=4, pady=(4, 0))
+
+        ttk.Label(self.bar, text="Search:").pack(side=tk.LEFT, padx=(4, 2))
+        self.search_var = tk.StringVar()
+        self.search_entry = ttk.Entry(self.bar, textvariable=self.search_var, width=30)
+        self.search_entry.pack(side=tk.LEFT, padx=2)
+        self.search_entry.bind("<Return>", lambda _e: app._apply_events_filters())
+        self.search_entry.bind("<Control-a>", app._select_all)
+
+        self.type_vars: dict[str, tk.BooleanVar] = {}
+        ttk.Label(self.bar, text="Types:").pack(side=tk.LEFT, padx=(12, 2))
+        for typ in self.EVENT_TYPES:
+            var = tk.BooleanVar(value=True)
+            self.type_vars[typ] = var
+            cb = ttk.Checkbutton(self.bar, text=typ, variable=var,
+                                 command=app._apply_events_filters)
+            cb.pack(side=tk.LEFT, padx=2)
+
+        self.page_label = ttk.Label(self.bar, text="")
+        self.page_label.pack(side=tk.LEFT, padx=(12, 2))
+
+        self.next_btn = ttk.Button(self.bar, text="Next ▶", command=app._events_next)
+        self.next_btn.pack(side=tk.RIGHT, padx=2)
+        self.prev_btn = ttk.Button(self.bar, text="◀ Prev", command=app._events_prev)
+        self.prev_btn.pack(side=tk.RIGHT, padx=2)
+
+        self.auto_refresh_var = tk.BooleanVar(value=app.view_state.get("events_auto_refresh", False))
+        self.auto_refresh_cb = ttk.Checkbutton(
+            self.bar, text="auto refresh", variable=self.auto_refresh_var,
+            command=self._on_auto_refresh_toggle)
+        self.auto_refresh_cb.pack(side=tk.RIGHT, padx=2)
+
+        self.refresh_btn = ttk.Button(self.bar, text="Refresh", command=app.render)
+        self.refresh_btn.pack(side=tk.RIGHT, padx=2)
+
+        # event list
+        self.text = tk.Text(self.frame, wrap="word", bd=0,
+                            bg=self.theme["tile_bg"], fg=self.theme["fg"],
+                            highlightthickness=0, padx=8, pady=6,
+                            font=("TkDefaultFont", 9))
+        self.text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.scroll = ttk.Scrollbar(self.frame, orient=tk.VERTICAL, command=self.text.yview)
+        self.scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.text.configure(yscrollcommand=self.scroll.set)
+
+        self.text.tag_configure("time", foreground=self.theme["muted"])
+        self.text.tag_configure("type", foreground=self.theme["accent"], font=("TkDefaultFont", 9, "bold"))
+        self.text.tag_configure("window", foreground=self.theme["fg"])
+        self.text.tag_configure("mark", background=self.theme["mark_bg"])
+        self.text.tag_configure("muted", foreground=self.theme["muted"])
+
+        self._bind_text_scroll(self.text)
+
+    def _bind_text_scroll(self, text: tk.Text):
+        def _scroll(event):
+            if event.num == 4:
+                text.yview_scroll(-1, "units")
+            elif event.num == 5:
+                text.yview_scroll(1, "units")
+            elif event.delta:
+                text.yview_scroll(-1 if event.delta > 0 else 1, "units")
+            return "break"
+        text.bind("<MouseWheel>", _scroll)
+        text.bind("<Button-4>", _scroll)
+        text.bind("<Button-5>", _scroll)
+
+    def _on_auto_refresh_toggle(self):
+        self.app.view_state["events_auto_refresh"] = self.auto_refresh_var.get()
+
+    def set_events(self, events: list, total: int, offset: int, limit: int):
+        top = self.text.yview()[0]
+        self.text.configure(state="normal")
+        self.text.delete("1.0", tk.END)
+
+        end = offset + len(events)
+        self.page_label.configure(text=f"{offset + 1}-{end} of {total}")
+        self.prev_btn.configure(state="normal" if offset > 0 else "disabled")
+        self.next_btn.configure(state="normal" if end < total else "disabled")
+
+        if not events:
+            self.text.insert(tk.END, "No events found.", "muted")
+            self.text.configure(state="disabled")
+            self.text.yview_moveto(top)
+            return
+
+        for ev in events:
+            self._render_event_block(ev)
+        self.text.configure(state="disabled")
+        self.text.yview_moveto(top)
+
+    def _render_event_block(self, ev):
+        ts = _fmt_ts(ev.ts)
+        self.text.insert(tk.END, f"{ts}  ", "time")
+        self.text.insert(tk.END, f"{ev.type}\n", "type")
+        app = ev.app_name or ev.wm_class or "?"
+        title = ev.current_title or "(no title)"
+        self.text.insert(tk.END, f"  window: [{app}] {title}\n", "window")
+        count = getattr(ev, "hit_count", None) or 0
+        excerpts = getattr(ev, "hit_excerpts", None) or []
+        if count:
+            self.text.insert(tk.END, f"  hits: {count}\n", "muted")
+            for i, ex in enumerate(excerpts[:3], start=1):
+                self.text.insert(tk.END, f"  {i}: ", "muted")
+                self._insert_marked(ex)
+                self.text.insert(tk.END, "\n")
+        else:
+            body = (ev.excerpt or ev.text or "")
+            if body:
+                self.text.insert(tk.END, "  text: ", "muted")
+                self._insert_marked(body)
+                self.text.insert(tk.END, "\n")
+        self.text.insert(tk.END, "\n")
+
+    def _render_event_line(self, ev):
+        """Legacy single-line renderer; kept for callers that expect it."""
+        ts = _fmt_ts(ev.ts)
+        self.text.insert(tk.END, f"{ts}  ", "time")
+        typ = ev.type
+        self.text.insert(tk.END, f"{typ:10}", "type")
+        app = ev.app_name or ev.wm_class or "?"
+        title = ev.current_title or "(no title)"
+        self.text.insert(tk.END, f"[{app}] {title} — ", "window")
+        body = (ev.excerpt or ev.text or "")
+        self._insert_marked(body)
+        self.text.insert(tk.END, "\n")
+
+    def _insert_marked(self, text: str):
+        i = 0
+        while True:
+            start = text.find("<mark>", i)
+            if start < 0:
+                self.text.insert(tk.END, text[i:])
+                break
+            self.text.insert(tk.END, text[i:start])
+            end = text.find("</mark>", start)
+            if end < 0:
+                self.text.insert(tk.END, text[start + 6:])
+                break
+            self.text.insert(tk.END, text[start + 6:end], "mark")
+            i = end + 7

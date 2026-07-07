@@ -1,0 +1,9 @@
+in timeline or any random events, keyboard events shall be logged anyway even if no focused window found.
+
+shall display those events as no window bounded in timeline view.
+
+or we shall create a separate tab for: searching raw events, browse raw event timeline instead of associating with specific window.
+
+record full event stream no matter what window is focused or not.
+
+can use selection event at: 2026-07-04 21:15:52 to test.
