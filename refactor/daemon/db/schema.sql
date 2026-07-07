@@ -233,5 +233,17 @@ CREATE TRIGGER IF NOT EXISTS kbd_au AFTER UPDATE ON kbd_segment BEGIN
   INSERT INTO fts_kbd(rowid, text) VALUES (new.id, new.text);
 END;
 
+-- ────────────────────────────── jump events (frontend actions) ───────────────
+CREATE TABLE IF NOT EXISTS jump_event (
+  id             INTEGER PRIMARY KEY,
+  window_uid     INTEGER REFERENCES window(window_uid),
+  daemon_boot_id TEXT,
+  ts             REAL NOT NULL,
+  success        INTEGER NOT NULL DEFAULT 0,
+  title          TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_jump_window ON jump_event(window_uid, ts);
+CREATE INDEX IF NOT EXISTS ix_jump_boot   ON jump_event(daemon_boot_id, ts);
+
 -- ────────────────────────────── meta / versioning (06 §6) ────────────────────
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);

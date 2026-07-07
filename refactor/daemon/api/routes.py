@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
@@ -387,25 +388,45 @@ async def control_keyboard(body: models.KeyboardToggleIn, ctx: DaemonContext = D
 @router.post("/windows/{uid}/activate", response_model=models.ActivateOut)
 async def activate_window(uid: int, ctx: DaemonContext = Depends(get_ctx)):
     """Jump to window — re-verify liveness, then xdotool windowactivate (07 §5, 02 §6)."""
+    now = time.time()
     row = await ctx.store.fetchone(
         "SELECT x_window_id, session_key, alive FROM window WHERE window_uid = ?", (uid,))
     if row is None:
         raise HTTPException(status_code=404, detail="unknown window")
-    if row["session_key"] != ctx.session_key:
-        return models.ActivateOut(ok=False, reason="different-session")
-    if not row["alive"]:
-        return models.ActivateOut(ok=False, reason="dead")
 
     x_id = int(row["x_window_id"])
-    # re-verify it's still in the live client list before acting (02 §6)
-    windows = await _run(ctx, capture.get_window_list)
-    live_ids = {capture.normalize_win_id(w) for w, _d, _t in windows}
-    if x_id not in live_ids:
-        return models.ActivateOut(ok=False, reason="vanished")
+    success = False
+    reason = "ok"
 
-    ok = await _run(ctx, capture.activate_window, f"0x{x_id:08x}")
-    log.info("activate window_uid=%s x=0x%08x -> %s", uid, x_id, ok)
-    return models.ActivateOut(ok=bool(ok), reason="ok" if ok else "vanished")
+    if row["session_key"] != ctx.session_key:
+        reason = "different-session"
+    elif not row["alive"]:
+        reason = "dead"
+    else:
+        # re-verify it's still in the live client list before acting (02 §6)
+        windows = await _run(ctx, capture.get_window_list)
+        live_ids = {capture.normalize_win_id(w) for w, _d, _t in windows}
+        if x_id not in live_ids:
+            reason = "vanished"
+        else:
+            ok = await _run(ctx, capture.activate_window, f"0x{x_id:08x}")
+            success = bool(ok)
+            reason = "ok" if ok else "vanished"
+
+    # Log every jump attempt, successful or not.
+    title_row = await ctx.store.fetchone(
+        "SELECT title FROM title_history WHERE window_uid=? ORDER BY changed_at DESC, id DESC LIMIT 1",
+        (uid,))
+    boot_id = ctx.identity.daemon_boot_id if ctx.identity else None
+    try:
+        await ctx.store.execute(
+            "INSERT INTO jump_event(window_uid, daemon_boot_id, ts, success, title) VALUES(?,?,?,?,?)",
+            (uid, boot_id, now, 1 if success else 0, title_row["title"] if title_row else None))
+    except Exception as exc:                               # noqa: BLE001
+        log.warning("failed to log jump_event for uid=%s: %s", uid, exc)
+
+    log.info("activate window_uid=%s x=0x%08x -> reason=%s success=%s", uid, x_id, reason, success)
+    return models.ActivateOut(ok=success, reason=reason)
 
 
 async def _run(ctx, fn, *args):

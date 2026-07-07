@@ -21,6 +21,7 @@ import logging
 import time
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from tkinter import font as tkfont
 from tkinter import ttk
 import functools
@@ -243,6 +244,7 @@ class WindowPreviewApp(tk.Tk):
             "events_auto_refresh": False,
             "windows_offset": 0,
             "windows_loading": False,
+            "windows_has_more": False,
         }
         # identify our own X window for the hide-self filter (Tk-only, no Xlib)
         self._self_xid = self._get_self_xid()
@@ -260,6 +262,15 @@ class WindowPreviewApp(tk.Tk):
         self._window_capture_cache: dict[int, ImageTk.PhotoImage] = {}
         self._preview_cache: dict[int, ImageTk.PhotoImage] = {}
         self._current_windows: list[Window] = []
+
+        # Static placeholder shown for tiles with no window capture.
+        self._placeholder_path = (
+            Path(__file__).resolve().parent / "assets" / "default-image-missing-placeholder.jpg"
+        )
+        self._placeholder_image = self._make_placeholder_photo(
+            self.s.grid_tile_width, self.s.grid_tile_height, pad=True)
+        self._placeholder_preview_image = self._make_placeholder_photo(
+            self.s.hover_preview_max_dim, self.s.hover_preview_max_dim, pad=False)
 
         self.pool = ThreadPoolExecutor(max_workers=settings.request_worker_threads,
                                        thread_name_prefix="api")
@@ -602,7 +613,8 @@ class WindowPreviewApp(tk.Tk):
 
     def _build_grid(self):
         self.canvas = tk.Canvas(self.search_frame, bg=self.theme["canvas_bg"], highlightthickness=0)
-        self.scrollbar = ttk.Scrollbar(self.search_frame, orient=tk.VERTICAL, command=self.canvas.yview)
+        self.scrollbar = ttk.Scrollbar(self.search_frame, orient=tk.VERTICAL)
+        self.scrollbar.configure(command=self._scrollbar_command)
         self.canvas.configure(yscrollcommand=self.scrollbar.set)
         self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -612,10 +624,51 @@ class WindowPreviewApp(tk.Tk):
                               lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
         self.canvas.bind("<Configure>", self._on_canvas_configure)
 
+        # Bottom load-more indicator: a thin progress bar that fills as you scroll;
+        # hitting 100% fetches the next page.  The text label is hidden by default.
+        self.load_more_frame = ttk.Frame(self.search_frame)
+        self.load_more_label = ttk.Label(self.load_more_frame, text="scroll to load more")
+        # self.load_more_label.pack(side=tk.LEFT, padx=4)
+        self.load_more_progress = ttk.Progressbar(
+            self.load_more_frame, orient=tk.HORIZONTAL, mode="determinate", maximum=100)
+        self.load_more_progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        self.load_more_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=6, pady=(0, 6))
+        self.load_more_frame.pack_forget()
+
     def _on_canvas_configure(self, event=None):
         """Keep the search inner_frame sized to the viewport width."""
         width = event.width if event else self.canvas.winfo_width()
         self.canvas.itemconfig(self._inner_window, width=width)
+
+    def _scrollbar_command(self, *args):
+        """Proxy scrollbar commands to the canvas and check for bottom-of-scroll load."""
+        self.canvas.yview(*args)
+        self._check_scroll_bottom()
+
+    def _check_scroll_bottom(self):
+        """Update the load-more progress bar and trigger the next page at the bottom."""
+        st = self.view_state
+        if st.get("view") != "windows":
+            return
+        if st.get("windows_loading") or not st.get("windows_has_more"):
+            return
+        try:
+            _, bottom = self.canvas.yview()
+        except tk.TclError:
+            return
+        self.load_more_progress["value"] = min(100.0, bottom * 100.0)
+        if bottom >= 0.99:
+            self._load_next_page()
+
+    def _load_next_page(self):
+        """Fetch the next page of Windows-tab results when the user scrolls to the bottom."""
+        st = self.view_state
+        if st.get("windows_loading") or not st.get("windows_has_more"):
+            return
+        st["windows_offset"] = st.get("windows_offset", 0) + self.s.windows_page_size
+        st["windows_loading"] = True
+        self.status_var.set("loading more…")
+        self._fetch_windows_chunk(self._render_generation)
 
     def _build_banner(self):
         self.banner = ttk.Label(self, anchor="center", style="Dead.Tile.TLabel")
@@ -768,6 +821,8 @@ class WindowPreviewApp(tk.Tk):
         self._current_windows = []
         st["windows_offset"] = 0
         st["windows_loading"] = True
+        st["windows_has_more"] = True
+        self.load_more_progress["value"] = 0
         self._fetch_windows_chunk(gen)
 
     def _fetch_windows_chunk(self, gen: int):
@@ -799,30 +854,20 @@ class WindowPreviewApp(tk.Tk):
             loaded = len(self._current_windows)
             uids = [w.window_uid for w in windows]
 
-            self.status_var.set(f"loading… {loaded} loaded")
-
-            # Score the page just loaded, then request the next page.
-            # We keep paging while the backend returns any rows; we stop only on
-            # an empty page.  Stopping when ``len(windows) < page_size`` was wrong
-            # because backend-side filtering (self/denylist) can make a non-final
-            # page look partial.
-            def next_page():
-                st["windows_offset"] = offset + page_size
-                self._fetch_windows_chunk(gen)
-
-            def finish_page():
-                if not windows:
-                    st["windows_loading"] = False
-                    self.status_var.set(f"{loaded} window(s)")
-                    log.info("_render_search chunked done view=%s alive=%s sort=%s loaded=%d",
-                             st.get("view"), st.get("alive"), st.get("sort"), loaded)
-                    return
-                next_page()
+            st["windows_loading"] = False
+            if not windows:
+                st["windows_has_more"] = False
+                self.load_more_frame.pack_forget()
+                self.status_var.set(f"{loaded} window(s)")
+                log.info("_render_search paged done view=%s alive=%s sort=%s loaded=%d",
+                         st.get("view"), st.get("alive"), st.get("sort"), loaded)
+            else:
+                self.status_var.set(f"{loaded} window(s) — scroll to load more")
+                # Reflect the current scroll position now that new tiles exist.
+                self._check_scroll_bottom()
 
             if uids:
-                self._fetch_scores_for_uids(gen, uids, finish_page)
-            else:
-                finish_page()
+                self._fetch_scores_for_uids(gen, uids)
 
         self._submit(call, on_done)
 
@@ -894,6 +939,7 @@ class WindowPreviewApp(tk.Tk):
         self._hide_banner()
         self.status_var.set(f"{len(windows)} window(s)")
         log.debug("search returned %d windows", len(windows))
+        self.load_more_frame.pack_forget()
         self._reconcile_tiles(windows)
 
     def _render_timeline(self):
@@ -1244,9 +1290,22 @@ class WindowPreviewApp(tk.Tk):
             box.insert(tk.END, text[start + 6:end], "mark")
             i = end + 7
 
+    def _make_placeholder_photo(self, width: int, height: int, pad: bool = True) -> ImageTk.PhotoImage | None:
+        """Resize the bundled placeholder image for tile or hover preview use."""
+        if not self._placeholder_path.exists():
+            return None
+        try:
+            img = Image.open(self._placeholder_path)
+            if pad:
+                img = ImageOps.pad(img, (width, height), color=_hex_to_rgb(self.theme["tile_bg"]))
+            else:
+                img.thumbnail((width, height), Image.LANCZOS)
+            return ImageTk.PhotoImage(img)
+        except Exception as exc:                           # noqa: BLE001
+            log.warning("placeholder load failed: %s", exc)
+            return None
+
     def _load_window_capture(self, tile: dict, w: Window):
-        if w.window_capture_url is None:
-            return
         cached = self._window_capture_cache.get(w.window_uid)
         if cached is not None:
             tile["img_label"].configure(image=cached)
@@ -1254,11 +1313,18 @@ class WindowPreviewApp(tk.Tk):
             tile["capture_ts"] = w.window_capture_ts
             return
 
+        if w.window_capture_url is None:
+            self._set_tile_placeholder(tile)
+            return
+
         def fetch():
             return self.api.get_bytes(w.window_capture_url)
 
         def done(data, err):
-            if not data or tile["frame"].winfo_exists() == 0:
+            if tile["frame"].winfo_exists() == 0:
+                return
+            if not data:
+                self._set_tile_placeholder(tile)
                 return
             try:
                 img = Image.open(io.BytesIO(data))
@@ -1268,12 +1334,21 @@ class WindowPreviewApp(tk.Tk):
                 photo = ImageTk.PhotoImage(img)
             except Exception as exc:                       # noqa: BLE001
                 log.debug("window_capture decode failed uid=%s: %s", w.window_uid, exc)
+                self._set_tile_placeholder(tile)
                 return
             self._window_capture_cache[w.window_uid] = photo
             tile["capture_ts"] = w.window_capture_ts
             tile["img_label"].configure(image=photo)
             tile["img_label"].image = photo
         self._submit(fetch, done)
+
+    def _set_tile_placeholder(self, tile: dict):
+        """Show the bundled placeholder image when no capture is available."""
+        if self._placeholder_image is None:
+            return
+        tile["img_label"].configure(image=self._placeholder_image)
+        tile["img_label"].image = self._placeholder_image
+        tile["capture_ts"] = None
 
     # ───────────────────────── actions ─────────────────────────
     def jump_to(self, uid: int):
@@ -1547,6 +1622,7 @@ class WindowPreviewApp(tk.Tk):
             self.canvas.yview_scroll(1, "units")
         elif event.delta:
             self.canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        self._check_scroll_bottom()
 
     # ───────────────────────── hover preview (from demo) ─────────────────────────
     def _poll_hover(self):
