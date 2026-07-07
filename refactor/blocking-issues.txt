@@ -1,0 +1,5 @@
+when this daemon is called from ai agent side, ensure every api exposed to it is non-blocking and paginated.
+
+can query events using timestamp range, and can verify that.
+
+get overview stats first, then let the agent decide what to query.

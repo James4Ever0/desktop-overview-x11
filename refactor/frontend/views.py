@@ -1217,8 +1217,9 @@ class EventsView:
         self.search_var = tk.StringVar()
         self.search_entry = ttk.Entry(self.bar, textvariable=self.search_var, width=30)
         self.search_entry.pack(side=tk.LEFT, padx=2)
-        self.search_entry.bind("<Return>", lambda _e: app._apply_events_filters())
         self.search_entry.bind("<Control-a>", app._select_all)
+        self._search_after: str | None = None
+        self.search_var.trace_add("write", self._on_search_changed)
 
         self.type_vars: dict[str, tk.BooleanVar] = {}
         ttk.Label(self.bar, text="Types:").pack(side=tk.LEFT, padx=(12, 2))
@@ -1276,6 +1277,12 @@ class EventsView:
         text.bind("<MouseWheel>", _scroll)
         text.bind("<Button-4>", _scroll)
         text.bind("<Button-5>", _scroll)
+
+    def _on_search_changed(self, *_args):
+        """Debounced search-as-you-type for the Events tab."""
+        if self._search_after is not None:
+            self.app.after_cancel(self._search_after)
+        self._search_after = self.app.after(200, self.app._apply_events_filters)
 
     def _on_auto_refresh_toggle(self):
         self.app.view_state["events_auto_refresh"] = self.auto_refresh_var.get()
