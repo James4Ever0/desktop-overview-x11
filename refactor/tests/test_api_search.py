@@ -328,6 +328,15 @@ async def test_api(store, a, b, c):
               r.status_code == 200 and h["ok"] and h["session_key"] == "sess"
               and h["window_count"] == 3)
 
+        r = await cli.get("/stats")
+        stats = r.json()
+        check("GET /stats 200", r.status_code == 200)
+        check("stats alive/dead counts for session",
+              stats.get("alive_window_count") == 1 and stats.get("dead_window_count") == 1)
+        check("stats has db size", isinstance(stats.get("db_size_bytes"), int))
+        check("stats has captures size", isinstance(stats.get("captures_size_bytes"), int))
+        check("stats event types populated", len(stats.get("event_stats", [])) > 0)
+
         # control: keyboard toggle mutates settings
         r = await cli.post("/control/keyboard", json={"enabled": False})
         check("POST /control/keyboard disables", r.json()["enabled"] is False
@@ -476,7 +485,32 @@ async def test_focus_score_and_usage(store, a, b, c):
 
         by_tot = await search.list_windows(store, sort="usage_total", order="desc",
                                            current_session_key="sess")
-        check("usage_total desc order", [w["window_uid"] for w in by_tot[:3]] == [a, c, b])
+        check("usage_total desc order", [w["window_uid"] for w in by_tot[:3]] == [a, b, c])
+        by_tot_asc = await search.list_windows(store, sort="usage_total", order="asc",
+                                               current_session_key="sess")
+        check("usage_total asc order", [w["window_uid"] for w in by_tot_asc[:3]] == [c, b, a])
+
+        # Sorting must also be correct when the caller asks for enrich=False (the
+        # frontend's chunked/no-keyword path does this to avoid heavy per-row work).
+        by_tot_no_enrich = await search.list_windows(store, sort="usage_total", order="desc",
+                                                     enrich=False, current_session_key="sess")
+        check("usage_total desc order without enrich",
+              [w["window_uid"] for w in by_tot_no_enrich[:3]] == [a, b, c])
+        check("usage_total omitted when enrich=False",
+              all("usage_total" not in w for w in by_tot_no_enrich))
+
+        by_tot_alive = await search.list_windows(store, sort="usage_total", order="desc",
+                                                 alive="only", current_session_key="sess")
+        check("usage_total alive-only desc", [w["window_uid"] for w in by_tot_alive[:2]] == [a, c])
+        by_tot_dead = await search.list_windows(store, sort="usage_total", order="desc",
+                                                alive="dead", current_session_key="sess")
+        check("usage_total dead-only desc", [w["window_uid"] for w in by_tot_dead[:1]] == [b])
+        check("dead-only recent usage is zeroed", by_tot_dead[0].get("usage_5m") == 0.0)
+
+        scores = await search.window_scores(store, [a, b, c], now=now)
+        check("window_scores alive a has focus_score > 0", scores[a].get("focus_score", 0) > 0)
+        check("window_scores dead b only usage_total", set(scores[b].keys()) == {"usage_total"})
+        check("window_scores alive c has focus_score", scores[c].get("focus_score") is not None)
 
         srch = await search.search(store, q="invoice", sort="focus_score", order="desc",
                                    current_session_key="sess")

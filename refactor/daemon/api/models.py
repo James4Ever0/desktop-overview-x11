@@ -156,3 +156,30 @@ class ActivateOut(BaseModel):
 class RefreshOut(BaseModel):
     ok: bool
     captured: int | None = None
+
+
+class VDesktopCount(BaseModel):
+    index: int | None = None
+    name: str | None = None
+    alive_count: int
+
+
+class EventTypeStats(BaseModel):
+    type: str
+    count: int
+    earliest: float | None = None
+    latest: float | None = None
+
+
+class StatsOut(BaseModel):
+    db_size_bytes: int
+    captures_size_bytes: int
+    alive_window_count: int
+    dead_window_count: int
+    current_focus_window_uid: int | None = None
+    total_vdesktop_count: int
+    vdesktop_counts: list[VDesktopCount]
+    event_total_count: int
+    event_stats: list[EventTypeStats]
+    session_key: str | None = None
+    daemon_boot_id: str | None = None

@@ -366,6 +366,80 @@ async def get_health(ctx: DaemonContext = Depends(get_ctx)):
     )
 
 
+# ───────────────────────── stats ─────────────────────────
+def _dir_size(path: str) -> int:
+    total = 0
+    try:
+        for root, _, files in os.walk(path):
+            for f in files:
+                total += os.path.getsize(os.path.join(root, f))
+    except OSError:
+        pass
+    return total
+
+
+@router.get("/stats", response_model=models.StatsOut)
+async def get_stats(ctx: DaemonContext = Depends(get_ctx)):
+    s = ctx.settings
+    db_size = 0
+    try:
+        db_size = os.path.getsize(s.db_path)
+    except OSError:
+        pass
+    captures_size = _dir_size(str(s.window_capture_dir))
+
+    alive_row = await ctx.store.fetchone(
+        "SELECT COUNT(*) AS c FROM window WHERE session_key=? AND alive=1", (ctx.session_key,))
+    dead_row = await ctx.store.fetchone(
+        "SELECT COUNT(*) AS c FROM window WHERE session_key=? AND alive=0", (ctx.session_key,))
+    alive_count = alive_row["c"] if alive_row else 0
+    dead_count = dead_row["c"] if dead_row else 0
+
+    cur_focus = ctx.registry.current_focus_window_uid if ctx.registry else None
+
+    vd_rows = await ctx.store.fetchall(
+        "SELECT vdesktop_index, vdesktop_name, COUNT(*) AS c FROM window "
+        "WHERE session_key=? AND alive=1 GROUP BY vdesktop_index ORDER BY vdesktop_index",
+        (ctx.session_key,))
+    vdesktop_counts = [
+        models.VDesktopCount(index=r["vdesktop_index"], name=r["vdesktop_name"], alive_count=r["c"])
+        for r in vd_rows
+    ]
+    h = ctx.handlers
+    total_vd = len(h.desktop_names) if h and h.desktop_names else len(vdesktop_counts)
+
+    event_stats: list[models.EventTypeStats] = []
+    total_events = 0
+    for typ, table, ts_col, _text_col, _kind_col, _fts in events._TEXT_SOURCES:
+        row = await ctx.store.fetchone(
+            f"SELECT COUNT(*) AS c, MIN({ts_col}) AS earliest, MAX({ts_col}) AS latest FROM {table}")
+        count = row["c"] if row else 0
+        total_events += count
+        event_stats.append(models.EventTypeStats(
+            type=typ, count=count, earliest=row["earliest"], latest=row["latest"]))
+    for typ, table, ts_col, _uid_col in events._NON_TEXT_SOURCES:
+        row = await ctx.store.fetchone(
+            f"SELECT COUNT(*) AS c, MIN({ts_col}) AS earliest, MAX({ts_col}) AS latest FROM {table}")
+        count = row["c"] if row else 0
+        total_events += count
+        event_stats.append(models.EventTypeStats(
+            type=typ, count=count, earliest=row["earliest"], latest=row["latest"]))
+
+    return models.StatsOut(
+        db_size_bytes=db_size,
+        captures_size_bytes=captures_size,
+        alive_window_count=alive_count,
+        dead_window_count=dead_count,
+        current_focus_window_uid=cur_focus,
+        total_vdesktop_count=total_vd,
+        vdesktop_counts=vdesktop_counts,
+        event_total_count=total_events,
+        event_stats=event_stats,
+        session_key=ctx.session_key,
+        daemon_boot_id=(ctx.identity.daemon_boot_id if ctx.identity else None),
+    )
+
+
 # ───────────────────────── control / write (07 §5) ─────────────────────────
 @router.post("/window_captures/refresh", response_model=models.RefreshOut)
 async def refresh_window_captures(ctx: DaemonContext = Depends(get_ctx)):

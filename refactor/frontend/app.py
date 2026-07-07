@@ -37,7 +37,7 @@ setup_fonts()
 
 log = logging.getLogger("dovw.fe.app")
 
-_ALL_EVENT_TYPES = ("title", "app_name", "clipboard", "selection", "keyboard", "read", "focus", "lock")
+_ALL_EVENT_TYPES = ("title", "app_name", "clipboard", "selection", "keyboard", "read", "focus", "lock", "jump")
 
 
 def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
@@ -567,8 +567,9 @@ class WindowPreviewApp(tk.Tk):
         # sort / order (applies to search grid and timeline lanes)
         ttk.Label(flt, text="   Sort:").pack(side=tk.LEFT)
         self.sort_var = tk.StringVar(value="last_access")
+        self._all_sort_options = list(SORT_OPTIONS)
         self.sort_combo = ttk.Combobox(flt, textvariable=self.sort_var, state="readonly",
-                                       values=[v for _l, v in SORT_OPTIONS], width=14)
+                                       values=[v for _l, v in self._all_sort_options], width=14)
         self.sort_combo.bind("<<ComboboxSelected>>", self._on_sort_changed)
         self.sort_combo.pack(side=tk.LEFT, padx=2)
         self.order_var = tk.StringVar(value="desc")
@@ -576,6 +577,7 @@ class WindowPreviewApp(tk.Tk):
                                         values=["asc", "desc"], width=6)
         self.order_combo.bind("<<ComboboxSelected>>", self._on_sort_changed)
         self.order_combo.pack(side=tk.LEFT, padx=2)
+        self._update_sort_options()
 
         # timeline-specific controls (zoom + red-line time); shown only in timeline view, on the same row
         self._timeline_filters: list[tk.Widget] = []
@@ -606,9 +608,11 @@ class WindowPreviewApp(tk.Tk):
         self.search_frame = ttk.Frame(self.notebook)
         self.timeline_frame = ttk.Frame(self.notebook)
         self.events_frame = ttk.Frame(self.notebook)
+        self.stats_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.search_frame, text="Windows")
         self.notebook.add(self.timeline_frame, text="Timeline")
         self.notebook.add(self.events_frame, text="Events")
+        self.notebook.add(self.stats_frame, text="Stats")
         self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
 
     def _build_grid(self):
@@ -706,6 +710,8 @@ class WindowPreviewApp(tk.Tk):
             self._render_timeline()
         elif self.view_state["view"] == "events":
             self._render_events()
+        elif self.view_state["view"] == "stats":
+            self._render_stats()
         else:
             self._render_search()
 
@@ -753,7 +759,7 @@ class WindowPreviewApp(tk.Tk):
 
     def _on_notebook_tab_changed(self, _event=None):
         idx = self.notebook.index(self.notebook.select())
-        view = ["windows", "timeline", "events"][idx]
+        view = ["windows", "timeline", "events", "stats"][idx]
         if view == self.view_state["view"]:
             return
         self._switch_to_view(view, push_history=True)
@@ -761,7 +767,8 @@ class WindowPreviewApp(tk.Tk):
     def _sync_notebook_tab(self):
         if not getattr(self, "notebook", None):
             return
-        tab = {"windows": self.search_frame, "timeline": self.timeline_frame, "events": self.events_frame}.get(self.view_state["view"])
+        tab = {"windows": self.search_frame, "timeline": self.timeline_frame,
+               "events": self.events_frame, "stats": self.stats_frame}.get(self.view_state["view"])
         if tab is not None:
             self.notebook.select(tab)
 
@@ -1021,6 +1028,28 @@ class WindowPreviewApp(tk.Tk):
             view.set_events(events, total, self.view_state.get("events_offset", 0),
                             self.view_state.get("events_limit", 100))
         self.status_var.set(f"{len(events)} event(s)")
+
+    def _render_stats(self):
+        self.status_var.set("loading stats…")
+        view = getattr(self, "_stats_view", None)
+        if view is None or not getattr(view, "frame", None) or not view.frame.winfo_exists():
+            view = views.StatsView(self.stats_frame, self, self.theme)
+            self._stats_view = view
+
+        def call():
+            return self.api.stats()
+
+        def on_done(data, err):
+            if err is not None:
+                self._on_error(err)
+                return
+            self._hide_banner()
+            if view is not None:
+                view.set_stats(data)
+            self.status_var.set("stats")
+
+        gen = self._render_generation
+        self._submit(call, self._wrap_callback(gen, "stats", on_done))
 
     def _apply_events_filters(self, *_args):
         view = getattr(self, "_events_view", None)
@@ -1468,7 +1497,20 @@ class WindowPreviewApp(tk.Tk):
         self.view_state["filter_no_vdesktop"] = self.filter_no_vdesktop_var.get()
         self.view_state["hide_self"] = self.hide_self_var.get()
         self.view_state["current_boot_only"] = self.current_boot_var.get()
+        self._update_sort_options()
         self.render()
+
+    def _update_sort_options(self):
+        """Hide usage/focus sort options when showing only dead windows."""
+        alive = self.alive_var.get()
+        if alive == "dead":
+            allowed = {"last_access", "title", "window_id", "usage_total"}
+        else:
+            allowed = {val for _label, val in self._all_sort_options}
+        self.sort_combo.configure(values=[val for _label, val in self._all_sort_options if val in allowed])
+        if self.sort_var.get() not in allowed:
+            self.sort_var.set("last_access")
+            self.view_state["sort"] = "last_access"
 
     def _on_sort_changed(self, _event=None):
         self.view_state["sort"] = self.sort_var.get()
@@ -1538,6 +1580,7 @@ class WindowPreviewApp(tk.Tk):
         self.order_var.set(self.view_state.get("order", "desc"))
         self.hide_self_var.set(self.view_state.get("hide_self", self.s.hide_self))
         self.current_boot_var.set(self.view_state.get("current_boot_only", True))
+        self._update_sort_options()
 
     def _push_history(self):
         self._history_stack.append(dict(self.view_state))

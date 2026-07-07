@@ -196,6 +196,24 @@ def _maybe_build_gui(fe_settings):
         app = WindowPreviewApp(fe_settings, cli)
         app.update_idletasks()
         check("Tk WindowPreviewApp builds without error", True)
+
+        # Sort options are unrestricted for alive-only.
+        app.alive_var.set("only")
+        app._update_sort_options()
+        vals = list(app.sort_combo.cget("values"))
+        check("sort options include usage_5m for alive-only", "usage_5m" in vals)
+        check("sort options include focus_score for alive-only", "focus_score" in vals)
+
+        # Sort options are restricted when showing only dead windows.
+        app.sort_var.set("usage_5m")
+        app.alive_var.set("dead")
+        app._update_sort_options()
+        vals = list(app.sort_combo.cget("values"))
+        check("dead sort options exclude usage_5m", "usage_5m" not in vals)
+        check("dead sort options exclude focus_score", "focus_score" not in vals)
+        check("dead sort options include usage_total", "usage_total" in vals)
+        check("disallowed sort resets to last_access", app.sort_var.get() == "last_access")
+
         app.on_close()
     except Exception as exc:                                # noqa: BLE001
         check(f"Tk WindowPreviewApp builds without error ({exc})", False)

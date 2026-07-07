@@ -19,6 +19,23 @@ from PIL import Image, ImageTk
 
 log = logging.getLogger("dovw.fe.views")
 
+
+def _fmt_ts(ts: float | None) -> str:
+    if ts is None or ts <= 0:
+        return "—"
+    return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _fmt_bytes(n: int | None) -> str:
+    if n is None or n < 0:
+        return "—"
+    size = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024.0:
+            return f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} TB"
+
 LANE_H = 34
 LABEL_W = 230
 BAR_H = 18
@@ -1182,7 +1199,7 @@ class TimelineView:
 class EventsView:
     """Paginated, searchable global event log (plan 13)."""
 
-    EVENT_TYPES = ("title", "app_name", "clipboard", "selection", "keyboard", "read", "focus", "lock")
+    EVENT_TYPES = ("title", "app_name", "clipboard", "selection", "keyboard", "read", "focus", "lock", "jump")
 
     def __init__(self, parent, app, theme):
         self.app = app
@@ -1334,3 +1351,70 @@ class EventsView:
                 break
             self.text.insert(tk.END, text[start + 6:end], "mark")
             i = end + 7
+
+
+class StatsView:
+    """Simple read-only stats dashboard for the Stats tab."""
+
+    def __init__(self, parent, app, theme):
+        self.app = app
+        self.theme = theme
+        self.frame = ttk.Frame(parent, style="Tile.TFrame")
+        self.frame.grid(row=0, column=0, sticky="nsew")
+        parent.rowconfigure(0, weight=1)
+        parent.columnconfigure(0, weight=1)
+
+        self.text = tk.Text(self.frame, wrap="word", bd=0,
+                            bg=theme["tile_bg"], fg=theme["fg"],
+                            highlightthickness=0, padx=12, pady=12,
+                            font=("TkDefaultFont", 10))
+        self.text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb = ttk.Scrollbar(self.frame, orient=tk.VERTICAL, command=self.text.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.text.configure(yscrollcommand=sb.set)
+
+        self.text.tag_configure("header", foreground=theme["accent"],
+                                font=("TkDefaultFont", 12, "bold"))
+        self.text.tag_configure("label", foreground=theme["muted"])
+        self.text.tag_configure("value", foreground=theme["fg"])
+
+    def set_stats(self, data: dict):
+        self.text.configure(state="normal")
+        self.text.delete("1.0", tk.END)
+
+        def header(title: str):
+            self.text.insert(tk.END, f"\n{title}\n", "header")
+
+        def line(label: str, value):
+            self.text.insert(tk.END, f"{label}: ", "label")
+            self.text.insert(tk.END, f"{value}\n", "value")
+
+        header("Storage")
+        line("DB size", _fmt_bytes(data.get("db_size_bytes")))
+        line("Photos size", _fmt_bytes(data.get("captures_size_bytes")))
+
+        header("Windows")
+        line("Alive", data.get("alive_window_count", 0))
+        line("Dead", data.get("dead_window_count", 0))
+        line("Current focus window uid", data.get("current_focus_window_uid") or "—")
+        line("Total virtual desktops", data.get("total_vdesktop_count", 0))
+
+        header("Virtual desktop counts")
+        for vd in data.get("vdesktop_counts", []):
+            idx = vd.get("index") if vd.get("index") is not None else "?"
+            name = vd.get("name") or "?"
+            count = vd.get("alive_count", 0)
+            self.text.insert(tk.END, f"  [{idx}: {name}] ", "label")
+            self.text.insert(tk.END, f"{count}\n", "value")
+
+        header("Events")
+        line("Total", data.get("event_total_count", 0))
+        for ev in data.get("event_stats", []):
+            typ = ev.get("type", "?")
+            count = ev.get("count", 0)
+            earliest = _fmt_ts(ev.get("earliest"))
+            latest = _fmt_ts(ev.get("latest"))
+            self.text.insert(tk.END, f"  {typ}: ", "label")
+            self.text.insert(tk.END, f"{count}  ({earliest} → {latest})\n", "value")
+
+        self.text.configure(state="disabled")

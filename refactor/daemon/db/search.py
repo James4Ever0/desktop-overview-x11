@@ -171,8 +171,42 @@ def _is_usage_sort(sort: str) -> bool:
     return sort == "focus_score" or sort.startswith("usage_")
 
 
+async def _focus_span_usage_total(store, uids: list[int]) -> dict[int, float]:
+    """Return total focused minutes per window from global focus-event spans.
+
+    A focus span starts at a ``focus_event`` row and ends at the next global
+    focus or screen-lock event.  This gives a usable fallback total for dead
+    windows that have no recent heartbeat rows.
+    """
+    if not uids:
+        return {}
+    placeholders = ",".join("?" * len(uids))
+    sql = (
+        "WITH events AS ("
+        " SELECT 'focus' AS kind, window_uid, focused_at AS ts FROM focus_event"
+        " UNION ALL"
+        " SELECT 'lock', NULL, changed_at FROM screen_lock_event"
+        "),"
+        " ordered AS ("
+        " SELECT kind, window_uid, ts,"
+        "   LEAD(ts) OVER (ORDER BY ts) AS next_ts"
+        " FROM events"
+        ")"
+        " SELECT window_uid, ROUND(SUM(next_ts - ts) / 60.0, 1) AS minutes"
+        " FROM ordered"
+        f" WHERE kind='focus' AND window_uid IN ({placeholders}) AND next_ts IS NOT NULL"
+        " GROUP BY window_uid"
+    )
+    rows = await store.fetchall(sql, tuple(uids))
+    return {row["window_uid"]: row["minutes"] for row in rows}
+
+
 async def _enrich_usage_total_only(store, items: list[dict], key: str = "window_uid") -> None:
-    """Attach only usage_total (cheapest heartbeat aggregation) for dead/visible rows."""
+    """Attach usage_total for dead/visible rows.
+
+    Uses heartbeat counts when available; otherwise falls back to the total
+    focused duration derived from focus-event spans.
+    """
     if not items:
         return
     uids = [o[key] for o in items]
@@ -181,17 +215,29 @@ async def _enrich_usage_total_only(store, items: list[dict], key: str = "window_
     sql = (f"SELECT window_uid, COUNT(*) AS n FROM window_heartbeat "
            f"WHERE window_uid IN ({placeholders}) GROUP BY window_uid")
     rows = await store.fetchall(sql, tuple(uids))
-    totals = {row["window_uid"]: round(row["n"] * interval / 60.0, 1) for row in rows}
+    heartbeat_totals = {row["window_uid"]: round(row["n"] * interval / 60.0, 1) for row in rows}
+
+    # Fall back to focus-span duration for windows with no recorded heartbeats.
+    missing = [uid for uid in uids if heartbeat_totals.get(uid, 0.0) == 0.0]
+    focus_totals = await _focus_span_usage_total(store, missing) if missing else {}
+
     for o in items:
-        o["usage_total"] = totals.get(o[key], 0.0)
+        uid = o[key]
+        total = heartbeat_totals.get(uid, 0.0)
+        if total == 0.0:
+            total = focus_totals.get(uid, 0.0)
+        o["usage_total"] = total
 
 
 def _set_dead_scores_zero(items: list[dict]) -> None:
-    """Set all usage fields and focus_score to 0.0 (used when sorting by usage/focus)."""
+    """Set recent usage fields and focus_score to 0.0 for dead rows (used when sorting by usage/focus).
+
+    ``usage_total`` is preserved/recalculated separately because it can be derived
+    from historical heartbeat or focus-span data even for dead windows.
+    """
     for o in items:
         for label in USAGE_INTERVALS_S:
             o[label] = 0.0
-        o["usage_total"] = 0.0
         o["focus_score"] = 0.0
 
 
@@ -252,6 +298,8 @@ async def list_windows(store, *, alive="both", sort="last_access", order="desc",
 
     if sort == "focus_score" or sort.startswith("usage_"):
         # focus_score and usage sorts depend on enriched values, so sort globally in Python.
+        # We always compute the values needed for ordering; they are stripped before
+        # returning when enrich=False so the API contract is preserved.
         t0 = _T()
         sql = f"SELECT {_WINDOW_COLS} FROM window w {where_clause}"
         rows = await store.fetchall(sql, tuple(params))
@@ -261,23 +309,31 @@ async def list_windows(store, *, alive="both", sort="last_access", order="desc",
         results = [assemble_window(r, current_session_key) for r in rows]
         results = _filter_denied(results)
         results = _filter_self(results, self_xid)
-        if enrich:
-            alive_items = [r for r in results if r["alive"]]
-            if alive_items:
-                await _enrich_usage(store, alive_items, now=now)
+        alive_items = [r for r in results if r["alive"]]
+        if alive_items:
+            await _enrich_usage(store, alive_items, now=now)
+            if sort == "focus_score":
                 await _enrich_focus_score(store, alive_items, now=now)
-            dead_items = [r for r in results if not r["alive"]]
-            if dead_items:
-                _set_dead_scores_zero(dead_items)
-            t2 = _T()
-            log.info("list_windows enrich alive=%s sort=%s enrich=%s rows=%d ms=%.1f",
-                     alive, sort, enrich, len(results), t2 - t1)
+        dead_items = [r for r in results if not r["alive"]]
+        if dead_items:
+            _set_dead_scores_zero(dead_items)
+            await _enrich_usage_total_only(store, dead_items)
+        t2 = _T()
+        log.info("list_windows enrich alive=%s sort=%s enrich=%s rows=%d ms=%.1f",
+                 alive, sort, enrich, len(results), t2 - t1)
         reverse = order != "asc"
         if sort == "focus_score":
-            results.sort(key=lambda o: (o["focus_score"], o["window_uid"]), reverse=reverse)
+            results.sort(key=lambda o: (o.get("focus_score") or 0, o["window_uid"]), reverse=reverse)
         else:
             results.sort(key=lambda o: (o.get(sort) or 0, o["window_uid"]), reverse=reverse)
-        return results[offset:offset + limit]
+        page = results[offset:offset + limit]
+        if not enrich:
+            for o in page:
+                for label in USAGE_INTERVALS_S:
+                    o.pop(label, None)
+                o.pop("usage_total", None)
+                o.pop("focus_score", None)
+        return page
 
     if sort == "last_access":
         # Fast path: pre-aggregate focus times, select uids for the page, then fetch
@@ -349,7 +405,18 @@ async def window_scores(store, uids: list[int], now=None) -> dict[int, dict]:
         tuple(uids))
     alive_map = {row["window_uid"]: bool(row["alive"]) for row in rows}
 
-    items = [{"window_uid": uid, "alive": alive_map.get(uid, False)} for uid in uids]
+    # focus_score needs last_access; fetch it once for all requested windows.
+    last_access_rows = await store.fetchall(
+        f"SELECT window_uid, COALESCE(MAX(focused_at), 0) AS last_access "
+        f"FROM focus_event WHERE window_uid IN ({placeholders}) GROUP BY window_uid",
+        tuple(uids))
+    last_access_map = {row["window_uid"]: row["last_access"] for row in last_access_rows}
+
+    items = [
+        {"window_uid": uid, "alive": alive_map.get(uid, False),
+         "last_access": last_access_map.get(uid, 0) or 0}
+        for uid in uids
+    ]
     await _enrich_usage(store, items, now=now)
     alive_items = [it for it in items if it["alive"]]
     if alive_items:

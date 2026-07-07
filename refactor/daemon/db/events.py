@@ -9,7 +9,7 @@ from __future__ import annotations
 from .search import _mark_substring, _WINDOW_COLS, assemble_window
 
 
-ALL_EVENT_TYPES = ("title", "app_name", "clipboard", "selection", "keyboard", "read", "focus", "lock")
+ALL_EVENT_TYPES = ("title", "app_name", "clipboard", "selection", "keyboard", "read", "focus", "lock", "jump")
 
 # (type, table, ts_col, text_col, kind_col, fts_table)
 _TEXT_SOURCES = (
@@ -19,6 +19,7 @@ _TEXT_SOURCES = (
     ("selection", "selection_event",  "created_at", "text",      None,       "fts_sel"),
     ("keyboard",  "kbd_segment",      "started_at", "text",      None,       "fts_kbd"),
     ("read",      "read_event",       "created_at", "text",      None,       None),
+    ("jump",      "jump_event",       "ts",         "title",     None,       None),
 )
 
 _NON_TEXT_SOURCES = (
@@ -138,7 +139,12 @@ def _time_where(ts_col: str, t_from, t_to) -> tuple[str, list]:
 
 def _source_select(typ: str, table: str, ts_col: str, text_col: str | None,
                    kind_col: str | None, uid_col: str | None = "window_uid") -> str:
-    kind_sel = f"{kind_col} AS kind" if kind_col else "NULL AS kind"
+    if typ == "jump":
+        kind_sel = "CASE WHEN t.success THEN 'success' ELSE 'failure' END AS kind"
+    elif kind_col:
+        kind_sel = f"{kind_col} AS kind"
+    else:
+        kind_sel = "NULL AS kind"
     if typ == "focus":
         text_sel = "'(focus)' AS text"
     elif typ == "lock":

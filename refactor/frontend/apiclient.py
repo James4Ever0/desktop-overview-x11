@@ -314,6 +314,9 @@ class ApiClient:
     def set_keyboard(self, enabled: bool) -> dict:
         return self._post("/control/keyboard", json={"enabled": enabled})
 
+    def stats(self) -> dict:
+        return self._get("/stats")
+
     def close(self) -> None:
         try:
             self._client.close()
