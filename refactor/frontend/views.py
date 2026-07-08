@@ -303,10 +303,10 @@ class TimelineView:
             self.scale = max(self.SCALE_MIN, min(self.SCALE_MAX, self.DEFAULT_INITIAL_SCALE))
             timeline_w = max(1, self._canvas_width() - self._x_offset() - PAD)
             self.start_time = now - timeline_w * self.scale
-            # Allow the right edge to extend past the data so "now" can sit at the right.
-            min_start = self.t_min - PAD * self.scale
-            max_start = max(self.t_max, now) + PAD * self.scale - timeline_w * self.scale
-            self.start_time = max(min_start, min(max_start, self.start_time))
+            # If the data is stale, don't leave the viewport dangling past the
+            # last event; clamp so the user actually sees something on first open.
+            self._clamp_view()
+            self.indicator_time = max(self.t_min, min(self.indicator_time, self.t_max))
             self._draw()
             self._sync_callbacks()
         else:
@@ -1243,9 +1243,6 @@ class EventsView:
             self.bar, text="auto refresh", variable=self.auto_refresh_var,
             command=self._on_auto_refresh_toggle)
         self.auto_refresh_cb.pack(side=tk.RIGHT, padx=2)
-
-        self.refresh_btn = ttk.Button(self.bar, text="Refresh", command=app.render)
-        self.refresh_btn.pack(side=tk.RIGHT, padx=2)
 
         # event list
         self.text = tk.Text(self.frame, wrap="word", bd=0,

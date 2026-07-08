@@ -276,6 +276,7 @@ class WindowPreviewApp(tk.Tk):
                                        thread_name_prefix="api")
         self._search_after = None
         self._refresh_after = None
+        self._restore_scroll_y = None
         self._busy = False
         self._render_generation = 0
 
@@ -507,6 +508,8 @@ class WindowPreviewApp(tk.Tk):
 
         self.help_btn = ttk.Button(bar, text="?", width=2, command=self._show_help)
         self.help_btn.pack(side=tk.RIGHT, padx=4)
+        self.capture_btn = ttk.Button(bar, text="Captures", command=self.on_capture_refresh)
+        self.capture_btn.pack(side=tk.RIGHT, padx=4)
         self.refresh_btn = ttk.Button(bar, text="Refresh", command=self.on_refresh)
         self.refresh_btn.pack(side=tk.RIGHT, padx=4)
         self.status_var = tk.StringVar(value="ready")
@@ -743,6 +746,7 @@ class WindowPreviewApp(tk.Tk):
         if clear_scope:
             self.view_state["selected_window_uid"] = None
             self.scope_var.set("")
+        self._restore_scroll_y = None
         self.title(f"Desktop Overview — {view}")
         self._self_title_prefix = self.title()
         self._show_search_filters(view)
@@ -858,6 +862,13 @@ class WindowPreviewApp(tk.Tk):
             self._current_windows.extend(windows)
             self._hide_banner()
             self._reconcile_tiles(self._current_windows)
+            # Restore scroll position after a full reload, then clear the request.
+            if getattr(self, "_restore_scroll_y", None) is not None:
+                try:
+                    self.canvas.yview_moveto(self._restore_scroll_y)
+                except tk.TclError:
+                    pass
+                self._restore_scroll_y = None
             loaded = len(self._current_windows)
             uids = [w.window_uid for w in windows]
 
@@ -1409,8 +1420,9 @@ class WindowPreviewApp(tk.Tk):
         self.scope_var.set("")
         self.render()
 
-    def on_refresh(self):
-        log.debug("manual refresh triggered")
+    def on_capture_refresh(self):
+        """Manually trigger a daemon window-capture sweep (original Refresh behaviour)."""
+        log.debug("manual window capture refresh triggered")
         self.status_var.set("refreshing window_captures…")
         self._window_capture_cache.clear()
 
@@ -1421,6 +1433,32 @@ class WindowPreviewApp(tk.Tk):
             self.status_var.set(f"captured {res.get('captured')}")
             self.render()
         self._submit(self.api.refresh_window_captures, done)
+
+    def on_refresh(self):
+        """Context-aware refresh: full reload for Windows, re-render for other views."""
+        view = self.view_state.get("view")
+        if view == "windows":
+            self._reload_windows()
+        else:
+            self.render()
+
+    def _reload_windows(self):
+        """Full reload of the Windows tab: clear tiles, refetch from top, restore scroll.
+
+        Keeps the current search input and filters.
+        """
+        log.debug("full reload of windows tab")
+        self.status_var.set("reloading…")
+        # Remember where the user was scrolled so we can jump back after the first chunk.
+        try:
+            self._restore_scroll_y = self.canvas.yview()[0]
+        except tk.TclError:
+            self._restore_scroll_y = 0.0
+        # Clear cached images so tiles reflect the latest captures.
+        self._window_capture_cache.clear()
+        self._preview_cache.clear()
+        # Restart the chunked fetch from offset 0.
+        self._start_chunked_load(self._render_generation)
 
     def _show_help(self):
         """Open a non-modal help window with operation shortcuts and knob meanings."""
@@ -2057,8 +2095,7 @@ class WindowPreviewApp(tk.Tk):
                 # plan 15: refresh only the scores/captures of already-visible tiles,
                 # not the whole grid, to avoid re-querying the dead-window list every tick.
                 self._refresh_visible_scores()
-            else:
-                self.render()
+            # timeline/stats are left to the manual Refresh button.
             self._refresh_after = self.after(self.s.grid_auto_refresh_s * 1000, tick)
         self._refresh_after = self.after(self.s.grid_auto_refresh_s * 1000, tick)
 
