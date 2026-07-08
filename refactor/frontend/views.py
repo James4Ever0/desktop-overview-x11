@@ -144,6 +144,7 @@ class TimelineView:
     MAX_EVENTS_IN_HOVER = 20
     HOVER_MAX_LINES = 14
     STICKY_MARGIN = LANE_H // 4
+    MIN_CANVAS_WIDTH = 50
 
     def __init__(self, parent, app, theme, api, *, scale=None, indicator_time=None):
         self.app = app
@@ -185,8 +186,12 @@ class TimelineView:
         self.indicator_callback = None
         self.range_callback = None
 
+        self._pending_initial_lanes: list | None = None
+        self._initial_layout_done = False
+
         self._build_widgets()
         self._bind_events()
+        self.frame.bind("<Map>", self._on_frame_map)
 
     # ───────────────────────── construction ─────────────────────────
     def _build_widgets(self):
@@ -297,22 +302,50 @@ class TimelineView:
             return
 
         # First load: current time at the right edge, fixed initial zoom.
-        if self.start_time == 0.0 and abs(self.scale - 1.0) < 1e-9:
-            now = time.time()
-            self.indicator_time = now
-            self.scale = max(self.SCALE_MIN, min(self.SCALE_MAX, self.DEFAULT_INITIAL_SCALE))
-            timeline_w = max(1, self._canvas_width() - self._x_offset() - PAD)
-            self.start_time = now - timeline_w * self.scale
-            # If the data is stale, don't leave the viewport dangling past the
-            # last event; clamp so the user actually sees something on first open.
-            self._clamp_view()
-            self.indicator_time = max(self.t_min, min(self.indicator_time, self.t_max))
-            self._draw()
-            self._sync_callbacks()
+        if not self._initial_layout_done and self.start_time == 0.0 and abs(self.scale - 1.0) < 1e-9:
+            if self.frame.winfo_ismapped() and self._canvas_width() >= self.MIN_CANVAS_WIDTH:
+                self._do_initial_layout(self.lanes)
+            else:
+                # The frame/canvas isn't mapped yet; defer layout so we use a real
+                # viewport width instead of a 1-pixel sliver.
+                self._pending_initial_lanes = list(self.lanes)
+                self.frame.after(50, self._deferred_initial_layout)
         else:
             self._clamp_view()
             self._draw()
         self._sync_callbacks()
+
+    def _on_frame_map(self, _event=None):
+        """Fire the deferred initial layout as soon as the timeline frame appears."""
+        self._deferred_initial_layout()
+
+    def _deferred_initial_layout(self):
+        """Finish the first-load viewport setup once the canvas has a real size."""
+        lanes = self._pending_initial_lanes
+        if lanes is None:
+            return
+        if not self.frame.winfo_ismapped() or self._canvas_width() < self.MIN_CANVAS_WIDTH:
+            self.frame.after(50, self._deferred_initial_layout)
+            return
+        self._pending_initial_lanes = None
+        self._do_initial_layout(lanes)
+
+    def _do_initial_layout(self, lanes: list):
+        """Position the viewport with current time at the right edge on first open."""
+        self.lanes = lanes
+        self._apply_title_filter()
+        now = time.time()
+        self.indicator_time = now
+        self.scale = max(self.SCALE_MIN, min(self.SCALE_MAX, self.DEFAULT_INITIAL_SCALE))
+        timeline_w = max(1, self._canvas_width() - self._x_offset() - PAD)
+        self.start_time = now - timeline_w * self.scale
+        # If the data is stale, don't leave the viewport dangling past the
+        # last event; clamp so the user actually sees something on first open.
+        self._clamp_view()
+        self.indicator_time = max(self.t_min, min(self.indicator_time, self.t_max))
+        self._draw()
+        self._sync_callbacks()
+        self._initial_layout_done = True
 
     def set_title_filter(self, query: str):
         """Filter visible lanes by current title (frontend-only, AND tokens); keep zoom + red line."""
