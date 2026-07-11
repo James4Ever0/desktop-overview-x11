@@ -171,6 +171,53 @@ def _is_usage_sort(sort: str) -> bool:
     return sort == "focus_score" or sort.startswith("usage_")
 
 
+JUMP_INTERVALS_S = {
+    "jump_5m": 300,
+    "jump_10m": 600,
+    "jump_30m": 1800,
+    "jump_1d": 86400,
+}
+
+
+async def _enrich_jump_counts(store, items: list[dict], key: str = "window_uid", now=None) -> None:
+    """Attach jump_5m/10m/30m/1d/total counts to a list of window/lane dicts."""
+    if not items:
+        return
+    now = time.time() if now is None else now
+    uids = [o[key] for o in items]
+    placeholders = ",".join("?" * len(uids))
+    max_age = max(JUMP_INTERVALS_S.values())
+
+    cols = ", ".join(
+        f"SUM(CASE WHEN ts >= ? THEN 1 ELSE 0 END) AS {label}"
+        for label in JUMP_INTERVALS_S
+    )
+    params = [now - v for v in JUMP_INTERVALS_S.values()]
+    params.extend(uids)
+    params.append(now - max_age)
+    sql = (f"SELECT window_uid, {cols} FROM jump_event "
+           f"WHERE window_uid IN ({placeholders}) AND ts >= ? AND success = 1 "
+           "GROUP BY window_uid")
+    rows = await store.fetchall(sql, tuple(params))
+    out: dict[int, dict] = {uid: {label: 0 for label in JUMP_INTERVALS_S} for uid in uids}
+    for row in rows:
+        uid = row["window_uid"]
+        for label in JUMP_INTERVALS_S:
+            out[uid][label] = row[label] or 0
+
+    total_sql = (f"SELECT window_uid, COUNT(*) AS n FROM jump_event "
+                 f"WHERE window_uid IN ({placeholders}) AND success = 1 "
+                 "GROUP BY window_uid")
+    total_rows = await store.fetchall(total_sql, tuple(uids))
+    for row in total_rows:
+        out[row["window_uid"]]["jump_total"] = row["n"] or 0
+    for uid in uids:
+        out[uid].setdefault("jump_total", 0)
+
+    for o in items:
+        o.update(out[o[key]])
+
+
 async def _focus_span_usage_total(store, uids: list[int]) -> dict[int, float]:
     """Return total focused minutes per window from global focus-event spans.
 
@@ -318,6 +365,7 @@ async def list_windows(store, *, alive="both", sort="last_access", order="desc",
         if dead_items:
             _set_dead_scores_zero(dead_items)
             await _enrich_usage_total_only(store, dead_items)
+        await _enrich_jump_counts(store, results, now=now)
         t2 = _T()
         log.info("list_windows enrich alive=%s sort=%s enrich=%s rows=%d ms=%.1f",
                  alive, sort, enrich, len(results), t2 - t1)
@@ -333,6 +381,9 @@ async def list_windows(store, *, alive="both", sort="last_access", order="desc",
                     o.pop(label, None)
                 o.pop("usage_total", None)
                 o.pop("focus_score", None)
+                for label in JUMP_INTERVALS_S:
+                    o.pop(label, None)
+                o.pop("jump_total", None)
         return page
 
     if sort == "last_access":
@@ -384,6 +435,7 @@ async def list_windows(store, *, alive="both", sort="last_access", order="desc",
         else:  # only
             await _enrich_usage(store, results, now=now)
             await _enrich_focus_score(store, results, now=now)
+        await _enrich_jump_counts(store, results, now=now)
         t2 = _T()
         log.info("list_windows enrich alive=%s sort=%s enrich=%s rows=%d ms=%.1f",
                  alive, sort, enrich, len(results), t2 - t1)
@@ -421,16 +473,20 @@ async def window_scores(store, uids: list[int], now=None) -> dict[int, dict]:
     alive_items = [it for it in items if it["alive"]]
     if alive_items:
         await _enrich_focus_score(store, alive_items, now=now)
+    await _enrich_jump_counts(store, items, now=now)
 
     out: dict[int, dict] = {}
     for it in items:
         uid = it["window_uid"]
         if it["alive"]:
-            out[uid] = {label: it.get(label) for label in USAGE_INTERVALS_S}
-            out[uid]["usage_total"] = it.get("usage_total")
-            out[uid]["focus_score"] = it.get("focus_score")
+            base = {label: it.get(label) for label in USAGE_INTERVALS_S}
+            base["usage_total"] = it.get("usage_total")
+            base["focus_score"] = it.get("focus_score")
         else:
-            out[uid] = {"usage_total": it.get("usage_total", 0.0)}
+            base = {"usage_total": it.get("usage_total")}
+        base.update({label: it.get(label) for label in JUMP_INTERVALS_S})
+        base["jump_total"] = it.get("jump_total")
+        out[uid] = base
     return out
 
 
@@ -493,6 +549,7 @@ async def search(store, *, q=None, window_uid=None, fields=None, alive="both",
     now = time.time()
     await _enrich_usage(store, results, now=now)
     await _enrich_focus_score(store, results, now=now)
+    await _enrich_jump_counts(store, results, now=now)
 
     reverse = order != "asc"
     if sort == "relevance":

@@ -106,6 +106,21 @@ def _fmt_usage_summary(w: Window) -> str:
     return " | ".join(parts)
 
 
+def _fmt_jumps(w: Window) -> str:
+    """Jump counts over the standard look-back windows + total."""
+    vals = [getattr(w, label, None) for label in ("jump_5m", "jump_10m", "jump_30m", "jump_1d", "jump_total")]
+    if all(v is None for v in vals):
+        return ""
+    labels = ("5m", "10m", "30m", "1d", "tot")
+    parts = []
+    for label, v in zip(labels, vals):
+        if v is None:
+            parts.append(f"{label}:—")
+        else:
+            parts.append(f"{label}:{v}")
+    return "jmp: " + " ".join(parts)
+
+
 def _fmt_ts(ts: float | None) -> str:
     """ISO-style timestamp for event/keyboard chunks in the hover detail view."""
     if ts is None or ts <= 0:
@@ -917,7 +932,8 @@ class WindowPreviewApp(tk.Tk):
                 continue
             w = tile["win"]
             for label in ("usage_5m", "usage_10m", "usage_30m", "usage_1d",
-                          "usage_total", "focus_score"):
+                          "usage_total", "focus_score",
+                          "jump_5m", "jump_10m", "jump_30m", "jump_1d", "jump_total"):
                 setattr(w, label, score.get(label))
             self._update_tile(tile, w)
 
@@ -1259,6 +1275,8 @@ class WindowPreviewApp(tk.Tk):
         usage_label.pack(anchor="w")
         total_score_label = ttk.Label(frame, style="Muted.TLabel")
         total_score_label.pack(anchor="w")
+        jump_label = ttk.Label(frame, style="Muted.TLabel")
+        jump_label.pack(anchor="w")
         badge_label = ttk.Label(frame, style="Muted.TLabel")
         badge_label.pack(anchor="w")
         status_label = ttk.Label(frame, style="Tile.TLabel")
@@ -1271,7 +1289,7 @@ class WindowPreviewApp(tk.Tk):
         tile = {"frame": frame, "img_label": img_label,
                 "app_label": app_label, "title_label": title_label,
                 "access_label": access_label, "usage_label": usage_label,
-                "total_score_label": total_score_label,
+                "total_score_label": total_score_label, "jump_label": jump_label,
                 "badge_label": badge_label, "status_label": status_label,
                 "hits_box": hits_box, "win": w}
 
@@ -1291,6 +1309,7 @@ class WindowPreviewApp(tk.Tk):
         tile["access_label"].configure(text=_fmt_last_access(w.last_access))
         tile["usage_label"].configure(text=_fmt_usage(w))
         tile["total_score_label"].configure(text=_fmt_usage_summary(w))
+        tile["jump_label"].configure(text=_fmt_jumps(w))
         tile["badge_label"].configure(text=w.desktop_badge)
         if w.alive and w.jumpable:
             tile["status_label"].configure(text="● accessible", style="Alive.Tile.TLabel")
@@ -1884,6 +1903,9 @@ class WindowPreviewApp(tk.Tk):
         usage_line = f"{_fmt_usage(w)}  |  {_fmt_usage_summary(w)}".strip()
         if usage_line:
             box.insert(tk.END, f"{usage_line}\n")
+        jump_line = _fmt_jumps(w)
+        if jump_line:
+            box.insert(tk.END, f"{jump_line}\n")
 
         if w.hits:
             box.insert(tk.END, "\nSearch hits\n", "section")

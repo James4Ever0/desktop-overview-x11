@@ -56,6 +56,11 @@ class Window:
     usage_1d: float | None = None
     usage_total: float | None = None
     focus_score: float | None = None
+    jump_5m: int | None = None
+    jump_10m: int | None = None
+    jump_30m: int | None = None
+    jump_1d: int | None = None
+    jump_total: int | None = None
     hits: list[Hit] = field(default_factory=list)
 
     @property
@@ -89,6 +94,9 @@ class Window:
             usage_1d=d.get("usage_1d"),
             usage_total=d.get("usage_total"),
             focus_score=d.get("focus_score"),
+            jump_5m=d.get("jump_5m"), jump_10m=d.get("jump_10m"),
+            jump_30m=d.get("jump_30m"), jump_1d=d.get("jump_1d"),
+            jump_total=d.get("jump_total"),
             hits=[Hit(h["field"], h.get("excerpt")) for h in d.get("hits", [])],
         )
 

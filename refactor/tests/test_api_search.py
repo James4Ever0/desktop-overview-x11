@@ -275,15 +275,16 @@ async def test_api(store, a, b, c):
         r = await cli.get("/windows", params={"enrich": "0", "limit": "10"})
         check("GET /windows enrich=0 omits scores",
               r.status_code == 200
-              and all(w.get("usage_total") is None for w in r.json()))
+              and all(w.get("usage_total") is None for w in r.json())
+              and all(w.get("jump_total") is None for w in r.json()))
 
         r = await cli.post("/windows/scores", json=[a, b])
         check("POST /windows/scores 200", r.status_code == 200)
         scores = r.json()
         check("scores alive a has focus_score",
               scores.get(str(a), {}).get("focus_score") is not None)
-        check("scores dead b only usage_total",
-              set(scores.get(str(b), {}).keys()) == {"usage_total"})
+        check("scores dead b has usage+jump counts",
+              set(scores.get(str(b), {}).keys()) == {"usage_total", "jump_5m", "jump_10m", "jump_30m", "jump_1d", "jump_total"})
 
         r = await cli.get("/search", params={"q": "invoice"})
         check("GET /search 200", r.status_code == 200)
@@ -463,6 +464,12 @@ async def test_focus_score_and_usage(store, a, b, c):
             "INSERT INTO window_heartbeat(daemon_boot_id, window_uid, x_window_id, ts)"
             " VALUES(?,?,?,?)", ("b", b, 0xBBBBB, now - 400))
 
+        # jump events: a has 1 within 5m and another within 30m; b has 1 within 10m
+        for uid, offset in [(a, 60), (a, 900), (b, 400)]:
+            await store.execute(
+                "INSERT INTO jump_event(window_uid, daemon_boot_id, ts, success)"
+                " VALUES(?,?,?,?)", (uid, "b", now - offset, 1))
+
         # recency: a is most recent, then b, then c
         for uid, t in [(a, now - 10), (b, now - 60), (c, now - 120)]:
             await store.execute(
@@ -475,6 +482,11 @@ async def test_focus_score_and_usage(store, a, b, c):
         check("window a has total usage 5.0", by_uid[a].get("usage_total") == 5.0)
         check("window b dead has no recent 5m usage", by_uid[b].get("usage_5m") is None)
         check("window b has total usage 1.0", by_uid[b].get("usage_total") == 1.0)
+        check("window a has 5m jump count 1", by_uid[a].get("jump_5m") == 1)
+        check("window a has 30m jump count 2", by_uid[a].get("jump_30m") == 2)
+        check("window a has total jump count 2", by_uid[a].get("jump_total") == 2)
+        check("window b has 5m jump count 0", by_uid[b].get("jump_5m") == 0)
+        check("window b has 10m jump count 1", by_uid[b].get("jump_10m") == 1)
 
         by_fs = await search.list_windows(store, sort="focus_score", order="desc",
                                           current_session_key="sess")
@@ -498,6 +510,8 @@ async def test_focus_score_and_usage(store, a, b, c):
               [w["window_uid"] for w in by_tot_no_enrich[:3]] == [a, b, c])
         check("usage_total omitted when enrich=False",
               all("usage_total" not in w for w in by_tot_no_enrich))
+        check("jump counts omitted when enrich=False",
+              all("jump_total" not in w and "jump_5m" not in w for w in by_tot_no_enrich))
 
         by_tot_alive = await search.list_windows(store, sort="usage_total", order="desc",
                                                  alive="only", current_session_key="sess")
@@ -509,7 +523,8 @@ async def test_focus_score_and_usage(store, a, b, c):
 
         scores = await search.window_scores(store, [a, b, c], now=now)
         check("window_scores alive a has focus_score > 0", scores[a].get("focus_score", 0) > 0)
-        check("window_scores dead b only usage_total", set(scores[b].keys()) == {"usage_total"})
+        check("window_scores dead b has usage+jump counts",
+              set(scores[b].keys()) == {"usage_total", "jump_5m", "jump_10m", "jump_30m", "jump_1d", "jump_total"})
         check("window_scores alive c has focus_score", scores[c].get("focus_score") is not None)
 
         srch = await search.search(store, q="invoice", sort="focus_score", order="desc",

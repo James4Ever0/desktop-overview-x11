@@ -123,8 +123,8 @@ def _client_checks(uds: str, a: int, b: int):
         scores = cli.window_scores([a, b])
         check("client.window_scores returns dict", isinstance(scores, dict))
         check("scores contains requested uids", {a, b} <= set(scores.keys()))
-        check("dead window b only has usage_total",
-              set(scores.get(b, {}).keys()) == {"usage_total"})
+        check("dead window b has usage+jump counts",
+              set(scores.get(b, {}).keys()) == {"usage_total", "jump_5m", "jump_10m", "jump_30m", "jump_1d", "jump_total"})
 
         wa = next(w for w in wins if w.window_uid == a)
         check("alive+session window is jumpable", wa.jumpable is True)

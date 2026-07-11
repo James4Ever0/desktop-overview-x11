@@ -1,0 +1,12 @@
+make this into a small drawer that invoked by the top or side bar hint, or anywhere you like
+
+invoke by shortcut win+o or other keys, will show up on active virtual desktop, will be sticky on top, default to make the invoked press esc to minimize the window
+need to write comment for your personal definition of valid key reprs in demo config file or default config file, quit if those keys do not match your def.
+
+make this configurable in frontend config file
+
+(write a small demo python file for reference)
+
+---
+
+click right to preview instead of hover.

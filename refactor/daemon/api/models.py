@@ -35,6 +35,11 @@ class WindowOut(BaseModel):
     usage_1d: float | None = None
     usage_total: float | None = None
     focus_score: float | None = None
+    jump_5m: int | None = None
+    jump_10m: int | None = None
+    jump_30m: int | None = None
+    jump_1d: int | None = None
+    jump_total: int | None = None
     window_capture_url: str | None = None
     window_capture_ts: float | None = None
     hits: list[Hit] = []

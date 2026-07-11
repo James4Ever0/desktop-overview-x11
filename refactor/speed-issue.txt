@@ -1,0 +1,1 @@
+are you sure all network requests including image lookup are fully async in frontend? and what about the backend? can we speedup by using concurrent db cursor?
